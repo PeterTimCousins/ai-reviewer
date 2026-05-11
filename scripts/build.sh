@@ -27,6 +27,7 @@ mkdir -p "$app_root/Contents/MacOS"
 mkdir -p "$app_root/Contents/Resources"
 cp "$repo_root/.build/debug/ai-reviewer-watcher" "$app_root/Contents/MacOS/$binary_name"
 cp -R "$repo_root/profiles" "$app_root/Contents/Resources/profiles"
+cp "$repo_root/Assets/AppIcon.icns" "$app_root/Contents/Resources/AppIcon.icns"
 
 cat > "$app_root/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -43,6 +44,8 @@ cat > "$app_root/Contents/Info.plist" <<PLIST
   <string>6.0</string>
   <key>CFBundleName</key>
   <string>AI Reviewer</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
