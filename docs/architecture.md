@@ -58,6 +58,11 @@ Build a minimal app plus foreground CLI that:
   `startWatcherOnLaunch` is enabled.
 - Hides the Dock icon if `hideDockIcon` is enabled, while keeping the status
   item available.
+- Opens to a review manager view that joins recent Git history with local
+  reviewed, failed, skipped, running, and pending review state.
+- Loads selected review output and watcher logs in the app.
+- Supports an intentional manual rerun for a selected commit by clearing that
+  commit's ledger entries before invoking the normal review path.
 - Runs a foreground `--watch` polling loop for CLI development. Startup HEAD
   reconciliation is controlled by `reviewCurrentHeadOnStartup`; failed-review
   retries are also checked while HEAD is stable.
@@ -109,16 +114,15 @@ Build a minimal app plus foreground CLI that:
    AI Reviewer copy the final report back to the configured repo reports path.
 8. Define review behavior through JSON profiles with global instructions,
    specialist agents, model overrides, ignore paths, and size gates.
-9. Keep the settings UI thin over the same app-owned operations used by the
-   CLI and menu-bar controls.
+9. Keep the manager and settings UI thin over the same app-owned operations
+   used by the CLI and menu-bar controls.
 10. Keep watcher lifecycle logs under `~/Library/Logs/com.ai-reviewer/` so
    validation does not require Accessibility, AppleScript, or UI automation.
 
 ## Public App Roadmap
 
-The app now has a basic settings window. It should evolve toward a menu-bar
-utility, with the settings UI remaining thin over the same operations used by
-the CLI:
+The app is now a menu-bar-oriented review manager, with the UI remaining thin
+over the same operations used by the CLI:
 
 - choose watched repository with `NSOpenPanel`
 - configure reports path, cache path, Codex home, poll interval, parallelism,
@@ -132,7 +136,12 @@ the CLI:
 - hide the Dock icon for menu-bar-only operation
 - keep a menu bar status item available after the settings window is closed
 - open cache and log locations
-- show last seen commit, last materialized bundle, and recent errors
+- show last seen commit, last materialized bundle, recent errors, review
+  history, skipped reviews, failed reviews, completed reviews, and pending
+  review state
+- load selected review output and watcher logs in-app
+- manually rerun a selected commit when the review failed, was skipped, or the
+  copied report artifact was removed
 
 Picking the repository through a native open panel is important because it gives
 macOS a clear user-intent signal for removable volume access.

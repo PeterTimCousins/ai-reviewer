@@ -20,12 +20,16 @@ The intended model is:
 This is early-stage software. The current app can:
 
 - build a small macOS app bundle with bundle identifier `com.ai-reviewer`
-- open a basic settings window when launched normally
+- open a manager window when launched normally
 - validate a local JSON config
-- start and stop an app-owned repository HEAD watcher from the settings window
+- start and stop an app-owned repository HEAD watcher from the manager window
 - optionally register the app as a macOS login item
 - start the watcher when the app opens
 - optionally hide the Dock icon
+- show recent Git commit history with completed, failed, skipped, running, and
+  pending review state
+- load completed review output and watcher logs in the app
+- manually rerun a review for a selected commit
 - watch a repository HEAD in the foreground from the CLI
 - materialize the current HEAD into a local cache bundle
 - run Codex against a local cache bundle with a stripped environment
@@ -58,15 +62,15 @@ bundled default profile. To use a specific profile, set `reviewProfilePath` to
 an absolute path or choose a JSON profile in the settings window. Private
 repo-specific profiles can live under ignored `profiles/local/`.
 
-Open the settings window with:
+Open the manager window with:
 
 ```bash
 open build/AI\ Reviewer.app
 ```
 
-Use **Start Watching** and **Stop Watching** in the settings window to run the
-watcher inside the app process. Closing the settings window leaves an active
-watcher running; reopen the window from the app menu, status item, or Dock icon
+Use **Start** and **Stop** in the manager window to run the watcher inside the
+app process. Closing the window leaves an active watcher running; reopen the
+window from the app menu, status item, or Dock icon
 when the Dock icon is enabled.
 
 Enable **Launch AI Reviewer at login** to register the app with macOS Login
@@ -191,17 +195,21 @@ stable across rebuilds, set a real signing identity before building:
 AI_REVIEWER_CODESIGN_IDENTITY="Developer ID Application: Example" scripts/build.sh
 ```
 
-## GUI Roadmap
+## GUI
 
-The app currently includes a basic settings window for editing the app-support
-config, choosing a watched repository, validating settings, materializing HEAD,
-running a HEAD review, running the one-shot review workflow, starting and
-stopping the app-owned watcher, controlling login-item registration, opening
-the cache and log folders, and staying available from the macOS menu bar when
-the settings window is closed.
+The app opens to a review manager rather than a raw settings form. The
+**Reviews** view shows recent Git commits from the watched repository and joins
+them with the local state ledger so each commit is marked completed, failed,
+skipped, running, or pending. Selecting a completed review loads the review
+text in the app; selecting a failed or skipped review shows the recorded reason.
+The selected commit can be manually rerun, which intentionally clears that
+commit's reviewed/failed/skipped ledger entries before running the review again.
 
-The intended product shape is a menu-bar app that owns the watcher lifecycle.
-The settings UI currently covers:
+The **Logs** view tails the watcher log from
+`~/Library/Logs/com.ai-reviewer/watcher.log`.
+
+The **Settings** view remains a thin editor over the app-support config. It
+covers:
 
 - watched repository
 - reports path inside that repository

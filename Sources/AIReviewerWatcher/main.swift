@@ -313,6 +313,27 @@ struct ReviewSkipRecord: Codable {
     var reason: String
 }
 
+enum ReviewHistoryStatus: String {
+    case completed = "Completed"
+    case failed = "Failed"
+    case skipped = "Skipped"
+    case running = "Running"
+    case pending = "Pending"
+}
+
+struct ReviewHistoryItem {
+    let sha: String
+    let shortSha: String
+    let date: String
+    let subject: String
+    let status: ReviewHistoryStatus
+    let detail: String
+    let reviewPath: String?
+    let localReviewPath: String?
+    let bundlePath: String?
+    let logPath: String?
+}
+
 enum Command: String {
     case validate
     case watch
@@ -1766,6 +1787,161 @@ func reviewPendingCommits(config: AppConfig) throws -> [URL] {
     return reports
 }
 
+func logPathForReviewPath(_ path: String?) -> String? {
+    guard let path, !path.isEmpty else {
+        return nil
+    }
+
+    let url = URL(fileURLWithPath: path)
+    let name = url.deletingPathExtension().lastPathComponent + ".log"
+    return url.deletingLastPathComponent().appendingPathComponent(name).path
+}
+
+func preferredReviewPath(_ record: ReviewRecord) -> String? {
+    if FileManager.default.fileExists(atPath: record.copiedReportPath) {
+        return record.copiedReportPath
+    }
+    if FileManager.default.fileExists(atPath: record.localReviewPath) {
+        return record.localReviewPath
+    }
+    return record.copiedReportPath
+}
+
+func loadReviewHistory(config: AppConfig, runningCommits: Set<String> = []) throws -> [ReviewHistoryItem] {
+    try validatePaths(config: config)
+
+    let repoPath = repoURL(config: config).path
+    let state = try loadState(config: config)
+    let output = try runGit(
+        repoPath: repoPath,
+        arguments: [
+            "log",
+            "--max-count=\(config.reviewSweepDepth)",
+            "--date=iso-strict",
+            "--format=%H%x1f%h%x1f%ad%x1f%s"
+        ]
+    )
+
+    return output
+        .split(separator: "\n", omittingEmptySubsequences: true)
+        .compactMap { line -> ReviewHistoryItem? in
+            let parts = line.split(separator: "\u{1f}", maxSplits: 3, omittingEmptySubsequences: false).map(String.init)
+            guard parts.count == 4 else {
+                return nil
+            }
+
+            let sha = parts[0]
+            let shortSha = parts[1]
+            let date = parts[2]
+            let subject = parts[3]
+
+            if runningCommits.contains(sha) {
+                return ReviewHistoryItem(
+                    sha: sha,
+                    shortSha: shortSha,
+                    date: date,
+                    subject: subject,
+                    status: .running,
+                    detail: "Review is currently running.",
+                    reviewPath: nil,
+                    localReviewPath: nil,
+                    bundlePath: nil,
+                    logPath: nil
+                )
+            }
+
+            if let reviewed = state.reviewed[sha] {
+                let reviewPath = preferredReviewPath(reviewed)
+                return ReviewHistoryItem(
+                    sha: sha,
+                    shortSha: reviewed.shortSha,
+                    date: date,
+                    subject: subject,
+                    status: .completed,
+                    detail: FileManager.default.fileExists(atPath: reviewed.copiedReportPath) ? "Review completed." : "Review completed, but the copied report file is missing.",
+                    reviewPath: reviewPath,
+                    localReviewPath: reviewed.localReviewPath,
+                    bundlePath: reviewed.bundlePath,
+                    logPath: logPathForReviewPath(reviewed.localReviewPath)
+                )
+            }
+
+            if let failure = state.failed[sha] {
+                return ReviewHistoryItem(
+                    sha: sha,
+                    shortSha: failure.shortSha,
+                    date: date,
+                    subject: subject,
+                    status: .failed,
+                    detail: failure.error,
+                    reviewPath: failure.localReviewPath,
+                    localReviewPath: failure.localReviewPath,
+                    bundlePath: failure.bundlePath,
+                    logPath: logPathForReviewPath(failure.localReviewPath)
+                )
+            }
+
+            if let skipped = state.skipped?[sha] {
+                return ReviewHistoryItem(
+                    sha: sha,
+                    shortSha: skipped.shortSha,
+                    date: date,
+                    subject: subject,
+                    status: .skipped,
+                    detail: skipped.reason,
+                    reviewPath: nil,
+                    localReviewPath: nil,
+                    bundlePath: nil,
+                    logPath: nil
+                )
+            }
+
+            return ReviewHistoryItem(
+                sha: sha,
+                shortSha: shortSha,
+                date: date,
+                subject: subject,
+                status: .pending,
+                detail: "No review ledger entry yet.",
+                reviewPath: nil,
+                localReviewPath: nil,
+                bundlePath: nil,
+                logPath: nil
+            )
+        }
+}
+
+func rerunReviewCommit(config: AppConfig, commit: String) throws -> URL? {
+    let repoPath = repoURL(config: config).path
+    let resolvedCommit = try runGit(repoPath: repoPath, arguments: ["rev-parse", commit])
+    var state = try loadState(config: config)
+    state.reviewed.removeValue(forKey: resolvedCommit)
+    state.failed.removeValue(forKey: resolvedCommit)
+    state.skipped?.removeValue(forKey: resolvedCommit)
+    try saveState(state, config: config)
+    return try reviewCommit(config: config, commit: resolvedCommit)
+}
+
+func readTextFileIfPresent(path: String?) -> String? {
+    guard let path, !path.isEmpty, FileManager.default.fileExists(atPath: path) else {
+        return nil
+    }
+
+    return try? String(contentsOfFile: path, encoding: .utf8)
+}
+
+func readLogText() -> String {
+    let logURL = watcherLogURL()
+    guard let data = try? Data(contentsOf: logURL),
+          let text = String(data: data, encoding: .utf8)
+    else {
+        return "No watcher log has been written yet."
+    }
+
+    let lines = text.split(separator: "\n", omittingEmptySubsequences: false).suffix(400)
+    return lines.joined(separator: "\n")
+}
+
 struct ParsedCommand {
     let command: Command
     let configPath: String
@@ -1973,13 +2149,23 @@ final class AppWatcher: @unchecked Sendable {
 }
 
 @MainActor
-final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
+final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate {
+    private enum MainSection: Int {
+        case reviews = 0
+        case logs = 1
+        case settings = 2
+    }
+
     private let configURL = defaultAppConfigURL()
     private var window: NSWindow?
     private var statusItem: NSStatusItem?
     private let appWatcher = AppWatcher()
     private let watcherLock = FileLock(url: watcherLockURL())
     private var watcherRunning = false
+    private var activeSection: MainSection = .reviews
+    private var reviewItems: [ReviewHistoryItem] = []
+    private var selectedReviewIndex: Int?
+    private var runningCommits = Set<String>()
 
     private let repoField = NSTextField()
     private let reportsField = NSTextField()
@@ -2001,6 +2187,15 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
     private let launchAtLoginCheckbox = NSButton(checkboxWithTitle: "Launch AI Reviewer at login", target: nil, action: nil)
     private let statusField = NSTextField(labelWithString: "Idle")
     private let watcherField = NSTextField(labelWithString: "Watcher: stopped")
+    private let summaryField = NSTextField(labelWithString: "No repository loaded")
+    private let contentContainer = NSView()
+    private let segmentedControl = NSSegmentedControl(labels: ["Reviews", "Logs", "Settings"], trackingMode: .selectOne, target: nil, action: nil)
+    private let reviewTableView = NSTableView()
+    private let reviewDetailTextView = NSTextView()
+    private let logsTextView = NSTextView()
+    private var rerunReviewButton: NSButton?
+    private var openReviewButton: NSButton?
+    private var openBundleButton: NSButton?
     private var startWatcherButton: NSButton?
     private var stopWatcherButton: NSButton?
     private var watcherStatusMenuItem: NSMenuItem?
@@ -2014,6 +2209,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         let config = loadConfigIntoFields()
         refreshLoginItemCheckbox()
         applyActivationPolicy(config: config)
+        showSection(.reviews)
         window?.center()
 
         if config.shouldStartWatcherOnLaunch && !config.repoPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -2043,7 +2239,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         let mainMenu = NSMenu()
         let appMenuItem = NSMenuItem()
         let appMenu = NSMenu()
-        appMenu.addItem(NSMenuItem(title: "Settings...", action: #selector(showSettingsWindow), keyEquivalent: ","))
+        appMenu.addItem(NSMenuItem(title: "Open AI Reviewer", action: #selector(showSettingsWindow), keyEquivalent: ","))
         appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(NSMenuItem(title: "Quit AI Reviewer", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         appMenuItem.submenu = appMenu
@@ -2062,7 +2258,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(status)
         menu.addItem(NSMenuItem.separator())
 
-        let settings = NSMenuItem(title: "Settings...", action: #selector(showSettingsWindow), keyEquivalent: "")
+        let settings = NSMenuItem(title: "Open AI Reviewer", action: #selector(showSettingsWindow), keyEquivalent: "")
         settings.target = self
         menu.addItem(settings)
 
@@ -2096,44 +2292,273 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildWindow() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 800, height: 790),
+            contentRect: NSRect(x: 0, y: 0, width: 1060, height: 760),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "AI Reviewer"
-        window.minSize = NSSize(width: 680, height: 640)
+        window.minSize = NSSize(width: 860, height: 620)
         window.isReleasedWhenClosed = false
 
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .leading
-        root.spacing = 14
+        root.spacing = 12
         root.edgeInsets = NSEdgeInsets(top: 22, left: 24, bottom: 22, right: 24)
         root.translatesAutoresizingMaskIntoConstraints = false
 
-        let title = NSTextField(labelWithString: "Settings")
-        title.font = .systemFont(ofSize: 22, weight: .semibold)
-        root.addArrangedSubview(title)
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 12
+        header.translatesAutoresizingMaskIntoConstraints = false
 
-        root.addArrangedSubview(row(label: "Repository", field: repoField, buttonTitle: "Choose", action: #selector(chooseRepository)))
-        root.addArrangedSubview(row(label: "Reports Path", field: reportsField))
-        root.addArrangedSubview(row(label: "Cache Path", field: cacheField))
-        root.addArrangedSubview(row(label: "Codex Home", field: codexHomeField))
-        root.addArrangedSubview(row(label: "Codex Model", field: codexModelField))
-        root.addArrangedSubview(row(label: "Review Profile", field: reviewProfileField, buttonTitle: "Choose", action: #selector(chooseReviewProfile)))
-        root.addArrangedSubview(row(label: "State Path", field: statePathField))
-        root.addArrangedSubview(row(label: "Poll Seconds", field: pollIntervalField))
-        root.addArrangedSubview(row(label: "Sweep Depth", field: sweepDepthField))
-        root.addArrangedSubview(row(label: "Retry Failed Secs", field: retryFailedAfterField))
-        root.addArrangedSubview(row(label: "Codex Timeout Secs", field: codexTimeoutField))
-        root.addArrangedSubview(row(label: "Max Parallel", field: maxParallelField))
-        root.addArrangedSubview(row(label: "Max Snapshot Bytes", field: maxSnapshotField))
-        root.addArrangedSubview(row(label: "Max Prompt Snapshot", field: maxPromptSnapshotField))
-        root.addArrangedSubview(checkboxRow(startWatcherOnLaunchCheckbox))
-        root.addArrangedSubview(checkboxRow(hideDockIconCheckbox))
-        root.addArrangedSubview(checkboxRow(reviewStartupCheckbox))
-        root.addArrangedSubview(checkboxRow(launchAtLoginCheckbox))
+        let titleStack = NSStackView()
+        titleStack.orientation = .vertical
+        titleStack.alignment = .leading
+        titleStack.spacing = 3
+
+        let title = NSTextField(labelWithString: "AI Reviewer")
+        title.font = .systemFont(ofSize: 24, weight: .semibold)
+        titleStack.addArrangedSubview(title)
+
+        summaryField.lineBreakMode = .byTruncatingMiddle
+        summaryField.maximumNumberOfLines = 2
+        summaryField.textColor = .secondaryLabelColor
+        titleStack.addArrangedSubview(summaryField)
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let startButton = button(title: "Start", action: #selector(startWatching))
+        let stopButton = button(title: "Stop", action: #selector(stopWatching))
+        stopButton.isEnabled = false
+        startWatcherButton = startButton
+        stopWatcherButton = stopButton
+
+        header.addArrangedSubview(titleStack)
+        header.addArrangedSubview(spacer)
+        header.addArrangedSubview(button(title: "Refresh", action: #selector(refreshCurrentView)))
+        header.addArrangedSubview(startButton)
+        header.addArrangedSubview(stopButton)
+        root.addArrangedSubview(header)
+
+        segmentedControl.target = self
+        segmentedControl.action = #selector(sectionChanged)
+        segmentedControl.selectedSegment = MainSection.reviews.rawValue
+        root.addArrangedSubview(segmentedControl)
+
+        watcherField.lineBreakMode = .byWordWrapping
+        watcherField.maximumNumberOfLines = 3
+        watcherField.textColor = .secondaryLabelColor
+        root.addArrangedSubview(watcherField)
+
+        contentContainer.translatesAutoresizingMaskIntoConstraints = false
+        root.addArrangedSubview(contentContainer)
+
+        statusField.lineBreakMode = .byWordWrapping
+        statusField.maximumNumberOfLines = 4
+        statusField.textColor = .secondaryLabelColor
+        root.addArrangedSubview(statusField)
+
+        window.contentView = NSView()
+        window.contentView?.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor),
+            root.topAnchor.constraint(equalTo: window.contentView!.topAnchor),
+            root.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor),
+            header.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -48),
+            segmentedControl.widthAnchor.constraint(equalToConstant: 300),
+            watcherField.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -48),
+            contentContainer.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -48),
+            contentContainer.heightAnchor.constraint(greaterThanOrEqualToConstant: 460),
+            statusField.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -48)
+        ])
+
+        self.window = window
+    }
+
+    private func replaceContent(with view: NSView) {
+        contentContainer.subviews.forEach { $0.removeFromSuperview() }
+        view.translatesAutoresizingMaskIntoConstraints = false
+        contentContainer.addSubview(view)
+        NSLayoutConstraint.activate([
+            view.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
+            view.topAnchor.constraint(equalTo: contentContainer.topAnchor),
+            view.bottomAnchor.constraint(equalTo: contentContainer.bottomAnchor)
+        ])
+    }
+
+    private func showSection(_ section: MainSection) {
+        activeSection = section
+        segmentedControl.selectedSegment = section.rawValue
+
+        switch section {
+        case .reviews:
+            replaceContent(with: buildReviewsView())
+            refreshReviewHistory()
+        case .logs:
+            replaceContent(with: buildLogsView())
+            refreshLogs()
+        case .settings:
+            replaceContent(with: buildSettingsView())
+        }
+    }
+
+    @objc private func sectionChanged() {
+        showSection(MainSection(rawValue: segmentedControl.selectedSegment) ?? .reviews)
+    }
+
+    @objc private func refreshCurrentView() {
+        switch activeSection {
+        case .reviews:
+            refreshReviewHistory()
+        case .logs:
+            refreshLogs()
+        case .settings:
+            do {
+                let config = try configFromFields()
+                try saveConfig(config, to: configURL)
+                statusField.stringValue = "Saved \(configURL.path)"
+            } catch {
+                statusField.stringValue = "\(error)"
+            }
+        }
+    }
+
+    private func buildReviewsView() -> NSView {
+        configureReviewTableIfNeeded()
+
+        let split = NSSplitView()
+        split.isVertical = true
+        split.dividerStyle = .thin
+
+        let tableScroll = NSScrollView()
+        tableScroll.hasVerticalScroller = true
+        tableScroll.documentView = reviewTableView
+        tableScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 430).isActive = true
+
+        let detailStack = NSStackView()
+        detailStack.orientation = .vertical
+        detailStack.alignment = .leading
+        detailStack.spacing = 8
+
+        let actionRow = NSStackView()
+        actionRow.orientation = .horizontal
+        actionRow.spacing = 8
+        let rerun = button(title: "Rerun Review", action: #selector(rerunSelectedReview))
+        let openReview = button(title: "Open Review", action: #selector(openSelectedReview))
+        let openBundle = button(title: "Open Bundle", action: #selector(openSelectedBundle))
+        rerunReviewButton = rerun
+        openReviewButton = openReview
+        openBundleButton = openBundle
+        actionRow.addArrangedSubview(rerun)
+        actionRow.addArrangedSubview(openReview)
+        actionRow.addArrangedSubview(openBundle)
+
+        reviewDetailTextView.isEditable = false
+        reviewDetailTextView.isRichText = false
+        reviewDetailTextView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        reviewDetailTextView.textContainerInset = NSSize(width: 10, height: 10)
+        let detailScroll = NSScrollView()
+        detailScroll.hasVerticalScroller = true
+        detailScroll.documentView = reviewDetailTextView
+        detailScroll.translatesAutoresizingMaskIntoConstraints = false
+        detailScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 390).isActive = true
+
+        detailStack.addArrangedSubview(actionRow)
+        detailStack.addArrangedSubview(detailScroll)
+        detailScroll.widthAnchor.constraint(equalTo: detailStack.widthAnchor).isActive = true
+
+        split.addArrangedSubview(tableScroll)
+        split.addArrangedSubview(detailStack)
+        return split
+    }
+
+    private func configureReviewTableIfNeeded() {
+        guard reviewTableView.tableColumns.isEmpty else {
+            return
+        }
+
+        reviewTableView.delegate = self
+        reviewTableView.dataSource = self
+        reviewTableView.headerView = nil
+        reviewTableView.rowHeight = 44
+        reviewTableView.usesAlternatingRowBackgroundColors = true
+        reviewTableView.allowsEmptySelection = true
+
+        for column in [
+            ("status", "Status", 88.0),
+            ("commit", "Commit", 86.0),
+            ("subject", "Commit", 250.0),
+            ("date", "Date", 130.0)
+        ] {
+            let tableColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(column.0))
+            tableColumn.title = column.1
+            tableColumn.width = column.2
+            reviewTableView.addTableColumn(tableColumn)
+        }
+    }
+
+    private func buildLogsView() -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+
+        let actions = NSStackView()
+        actions.orientation = .horizontal
+        actions.spacing = 8
+        actions.addArrangedSubview(button(title: "Refresh Logs", action: #selector(refreshLogsAction)))
+        actions.addArrangedSubview(button(title: "Open Logs Folder", action: #selector(openLogs)))
+        stack.addArrangedSubview(actions)
+
+        logsTextView.isEditable = false
+        logsTextView.isRichText = false
+        logsTextView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        logsTextView.textContainerInset = NSSize(width: 10, height: 10)
+
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.documentView = logsTextView
+        stack.addArrangedSubview(scroll)
+        scroll.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 430).isActive = true
+        return stack
+    }
+
+    private func buildSettingsView() -> NSView {
+        let form = NSStackView()
+        form.orientation = .vertical
+        form.alignment = .leading
+        form.spacing = 12
+        form.edgeInsets = NSEdgeInsets(top: 8, left: 0, bottom: 8, right: 0)
+
+        let title = NSTextField(labelWithString: "Settings")
+        title.font = .systemFont(ofSize: 18, weight: .semibold)
+        form.addArrangedSubview(title)
+
+        form.addArrangedSubview(row(label: "Repository", field: repoField, buttonTitle: "Choose", action: #selector(chooseRepository)))
+        form.addArrangedSubview(row(label: "Reports Path", field: reportsField))
+        form.addArrangedSubview(row(label: "Review Profile", field: reviewProfileField, buttonTitle: "Choose", action: #selector(chooseReviewProfile)))
+        form.addArrangedSubview(row(label: "Cache Path", field: cacheField))
+        form.addArrangedSubview(row(label: "Codex Home", field: codexHomeField))
+        form.addArrangedSubview(row(label: "Codex Model", field: codexModelField))
+        form.addArrangedSubview(row(label: "State Path", field: statePathField))
+        form.addArrangedSubview(row(label: "Poll Seconds", field: pollIntervalField))
+        form.addArrangedSubview(row(label: "Sweep Depth", field: sweepDepthField))
+        form.addArrangedSubview(row(label: "Retry Failed Secs", field: retryFailedAfterField))
+        form.addArrangedSubview(row(label: "Codex Timeout Secs", field: codexTimeoutField))
+        form.addArrangedSubview(row(label: "Max Parallel", field: maxParallelField))
+        form.addArrangedSubview(row(label: "Max Snapshot Bytes", field: maxSnapshotField))
+        form.addArrangedSubview(row(label: "Max Prompt Snapshot", field: maxPromptSnapshotField))
+        form.addArrangedSubview(checkboxRow(startWatcherOnLaunchCheckbox))
+        form.addArrangedSubview(checkboxRow(hideDockIconCheckbox))
+        form.addArrangedSubview(checkboxRow(reviewStartupCheckbox))
+        form.addArrangedSubview(checkboxRow(launchAtLoginCheckbox))
 
         let buttonRow = NSStackView()
         buttonRow.orientation = .horizontal
@@ -2144,41 +2569,199 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         buttonRow.addArrangedSubview(button(title: "Review HEAD", action: #selector(reviewHeadFromSettings)))
         buttonRow.addArrangedSubview(button(title: "Review Once", action: #selector(reviewOnceFromSettings)))
         buttonRow.addArrangedSubview(button(title: "Open Cache", action: #selector(openCache)))
-        buttonRow.addArrangedSubview(button(title: "Open Logs", action: #selector(openLogs)))
-        root.addArrangedSubview(buttonRow)
+        form.addArrangedSubview(buttonRow)
 
-        let watcherRow = NSStackView()
-        watcherRow.orientation = .horizontal
-        watcherRow.spacing = 8
-        let startButton = button(title: "Start Watching", action: #selector(startWatching))
-        let stopButton = button(title: "Stop Watching", action: #selector(stopWatching))
-        stopButton.isEnabled = false
-        startWatcherButton = startButton
-        stopWatcherButton = stopButton
-        watcherRow.addArrangedSubview(startButton)
-        watcherRow.addArrangedSubview(stopButton)
-        root.addArrangedSubview(watcherRow)
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.documentView = form
+        return scroll
+    }
 
-        watcherField.lineBreakMode = .byWordWrapping
-        watcherField.maximumNumberOfLines = 8
-        watcherField.textColor = .secondaryLabelColor
-        root.addArrangedSubview(watcherField)
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        reviewItems.count
+    }
 
-        statusField.lineBreakMode = .byWordWrapping
-        statusField.maximumNumberOfLines = 12
-        statusField.textColor = .secondaryLabelColor
-        root.addArrangedSubview(statusField)
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard row >= 0, row < reviewItems.count else {
+            return nil
+        }
 
-        window.contentView = NSView()
-        window.contentView?.addSubview(root)
-        NSLayoutConstraint.activate([
-            root.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor),
-            root.topAnchor.constraint(equalTo: window.contentView!.topAnchor),
-            root.bottomAnchor.constraint(lessThanOrEqualTo: window.contentView!.bottomAnchor)
-        ])
+        let item = reviewItems[row]
+        let identifier = tableColumn?.identifier.rawValue ?? "subject"
+        let value: String
+        switch identifier {
+        case "status":
+            value = item.status.rawValue
+        case "commit":
+            value = item.shortSha
+        case "date":
+            value = String(item.date.prefix(16)).replacingOccurrences(of: "T", with: " ")
+        default:
+            value = item.subject
+        }
 
-        self.window = window
+        let text = NSTextField(labelWithString: value)
+        text.lineBreakMode = identifier == "subject" ? .byTruncatingTail : .byTruncatingMiddle
+        text.maximumNumberOfLines = identifier == "subject" ? 2 : 1
+        text.textColor = color(for: item.status)
+        return text
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        let row = reviewTableView.selectedRow
+        selectedReviewIndex = row >= 0 && row < reviewItems.count ? row : nil
+        updateSelectedReviewDetail()
+    }
+
+    private func color(for status: ReviewHistoryStatus) -> NSColor {
+        switch status {
+        case .completed:
+            return .labelColor
+        case .failed:
+            return .systemRed
+        case .skipped:
+            return .systemOrange
+        case .running:
+            return .systemBlue
+        case .pending:
+            return .secondaryLabelColor
+        }
+    }
+
+    private func selectedReviewItem() -> ReviewHistoryItem? {
+        guard let selectedReviewIndex,
+              selectedReviewIndex >= 0,
+              selectedReviewIndex < reviewItems.count
+        else {
+            return nil
+        }
+        return reviewItems[selectedReviewIndex]
+    }
+
+    private func refreshReviewHistory() {
+        do {
+            let config = try configFromFields()
+            reviewItems = try loadReviewHistory(config: config, runningCommits: runningCommits)
+            reviewTableView.reloadData()
+            if reviewItems.indices.contains(selectedReviewIndex ?? -1) {
+                reviewTableView.selectRowIndexes(IndexSet(integer: selectedReviewIndex ?? 0), byExtendingSelection: false)
+            } else if !reviewItems.isEmpty {
+                selectedReviewIndex = 0
+                reviewTableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+            } else {
+                selectedReviewIndex = nil
+            }
+            updateSummary(config: config)
+            updateSelectedReviewDetail()
+        } catch {
+            reviewItems = []
+            reviewTableView.reloadData()
+            reviewDetailTextView.string = "\(error)"
+            summaryField.stringValue = "Unable to load review history"
+            statusField.stringValue = "\(error)"
+        }
+    }
+
+    private func updateSummary(config: AppConfig) {
+        let completed = reviewItems.filter { $0.status == .completed }.count
+        let failed = reviewItems.filter { $0.status == .failed }.count
+        let skipped = reviewItems.filter { $0.status == .skipped }.count
+        let pending = reviewItems.filter { $0.status == .pending }.count
+        let repoName = URL(fileURLWithPath: expandedPath(config.repoPath)).lastPathComponent
+        summaryField.stringValue = "\(repoName) - \(completed) completed, \(failed) failed, \(skipped) skipped, \(pending) pending in last \(config.reviewSweepDepth) commits"
+    }
+
+    private func updateSelectedReviewDetail() {
+        guard let item = selectedReviewItem() else {
+            reviewDetailTextView.string = "Select a commit to see review status and output."
+            rerunReviewButton?.isEnabled = false
+            openReviewButton?.isEnabled = false
+            openBundleButton?.isEnabled = false
+            return
+        }
+
+        rerunReviewButton?.isEnabled = item.status != .running
+        openReviewButton?.isEnabled = item.reviewPath != nil
+        openBundleButton?.isEnabled = item.bundlePath != nil
+
+        var header = """
+        Commit: \(item.shortSha)
+        Status: \(item.status.rawValue)
+        Date: \(item.date)
+        Subject: \(item.subject)
+        Detail: \(item.detail)
+        """
+
+        if let reviewText = readTextFileIfPresent(path: item.reviewPath) {
+            header += "\n\n" + reviewText
+        } else if let logText = readTextFileIfPresent(path: item.logPath) {
+            header += "\n\nLog:\n" + logText
+        } else if item.reviewPath != nil {
+            header += "\n\nReview ledger exists, but no readable review file was found."
+        }
+
+        reviewDetailTextView.string = header
+    }
+
+    @objc private func rerunSelectedReview() {
+        guard let item = selectedReviewItem() else {
+            return
+        }
+
+        do {
+            let config = try configFromFields()
+            runningCommits.insert(item.sha)
+            refreshReviewHistory()
+            statusField.stringValue = "Rerunning \(item.shortSha)..."
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result: String
+                do {
+                    if let reportURL = try rerunReviewCommit(config: config, commit: item.sha) {
+                        result = "Review copied to \(reportURL.path)"
+                    } else {
+                        result = "Review did not produce a report for \(item.shortSha)"
+                    }
+                } catch {
+                    result = "\(error)"
+                }
+
+                DispatchQueue.main.async { [weak self] in
+                    self?.runningCommits.remove(item.sha)
+                    self?.statusField.stringValue = result
+                    self?.refreshReviewHistory()
+                }
+            }
+        } catch {
+            statusField.stringValue = "\(error)"
+        }
+    }
+
+    @objc private func openSelectedReview() {
+        guard let item = selectedReviewItem(),
+              let path = item.reviewPath
+        else {
+            return
+        }
+
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+    }
+
+    @objc private func openSelectedBundle() {
+        guard let item = selectedReviewItem(),
+              let path = item.bundlePath
+        else {
+            return
+        }
+
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+    }
+
+    @objc private func refreshLogsAction() {
+        refreshLogs()
+    }
+
+    private func refreshLogs() {
+        logsTextView.string = readLogText()
     }
 
     @objc private func showSettingsWindow() {
@@ -2455,6 +3038,14 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
 
     private func applyWatcherUpdate(_ update: WatcherUpdate) {
         watcherRunning = update.isRunning
+        if let lastHead = update.lastHead,
+           update.status.localizedCaseInsensitiveContains("review") || update.status.localizedCaseInsensitiveContains("retry") {
+            runningCommits.insert(lastHead)
+        } else if update.status.localizedCaseInsensitiveContains("completed") ||
+                    update.status.localizedCaseInsensitiveContains("failed") ||
+                    update.status.localizedCaseInsensitiveContains("No pending") {
+            runningCommits.removeAll()
+        }
 
         var lines = ["Watcher: \(update.status)"]
         if let lastHead = update.lastHead {
@@ -2468,6 +3059,11 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         }
         watcherField.stringValue = lines.joined(separator: "\n")
         updateWatcherControls(status: lines[0])
+        if activeSection == .reviews {
+            refreshReviewHistory()
+        } else if activeSection == .logs {
+            refreshLogs()
+        }
         if !update.isRunning {
             watcherLock.unlock()
         }
