@@ -61,6 +61,7 @@ struct AppConfig: Codable, Sendable {
     var statePath: String?
     var reviewCurrentHeadOnStartup: Bool?
     var sweepDepth: Int?
+    var retryFailedAfterSeconds: Int?
 
     var snapshotByteLimit: Int {
         max(1, maxSnapshotBytes ?? 200_000)
@@ -72,6 +73,10 @@ struct AppConfig: Codable, Sendable {
 
     var reviewSweepDepth: Int {
         max(1, sweepDepth ?? 50)
+    }
+
+    var failedReviewRetrySeconds: Int {
+        max(0, retryFailedAfterSeconds ?? 3_600)
     }
 }
 
@@ -88,7 +93,8 @@ func defaultConfig() -> AppConfig {
         reviewProfilePath: nil,
         statePath: nil,
         reviewCurrentHeadOnStartup: false,
-        sweepDepth: 50
+        sweepDepth: 50,
+        retryFailedAfterSeconds: 3_600
     )
 }
 
@@ -414,6 +420,10 @@ func isoNow() -> String {
     ISO8601DateFormatter().string(from: Date())
 }
 
+func isoDate(_ value: String) -> Date? {
+    ISO8601DateFormatter().date(from: value)
+}
+
 func timestampForFilename() -> String {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -501,6 +511,7 @@ func validationSummary(config: AppConfig) throws -> String {
     pollIntervalSeconds: \(config.pollIntervalSeconds)
     reviewCurrentHeadOnStartup: \(config.shouldReviewCurrentHeadOnStartup)
     sweepDepth: \(config.reviewSweepDepth)
+    retryFailedAfterSeconds: \(config.failedReviewRetrySeconds)
     maxSnapshotBytes: \(config.snapshotByteLimit)
     """
 }
@@ -1266,6 +1277,18 @@ func shouldSkipCommit(repoPath: String, commit: String) throws -> Bool {
     return message.range(of: #"\[(skip-review|no-review)\]"#, options: .regularExpression) != nil
 }
 
+func shouldRetryFailure(_ failure: ReviewFailureRecord, retryAfterSeconds: Int, now: Date = Date()) -> Bool {
+    guard retryAfterSeconds > 0 else {
+        return true
+    }
+
+    guard let failedAt = isoDate(failure.failedAt) else {
+        return true
+    }
+
+    return now.timeIntervalSince(failedAt) >= TimeInterval(retryAfterSeconds)
+}
+
 func recordSeenHead(config: AppConfig, head: String) throws {
     var state = try loadState(config: config)
     state.lastSeenHead = head
@@ -1289,10 +1312,21 @@ func pendingReviewCommits(config: AppConfig) throws -> [String] {
 
     let reviewed = Set(state.reviewed.keys)
     let skipped = Set((state.skipped ?? [:]).keys)
+    let recentHistory = try runGit(repoPath: repoPath, arguments: ["rev-list", "--reverse", "--max-count=\(config.reviewSweepDepth)", "HEAD"])
+        .split(separator: "\n")
+        .map(String.init)
+    let rangeCandidates = Set(output.split(separator: "\n").map(String.init))
+    let candidates = recentHistory.filter { rangeCandidates.contains($0) || state.failed[$0] != nil }
+
     var pending: [String] = []
 
-    for commit in output.split(separator: "\n").map(String.init) {
+    for commit in candidates {
         if reviewed.contains(commit) || skipped.contains(commit) {
+            continue
+        }
+
+        if let failure = state.failed[commit],
+           !shouldRetryFailure(failure, retryAfterSeconds: config.failedReviewRetrySeconds) {
             continue
         }
 
@@ -1566,6 +1600,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
     private let statePathField = NSTextField()
     private let pollIntervalField = NSTextField()
     private let sweepDepthField = NSTextField()
+    private let retryFailedAfterField = NSTextField()
     private let maxParallelField = NSTextField()
     private let maxSnapshotField = NSTextField()
     private let reviewStartupCheckbox = NSButton(checkboxWithTitle: "Review pending commits when watcher starts", target: nil, action: nil)
@@ -1659,13 +1694,13 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildWindow() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 800, height: 620),
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 660),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "AI Reviewer"
-        window.minSize = NSSize(width: 680, height: 480)
+        window.minSize = NSSize(width: 680, height: 520)
         window.isReleasedWhenClosed = false
 
         let root = NSStackView()
@@ -1688,6 +1723,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         root.addArrangedSubview(row(label: "State Path", field: statePathField))
         root.addArrangedSubview(row(label: "Poll Seconds", field: pollIntervalField))
         root.addArrangedSubview(row(label: "Sweep Depth", field: sweepDepthField))
+        root.addArrangedSubview(row(label: "Retry Failed Secs", field: retryFailedAfterField))
         root.addArrangedSubview(row(label: "Max Parallel", field: maxParallelField))
         root.addArrangedSubview(row(label: "Max Snapshot Bytes", field: maxSnapshotField))
         root.addArrangedSubview(checkboxRow(reviewStartupCheckbox))
@@ -1807,6 +1843,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         statePathField.stringValue = config.statePath ?? ""
         pollIntervalField.stringValue = "\(config.pollIntervalSeconds)"
         sweepDepthField.stringValue = "\(config.reviewSweepDepth)"
+        retryFailedAfterField.stringValue = "\(config.failedReviewRetrySeconds)"
         maxParallelField.stringValue = "\(config.maxParallelReviews)"
         maxSnapshotField.stringValue = "\(config.snapshotByteLimit)"
         reviewStartupCheckbox.state = config.shouldReviewCurrentHeadOnStartup ? .on : .off
@@ -1815,6 +1852,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
     private func configFromFields() throws -> AppConfig {
         guard let pollInterval = Int(pollIntervalField.stringValue),
               let sweepDepth = Int(sweepDepthField.stringValue),
+              let retryFailedAfter = Int(retryFailedAfterField.stringValue),
               let maxParallel = Int(maxParallelField.stringValue),
               let maxSnapshot = Int(maxSnapshotField.stringValue)
         else {
@@ -1833,7 +1871,8 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
             reviewProfilePath: reviewProfileField.stringValue.isEmpty ? nil : reviewProfileField.stringValue,
             statePath: statePathField.stringValue.isEmpty ? nil : statePathField.stringValue,
             reviewCurrentHeadOnStartup: reviewStartupCheckbox.state == .on,
-            sweepDepth: max(1, sweepDepth)
+            sweepDepth: max(1, sweepDepth),
+            retryFailedAfterSeconds: max(0, retryFailedAfter)
         )
     }
 

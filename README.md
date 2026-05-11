@@ -29,7 +29,7 @@ This is early-stage software. The current app can:
 - run profile-driven specialist reviews from bundled or user-selected JSON
   profiles
 - copy completed review reports back to the configured reports directory
-- track reviewed and failed SHAs in local state
+- track reviewed, skipped, and failed SHAs in local state
 
 ## Quick Start
 
@@ -110,7 +110,8 @@ local state. Already reviewed SHAs are skipped.
 Pending commits are discovered by walking up to `sweepDepth` recent commits,
 skipping already reviewed SHAs, merge commits, and commit messages containing
 `[skip-review]` or `[no-review]`. Startup reconciliation only runs when
-`reviewCurrentHeadOnStartup` is enabled in config.
+`reviewCurrentHeadOnStartup` is enabled in config. Failed reviews are retried
+after `retryFailedAfterSeconds`; the default is one hour.
 
 ## Planned Runtime Locations
 
@@ -181,6 +182,7 @@ The settings UI currently covers:
 - state path
 - poll interval
 - sweep depth
+- retry failed seconds
 - max parallel reviews/profile agents
 - review pending commits on watcher startup
 - watcher enabled/disabled and recent review state

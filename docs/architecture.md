@@ -56,7 +56,8 @@ Build a minimal app plus foreground CLI that:
   reconciliation is controlled by `reviewCurrentHeadOnStartup`.
 - Reconciles pending commits by walking recent history up to `sweepDepth`,
   skipping already reviewed SHAs, merge commits, and `[skip-review]` or
-  `[no-review]` commit messages.
+  `[no-review]` commit messages. Failed SHAs are retried only after
+  `retryFailedAfterSeconds`.
 - Materializes HEAD into a local cache bundle.
 - Runs the configured review profile against a local bundle using the stripped
   environment and read-only sandbox. Profile agents run concurrently up to
@@ -65,7 +66,7 @@ Build a minimal app plus foreground CLI that:
 - Copies successful reports back through AI Reviewer and records reviewed or
   failed SHAs in local state.
 
-After that works, add failed-review retry policy and login-item support.
+After that works, add login-item support.
 
 ## Concrete Implementation Plan
 

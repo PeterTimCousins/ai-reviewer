@@ -10,5 +10,6 @@
   "statePath": null,
   "reviewCurrentHeadOnStartup": false,
   "sweepDepth": 50,
+  "retryFailedAfterSeconds": 3600,
   "maxSnapshotBytes": 200000
 }
