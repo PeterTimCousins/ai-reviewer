@@ -21,7 +21,8 @@ This is early-stage software. The current app can:
 - build a small macOS app bundle with bundle identifier `com.ai-reviewer`
 - open a basic settings window when launched normally
 - validate a local JSON config
-- watch a repository HEAD in the foreground
+- start and stop an app-owned repository HEAD watcher from the settings window
+- watch a repository HEAD in the foreground from the CLI
 - materialize the current HEAD into a local cache bundle
 - run Codex against a local cache bundle with a stripped environment
 - copy completed review reports back to the configured reports directory
@@ -51,6 +52,10 @@ Open the settings window with:
 ```bash
 open build/AI\ Reviewer.app
 ```
+
+Use **Start Watching** and **Stop Watching** in the settings window to run the
+watcher inside the app process. Closing the settings window leaves an active
+watcher running; reopen the window from the app menu or Dock icon.
 
 ## Commands
 
@@ -145,11 +150,11 @@ AI_REVIEWER_CODESIGN_IDENTITY="Developer ID Application: Example" scripts/build.
 
 The app currently includes a basic settings window for editing the app-support
 config, choosing a watched repository, validating settings, materializing HEAD,
-running a HEAD review, running the one-shot review workflow, and opening the
-cache folder.
+running a HEAD review, running the one-shot review workflow, starting and
+stopping the app-owned watcher, and opening the cache folder.
 
 The intended product shape is a menu-bar app that owns the watcher lifecycle.
-The settings UI should continue to cover:
+The settings UI currently covers:
 
 - watched repository
 - reports path inside that repository

@@ -724,10 +724,149 @@ func parseCommand(_ args: [String]) throws -> ParsedCommand {
     }
 }
 
+struct WatcherUpdate: Sendable {
+    let status: String
+    let isRunning: Bool
+    let lastHead: String?
+    let lastReview: String?
+    let lastError: String?
+}
+
+final class AppWatcher: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "com.ai-reviewer.app-watcher", qos: .utility)
+    private var timer: DispatchSourceTimer?
+    private var isRunning = false
+    private var isReviewing = false
+    private var lastHead: String?
+    private var lastReview: String?
+    private var lastError: String?
+
+    func start(config: AppConfig, onUpdate: @escaping @Sendable (WatcherUpdate) -> Void) {
+        queue.async {
+            self.timer?.cancel()
+            self.timer = nil
+            self.isRunning = true
+            self.isReviewing = false
+            self.lastReview = nil
+            self.lastError = nil
+            self.send("Starting watcher...", onUpdate: onUpdate)
+
+            do {
+                try validatePaths(config: config)
+                let repoPath = repoURL(config: config).path
+                self.lastHead = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
+                self.send("Watching \(repoPath)", onUpdate: onUpdate)
+
+                if config.shouldReviewCurrentHeadOnStartup {
+                    self.reviewCurrentHead(config: config, reason: "Reviewing current HEAD on startup", onUpdate: onUpdate)
+                }
+
+                let interval = max(1, config.pollIntervalSeconds)
+                let timer = DispatchSource.makeTimerSource(queue: self.queue)
+                timer.schedule(deadline: .now() + .seconds(interval), repeating: .seconds(interval))
+                timer.setEventHandler { [weak self] in
+                    self?.poll(config: config, onUpdate: onUpdate)
+                }
+                self.timer = timer
+                timer.resume()
+            } catch {
+                self.isRunning = false
+                self.lastError = "\(error)"
+                self.send("Watcher failed to start", onUpdate: onUpdate)
+            }
+        }
+    }
+
+    func stop(onUpdate: @escaping @Sendable (WatcherUpdate) -> Void) {
+        queue.async {
+            self.isRunning = false
+            self.timer?.cancel()
+            self.timer = nil
+            let suffix = self.isReviewing ? " after current review finishes" : ""
+            self.send("Watcher stopped\(suffix)", onUpdate: onUpdate)
+        }
+    }
+
+    private func poll(config: AppConfig, onUpdate: @escaping @Sendable (WatcherUpdate) -> Void) {
+        guard isRunning, !isReviewing else {
+            return
+        }
+
+        do {
+            let repoPath = repoURL(config: config).path
+            let head = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
+
+            if lastHead == nil {
+                lastHead = head
+            }
+
+            guard head != lastHead else {
+                send("Watching for commits", onUpdate: onUpdate)
+                return
+            }
+
+            let previousHead = lastHead
+            lastHead = head
+            reviewCurrentHead(
+                config: config,
+                reason: "HEAD changed \(short(previousHead)) -> \(short(head))",
+                onUpdate: onUpdate
+            )
+        } catch {
+            lastError = "\(error)"
+            send("Watcher poll failed", onUpdate: onUpdate)
+        }
+    }
+
+    private func reviewCurrentHead(config: AppConfig, reason: String, onUpdate: @escaping @Sendable (WatcherUpdate) -> Void) {
+        guard isRunning else {
+            return
+        }
+
+        isReviewing = true
+        lastError = nil
+        send(reason, onUpdate: onUpdate)
+
+        do {
+            if let reportURL = try reviewOnce(config: config) {
+                lastReview = reportURL.path
+                send("Review completed", onUpdate: onUpdate)
+            } else {
+                send("HEAD already reviewed", onUpdate: onUpdate)
+            }
+        } catch {
+            lastError = "\(error)"
+            send("Review failed", onUpdate: onUpdate)
+        }
+
+        isReviewing = false
+    }
+
+    private func send(_ status: String, onUpdate: @Sendable (WatcherUpdate) -> Void) {
+        onUpdate(WatcherUpdate(
+            status: status,
+            isRunning: isRunning,
+            lastHead: lastHead,
+            lastReview: lastReview,
+            lastError: lastError
+        ))
+    }
+
+    private func short(_ sha: String?) -> String {
+        guard let sha, !sha.isEmpty else {
+            return "(none)"
+        }
+
+        return String(sha.prefix(7))
+    }
+}
+
 @MainActor
 final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
     private let configURL = defaultAppConfigURL()
     private var window: NSWindow?
+    private let appWatcher = AppWatcher()
+    private var watcherRunning = false
 
     private let repoField = NSTextField()
     private let reportsField = NSTextField()
@@ -740,6 +879,9 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
     private let maxSnapshotField = NSTextField()
     private let reviewStartupCheckbox = NSButton(checkboxWithTitle: "Review current HEAD when watcher starts", target: nil, action: nil)
     private let statusField = NSTextField(labelWithString: "Idle")
+    private let watcherField = NSTextField(labelWithString: "Watcher: stopped")
+    private var startWatcherButton: NSButton?
+    private var stopWatcherButton: NSButton?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -752,13 +894,24 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        !watcherRunning
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showSettingsWindow()
+        return true
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        appWatcher.stop { _ in }
     }
 
     private func buildMenu() {
         let mainMenu = NSMenu()
         let appMenuItem = NSMenuItem()
         let appMenu = NSMenu()
+        appMenu.addItem(NSMenuItem(title: "Settings...", action: #selector(showSettingsWindow), keyEquivalent: ","))
+        appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(NSMenuItem(title: "Quit AI Reviewer", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         appMenuItem.submenu = appMenu
         mainMenu.addItem(appMenuItem)
@@ -767,13 +920,13 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildWindow() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 800, height: 550),
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 620),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "AI Reviewer"
-        window.minSize = NSSize(width: 680, height: 390)
+        window.minSize = NSSize(width: 680, height: 480)
 
         let root = NSStackView()
         root.orientation = .vertical
@@ -808,6 +961,23 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         buttonRow.addArrangedSubview(button(title: "Open Cache", action: #selector(openCache)))
         root.addArrangedSubview(buttonRow)
 
+        let watcherRow = NSStackView()
+        watcherRow.orientation = .horizontal
+        watcherRow.spacing = 8
+        let startButton = button(title: "Start Watching", action: #selector(startWatching))
+        let stopButton = button(title: "Stop Watching", action: #selector(stopWatching))
+        stopButton.isEnabled = false
+        startWatcherButton = startButton
+        stopWatcherButton = stopButton
+        watcherRow.addArrangedSubview(startButton)
+        watcherRow.addArrangedSubview(stopButton)
+        root.addArrangedSubview(watcherRow)
+
+        watcherField.lineBreakMode = .byWordWrapping
+        watcherField.maximumNumberOfLines = 8
+        watcherField.textColor = .secondaryLabelColor
+        root.addArrangedSubview(watcherField)
+
         statusField.lineBreakMode = .byWordWrapping
         statusField.maximumNumberOfLines = 12
         statusField.textColor = .secondaryLabelColor
@@ -823,6 +993,11 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         ])
 
         self.window = window
+    }
+
+    @objc private func showSettingsWindow() {
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     private func row(label: String, field: NSTextField, buttonTitle: String? = nil, action: Selector? = nil) -> NSView {
@@ -965,6 +1140,54 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
 
             return "HEAD already reviewed"
         }
+    }
+
+    @objc private func startWatching() {
+        do {
+            let config = try configFromFields()
+            try saveConfig(config, to: configURL)
+            watcherRunning = true
+            startWatcherButton?.isEnabled = false
+            stopWatcherButton?.isEnabled = true
+            watcherField.stringValue = "Watcher: starting..."
+            appWatcher.start(config: config) { [weak self] update in
+                DispatchQueue.main.async {
+                    self?.applyWatcherUpdate(update)
+                }
+            }
+        } catch {
+            watcherField.stringValue = "Watcher: \(error)"
+        }
+    }
+
+    @objc private func stopWatching() {
+        watcherRunning = false
+        startWatcherButton?.isEnabled = true
+        stopWatcherButton?.isEnabled = false
+        watcherField.stringValue = "Watcher: stopping..."
+        appWatcher.stop { [weak self] update in
+            DispatchQueue.main.async {
+                self?.applyWatcherUpdate(update)
+            }
+        }
+    }
+
+    private func applyWatcherUpdate(_ update: WatcherUpdate) {
+        watcherRunning = update.isRunning
+        startWatcherButton?.isEnabled = !update.isRunning
+        stopWatcherButton?.isEnabled = update.isRunning
+
+        var lines = ["Watcher: \(update.status)"]
+        if let lastHead = update.lastHead {
+            lines.append("Last HEAD: \(String(lastHead.prefix(12)))")
+        }
+        if let lastReview = update.lastReview {
+            lines.append("Last report: \(lastReview)")
+        }
+        if let lastError = update.lastError {
+            lines.append("Last error: \(lastError)")
+        }
+        watcherField.stringValue = lines.joined(separator: "\n")
     }
 
     private func runConfiguredOperation(_ label: String, operation: @escaping @Sendable (AppConfig) throws -> String) {
