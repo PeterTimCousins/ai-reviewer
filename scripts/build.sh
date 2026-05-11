@@ -26,7 +26,8 @@ fi
 mkdir -p "$app_root/Contents/MacOS"
 mkdir -p "$app_root/Contents/Resources"
 cp "$repo_root/.build/debug/ai-reviewer-watcher" "$app_root/Contents/MacOS/$binary_name"
-cp -R "$repo_root/profiles" "$app_root/Contents/Resources/profiles"
+mkdir -p "$app_root/Contents/Resources/profiles"
+cp "$repo_root/profiles/default-review.json" "$app_root/Contents/Resources/profiles/default-review.json"
 cp "$repo_root/Assets/AppIcon.icns" "$app_root/Contents/Resources/AppIcon.icns"
 
 cat > "$app_root/Contents/Info.plist" <<PLIST
