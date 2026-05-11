@@ -204,6 +204,16 @@ func appSupportURL() -> URL {
         .appendingPathComponent("Library/Application Support/com.ai-reviewer")
 }
 
+func appLogsURL() -> URL {
+    FileManager.default
+        .homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/com.ai-reviewer")
+}
+
+func watcherLogURL() -> URL {
+    appLogsURL().appendingPathComponent("watcher.log")
+}
+
 func stateURL(config: AppConfig) -> URL {
     if let statePath = config.statePath, !statePath.isEmpty {
         return URL(fileURLWithPath: expandedPath(statePath))
@@ -843,13 +853,42 @@ final class AppWatcher: @unchecked Sendable {
     }
 
     private func send(_ status: String, onUpdate: @Sendable (WatcherUpdate) -> Void) {
-        onUpdate(WatcherUpdate(
+        let update = WatcherUpdate(
             status: status,
             isRunning: isRunning,
             lastHead: lastHead,
             lastReview: lastReview,
             lastError: lastError
-        ))
+        )
+        appendLog(update)
+        onUpdate(update)
+    }
+
+    private func appendLog(_ update: WatcherUpdate) {
+        let logURL = watcherLogURL()
+        let fields = [
+            "status=\(update.status)",
+            "running=\(update.isRunning)",
+            "head=\(update.lastHead ?? "")",
+            "review=\(update.lastReview ?? "")",
+            "error=\(update.lastError ?? "")"
+        ]
+        let line = "\(isoNow()) \(fields.joined(separator: " "))\n"
+
+        do {
+            try FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: logURL.path) {
+                FileManager.default.createFile(atPath: logURL.path, contents: nil)
+            }
+            let handle = try FileHandle(forWritingTo: logURL)
+            defer {
+                try? handle.close()
+            }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: Data(line.utf8))
+        } catch {
+            fputs("watcher log warning: \(error)\n", stderr)
+        }
     }
 
     private func short(_ sha: String?) -> String {
@@ -959,6 +998,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         buttonRow.addArrangedSubview(button(title: "Review HEAD", action: #selector(reviewHeadFromSettings)))
         buttonRow.addArrangedSubview(button(title: "Review Once", action: #selector(reviewOnceFromSettings)))
         buttonRow.addArrangedSubview(button(title: "Open Cache", action: #selector(openCache)))
+        buttonRow.addArrangedSubview(button(title: "Open Logs", action: #selector(openLogs)))
         root.addArrangedSubview(buttonRow)
 
         let watcherRow = NSStackView()
@@ -1217,6 +1257,16 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         do {
             let config = try configFromFields()
             let url = cacheURL(config: config)
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            NSWorkspace.shared.open(url)
+        } catch {
+            statusField.stringValue = "\(error)"
+        }
+    }
+
+    @objc private func openLogs() {
+        do {
+            let url = appLogsURL()
             try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
             NSWorkspace.shared.open(url)
         } catch {

@@ -78,6 +78,8 @@ menu-bar/login item wrapper.
    AI Reviewer copy the final report back to the configured repo reports path.
 8. Evolve the current settings window into a menu-bar app and login item after
    the app-owned watcher can run one review cycle end to end.
+9. Keep watcher lifecycle logs under `~/Library/Logs/com.ai-reviewer/` so
+   validation does not require Accessibility, AppleScript, or UI automation.
 
 ## Public App Roadmap
 
