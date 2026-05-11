@@ -25,6 +25,12 @@ AI_REVIEWER_CODESIGN_IDENTITY="Developer ID Application: Example" scripts/build.
 
 `scripts/install.sh` copies the built bundle to `~/Applications/AI Reviewer.app`.
 
+Launch the settings window with:
+
+```bash
+open build/AI\ Reviewer.app
+```
+
 For local testing, copy the ignored config template and edit the paths:
 
 ```bash

@@ -19,6 +19,7 @@ The intended model is:
 This is early-stage software. The current app can:
 
 - build a small macOS app bundle with bundle identifier `com.ai-reviewer`
+- open a basic settings window when launched normally
 - validate a local JSON config
 - watch a repository HEAD in the foreground
 - materialize the current HEAD into a local cache bundle
@@ -41,6 +42,12 @@ build/AI\ Reviewer.app/Contents/MacOS/ai-reviewer-watcher materialize-head --con
 
 `config/local.json` is ignored by Git. `config/example.json` is safe for public
 use and contains placeholder paths only.
+
+Open the settings window with:
+
+```bash
+open build/AI\ Reviewer.app
+```
 
 ## Commands
 
@@ -110,8 +117,12 @@ AI_REVIEWER_CODESIGN_IDENTITY="Developer ID Application: Example" scripts/build.
 
 ## GUI Roadmap
 
-The intended product shape is a menu-bar app with a settings window. The first
-settings UI should configure:
+The app currently includes a basic settings window for editing the app-support
+config, choosing a watched repository, validating settings, materializing HEAD,
+and opening the cache folder.
+
+The intended product shape is a menu-bar app. The settings UI should continue
+to cover:
 
 - watched repository
 - reports path inside that repository

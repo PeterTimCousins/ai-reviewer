@@ -47,7 +47,7 @@ cat > "$app_root/Contents/Info.plist" <<PLIST
   <string>0.1.0</string>
   <key>CFBundleVersion</key>
   <string>1</string>
-  <key>LSBackgroundOnly</key>
+  <key>NSHighResolutionCapable</key>
   <true/>
 </dict>
 </plist>

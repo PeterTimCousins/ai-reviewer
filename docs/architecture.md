@@ -68,13 +68,14 @@ item wrapper.
    ephemeral execution, ignored user config, and ignored repo rules.
 7. Write Codex output to the local cache first, then have AI Reviewer copy the
    final report back to the configured repo reports path.
-8. Add a menu-bar app and login item after the foreground watcher can run one
-   review cycle end to end.
+8. Evolve the current settings window into a menu-bar app and login item after
+   the foreground watcher can run one review cycle end to end.
 
 ## Public App Roadmap
 
-The public app should evolve toward a menu-bar utility with a settings window.
-The settings UI should be thin over the same app operations used by the CLI:
+The app now has a basic settings window. It should evolve toward a menu-bar
+utility, with the settings UI remaining thin over the same operations used by
+the CLI:
 
 - choose watched repository with `NSOpenPanel`
 - configure reports path, cache path, Codex home, poll interval, and parallelism
