@@ -211,27 +211,21 @@ controls specialist-agent concurrency inside one commit review.
 The **Logs** view tails the watcher log from
 `~/Library/Logs/com.ai-reviewer/watcher.log`.
 
-The **Settings** view remains a thin editor over the app-support config. It
+The **Settings** view keeps common project and automation choices visible, and
+puts lower-level paths and developer actions behind **Show Advanced**. It
 covers:
 
 - watched repository
 - reports path inside that repository
-- cache path
-- Codex home path
-- Codex model
 - Review profile path
-- state path
-- poll interval
-- sweep depth
-- retry failed seconds
-- Codex timeout seconds
 - max concurrent commit reviews
 - max agents per review
-- max prompt snapshot bytes
 - start watching when app opens
 - hide Dock icon
-- review pending commits on watcher startup
 - launch at login
+- cache path, Codex home, Codex model, state path, polling, history, retry,
+  timeout, and snapshot limits in Advanced
+- materialize/review bundle development actions in Advanced
 - watcher enabled/disabled and recent review state
 
 ## Review Profiles

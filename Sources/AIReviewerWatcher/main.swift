@@ -2262,6 +2262,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var queuedManualCommits: [String] = []
     private var activeManualCommits = Set<String>()
     private var hasStatusIssue = false
+    private var advancedSettingsVisible = false
 
     private let repoField = NSTextField()
     private let reportsField = NSTextField()
@@ -2769,36 +2770,49 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         title.font = .systemFont(ofSize: 18, weight: .semibold)
         form.addArrangedSubview(title)
 
+        form.addArrangedSubview(sectionHeader("Project"))
         form.addArrangedSubview(row(label: "Repository", field: repoField, buttonTitle: "Choose", action: #selector(chooseRepository)))
-        form.addArrangedSubview(row(label: "Reports Path", field: reportsField))
-        form.addArrangedSubview(row(label: "Review Profile", field: reviewProfileField, buttonTitle: "Choose", action: #selector(chooseReviewProfile)))
-        form.addArrangedSubview(row(label: "Cache Path", field: cacheField))
-        form.addArrangedSubview(row(label: "Codex Home", field: codexHomeField))
-        form.addArrangedSubview(row(label: "Codex Model", field: codexModelField))
-        form.addArrangedSubview(row(label: "State Path", field: statePathField))
-        form.addArrangedSubview(row(label: "Poll Seconds", field: pollIntervalField))
-        form.addArrangedSubview(row(label: "Sweep Depth", field: sweepDepthField))
-        form.addArrangedSubview(row(label: "Retry Failed Secs", field: retryFailedAfterField))
-        form.addArrangedSubview(row(label: "Codex Timeout Secs", field: codexTimeoutField))
-        form.addArrangedSubview(row(label: "Max Concurrent Reviews", field: maxParallelCommitReviewsField))
-        form.addArrangedSubview(row(label: "Max Agents / Review", field: maxParallelField))
-        form.addArrangedSubview(row(label: "Max Snapshot Bytes", field: maxSnapshotField))
-        form.addArrangedSubview(row(label: "Max Prompt Snapshot", field: maxPromptSnapshotField))
+        form.addArrangedSubview(row(label: "Reports Folder", field: reportsField))
+        form.addArrangedSubview(row(label: "Review Instructions", field: reviewProfileField, buttonTitle: "Choose", action: #selector(chooseReviewProfile)))
+
+        form.addArrangedSubview(sectionHeader("Automation"))
+        form.addArrangedSubview(row(label: "Reviews at Once", field: maxParallelCommitReviewsField))
+        form.addArrangedSubview(row(label: "Agents per Review", field: maxParallelField))
         form.addArrangedSubview(checkboxRow(startWatcherOnLaunchCheckbox))
         form.addArrangedSubview(checkboxRow(hideDockIconCheckbox))
-        form.addArrangedSubview(checkboxRow(reviewStartupCheckbox))
         form.addArrangedSubview(checkboxRow(launchAtLoginCheckbox))
 
         let buttonRow = NSStackView()
         buttonRow.orientation = .horizontal
         buttonRow.spacing = 8
         buttonRow.addArrangedSubview(button(title: "Save", action: #selector(saveSettings)))
-        buttonRow.addArrangedSubview(button(title: "Validate", action: #selector(validateSettings)))
-        buttonRow.addArrangedSubview(button(title: "Materialize HEAD", action: #selector(materializeHeadFromSettings)))
-        buttonRow.addArrangedSubview(button(title: "Review HEAD", action: #selector(reviewHeadFromSettings)))
-        buttonRow.addArrangedSubview(button(title: "Review Once", action: #selector(reviewOnceFromSettings)))
-        buttonRow.addArrangedSubview(button(title: "Open Cache", action: #selector(openCache)))
+        buttonRow.addArrangedSubview(button(title: "Check Settings", action: #selector(validateSettings)))
+        buttonRow.addArrangedSubview(button(title: "Review Current Commit", action: #selector(reviewOnceFromSettings)))
+        buttonRow.addArrangedSubview(button(title: advancedSettingsVisible ? "Hide Advanced" : "Show Advanced", action: #selector(toggleAdvancedSettings)))
         form.addArrangedSubview(buttonRow)
+
+        if advancedSettingsVisible {
+            form.addArrangedSubview(sectionHeader("Advanced"))
+            form.addArrangedSubview(row(label: "Cache Folder", field: cacheField))
+            form.addArrangedSubview(row(label: "Codex Home", field: codexHomeField))
+            form.addArrangedSubview(row(label: "Codex Model", field: codexModelField))
+            form.addArrangedSubview(row(label: "State File", field: statePathField))
+            form.addArrangedSubview(row(label: "Poll Seconds", field: pollIntervalField))
+            form.addArrangedSubview(row(label: "History Depth", field: sweepDepthField))
+            form.addArrangedSubview(row(label: "Retry Failed Secs", field: retryFailedAfterField))
+            form.addArrangedSubview(row(label: "Codex Timeout Secs", field: codexTimeoutField))
+            form.addArrangedSubview(row(label: "Snapshot Bytes", field: maxSnapshotField))
+            form.addArrangedSubview(row(label: "Prompt Snapshot Bytes", field: maxPromptSnapshotField))
+            form.addArrangedSubview(checkboxRow(reviewStartupCheckbox))
+
+            let advancedButtons = NSStackView()
+            advancedButtons.orientation = .horizontal
+            advancedButtons.spacing = 8
+            advancedButtons.addArrangedSubview(button(title: "Materialize Bundle", action: #selector(materializeHeadFromSettings)))
+            advancedButtons.addArrangedSubview(button(title: "Run Bundle Review", action: #selector(reviewHeadFromSettings)))
+            advancedButtons.addArrangedSubview(button(title: "Open Cache", action: #selector(openCache)))
+            form.addArrangedSubview(advancedButtons)
+        }
 
         let container = NSView()
         container.translatesAutoresizingMaskIntoConstraints = false
@@ -2810,6 +2824,19 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             form.topAnchor.constraint(equalTo: container.topAnchor)
         ])
         return container
+    }
+
+    private func sectionHeader(_ title: String) -> NSTextField {
+        let field = NSTextField(labelWithString: title)
+        field.font = .systemFont(ofSize: 13, weight: .semibold)
+        field.textColor = .secondaryLabelColor
+        return field
+    }
+
+    @objc private func toggleAdvancedSettings() {
+        commitFieldEditing()
+        advancedSettingsVisible.toggle()
+        replaceContent(with: buildSettingsView())
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
