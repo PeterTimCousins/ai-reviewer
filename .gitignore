@@ -11,5 +11,6 @@ DerivedData/
 
 # Local runtime state
 config/local.json
+profiles/local/
 logs/
 tmp/

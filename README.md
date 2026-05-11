@@ -52,7 +52,8 @@ use and contains placeholder paths only.
 
 Review profiles live under `profiles/`. A blank `reviewProfilePath` uses the
 bundled default profile. To use a specific profile, set `reviewProfilePath` to
-an absolute path or choose a JSON profile in the settings window.
+an absolute path or choose a JSON profile in the settings window. Private
+repo-specific profiles can live under ignored `profiles/local/`.
 
 Open the settings window with:
 
@@ -195,7 +196,6 @@ through prompts while their working directory remains the local bundle.
 
 Bundled profiles:
 
-- `profiles/default-review.json`: general-purpose three-specialist review
-- `profiles/dropship-review.json`: dropship-app profile with compliance, bug,
-  impact, quality, security, architecture, and conditional integrator/workflow
-  specialists
+- `profiles/default-review.json`: general-purpose enterprise review with
+  correctness, security, data integrity, contract, workflow, resilience,
+  frontend, and test specialists

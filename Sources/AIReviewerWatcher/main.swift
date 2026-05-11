@@ -253,23 +253,36 @@ func stateURL(config: AppConfig) -> URL {
 }
 
 func bundledProfileURL(name: String) -> URL? {
-    Bundle.main.resourceURL?
-        .appendingPathComponent("profiles")
-        .appendingPathComponent(name)
+    let candidates = [
+        Bundle.main.resourceURL?
+            .appendingPathComponent("profiles")
+            .appendingPathComponent(name),
+        Bundle.main.executableURL?
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Resources")
+            .appendingPathComponent("profiles")
+            .appendingPathComponent(name),
+        URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("profiles")
+            .appendingPathComponent(name)
+    ]
+
+    return candidates.compactMap { $0 }.first { FileManager.default.fileExists(atPath: $0.path) }
 }
 
 func defaultReviewProfile() -> ReviewProfile {
     ReviewProfile(
         schemaVersion: 1,
-        name: "Default Review",
-        description: "General post-commit review profile.",
+        name: "Enterprise Default Review",
+        description: "Generic enterprise-grade post-commit review profile.",
         maxDiffBytes: 200_000,
         ignorePaths: [],
         globalInstructions: """
-        You are Codex running a precise, read-only post-commit code review.
+        You are Codex running a precise, read-only post-commit review for an enterprise software project.
         Review only changes introduced by the commit represented in the bundle.
         Do not report pre-existing issues unless this diff clearly makes them worse.
-        Report only concrete correctness, security, data, workflow, or maintainability issues visible from the diff and included snapshots.
+        Report only concrete correctness, security, data integrity, authorization, API compatibility, migration, concurrency, resilience, observability, user-facing behavior, or test issues visible from the diff and included snapshots.
         """,
         defaultModel: nil,
         agents: [
