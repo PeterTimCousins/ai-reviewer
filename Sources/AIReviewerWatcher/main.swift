@@ -2772,7 +2772,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
         form.addArrangedSubview(sectionHeader("Project"))
         form.addArrangedSubview(row(label: "Repository", field: repoField, buttonTitle: "Choose", action: #selector(chooseRepository)))
-        form.addArrangedSubview(row(label: "Reports Folder", field: reportsField))
+        form.addArrangedSubview(row(label: "Reports Folder", field: reportsField, buttonTitle: "Choose", action: #selector(chooseReportsFolder)))
         form.addArrangedSubview(row(label: "Review Instructions", field: reviewProfileField, buttonTitle: "Choose", action: #selector(chooseReviewProfile)))
 
         form.addArrangedSubview(sectionHeader("Automation"))
@@ -2786,8 +2786,6 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         buttonRow.orientation = .horizontal
         buttonRow.spacing = 8
         buttonRow.addArrangedSubview(button(title: "Save", action: #selector(saveSettings)))
-        buttonRow.addArrangedSubview(button(title: "Check Settings", action: #selector(validateSettings)))
-        buttonRow.addArrangedSubview(button(title: "Review Current Commit", action: #selector(reviewOnceFromSettings)))
         buttonRow.addArrangedSubview(button(title: advancedSettingsVisible ? "Hide Advanced" : "Show Advanced", action: #selector(toggleAdvancedSettings)))
         form.addArrangedSubview(buttonRow)
 
@@ -2818,12 +2816,20 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         container.translatesAutoresizingMaskIntoConstraints = false
         form.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(form)
+        let bottom = form.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor)
+        bottom.priority = .defaultLow
         NSLayoutConstraint.activate([
             form.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             form.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor),
-            form.topAnchor.constraint(equalTo: container.topAnchor)
+            form.topAnchor.constraint(equalTo: container.topAnchor),
+            bottom
         ])
-        return container
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .noBorder
+        scroll.documentView = container
+        container.frame = NSRect(x: 0, y: 0, width: 940, height: advancedSettingsVisible ? 780 : 360)
+        return scroll
     }
 
     private func sectionHeader(_ title: String) -> NSTextField {
@@ -3340,6 +3346,33 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
         if panel.runModal() == .OK, let url = panel.url {
             repoField.stringValue = url.path
+        }
+    }
+
+    @objc private func chooseReportsFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+
+        let repoURL = URL(fileURLWithPath: expandedPath(repoField.stringValue)).standardizedFileURL
+        panel.directoryURL = repoURL
+
+        if panel.runModal() == .OK, let url = panel.url {
+            let selected = url.standardizedFileURL.path
+            let repoPath = repoURL.path
+            guard selected == repoPath || selected.hasPrefix(repoPath + "/") else {
+                statusField.stringValue = "Reports folder must be inside the repository."
+                return
+            }
+
+            if selected == repoPath {
+                reportsField.stringValue = "."
+            } else {
+                reportsField.stringValue = String(selected.dropFirst(repoPath.count + 1))
+            }
         }
     }
 
