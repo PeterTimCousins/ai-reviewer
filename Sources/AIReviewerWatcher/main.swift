@@ -2509,13 +2509,13 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
     private func buildWindow() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1060, height: 760),
+            contentRect: NSRect(x: 0, y: 0, width: 1160, height: 820),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "AI Reviewer"
-        window.minSize = NSSize(width: 860, height: 620)
+        window.minSize = NSSize(width: 980, height: 680)
         window.isReleasedWhenClosed = false
         window.delegate = self
 
@@ -2718,12 +2718,13 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         reviewTableView.rowHeight = 44
         reviewTableView.usesAlternatingRowBackgroundColors = true
         reviewTableView.allowsEmptySelection = true
+        reviewTableView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
 
         for column in [
             ("status", "Status", 112.0),
             ("commit", "Commit", 86.0),
-            ("subject", "Commit", 250.0),
-            ("date", "Date", 130.0)
+            ("subject", "Commit", 340.0),
+            ("date", "Date", 140.0)
         ] {
             let tableColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(column.0))
             tableColumn.title = column.1
