@@ -19,19 +19,18 @@ model, install lifecycle, and review queue can be managed independently.
 
 ## Current Status
 
-The first implementation target is a foreground helper that can load config,
-validate the watched repository and reports path, and read Git HEAD state.
+The first implementation target is a foreground Swift helper that can load
+config, validate the watched repository and reports path, and read Git HEAD
+state.
 
-SwiftPM is currently blocked on this Mac by a Command Line Tools compiler/SDK
-mismatch, so `scripts/build.sh` falls back to an Objective-C Foundation helper
-that builds with `clang`. The fallback is packaged as a macOS app bundle with:
+`scripts/build.sh` packages the Swift executable as a macOS app bundle with:
 
 - Bundle path: `build/AI Reviewer.app`
 - Bundle identifier: `com.ai-reviewer`
 - Executable: `Contents/MacOS/ai-reviewer-watcher`
 
 By default the app is ad-hoc signed. For a permission identity that survives
-rebuilds, set a real local signing identity before building:
+rebuilds, set a real signing identity before building:
 
 ```bash
 AI_REVIEWER_CODESIGN_IDENTITY="Developer ID Application: Example" scripts/build.sh

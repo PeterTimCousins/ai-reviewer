@@ -9,27 +9,22 @@ bundle_id="com.ai-reviewer"
 build_root="$repo_root/build"
 app_root="$build_root/$app_name"
 binary_name="ai-reviewer-watcher"
-fallback_source="$repo_root/Sources/AIReviewerWatcherObjC/main.m"
 codesign_identity="${AI_REVIEWER_CODESIGN_IDENTITY:--}"
-swiftpm_log="$build_root/swiftpm-build.log"
 
 mkdir -p "$build_root"
 
-if [[ "${AI_REVIEWER_FORCE_FALLBACK:-0}" != "1" ]] && swift build >"$swiftpm_log" 2>&1; then
-  mkdir -p "$app_root/Contents/MacOS"
-  cp "$repo_root/.build/debug/ai-reviewer-watcher" "$app_root/Contents/MacOS/$binary_name"
-  build_mode="swiftpm"
-else
-  echo "SwiftPM unavailable; falling back to Objective-C clang build. See $swiftpm_log" >&2
-  rm -rf "$app_root"
-  mkdir -p "$app_root/Contents/MacOS"
-  /usr/bin/clang \
-    -fobjc-arc \
-    -framework Foundation \
-    "$fallback_source" \
-    -o "$app_root/Contents/MacOS/$binary_name"
-  build_mode="objc-fallback"
+swift build
+
+if [[ -e "$app_root" ]]; then
+  if ! command -v trash >/dev/null 2>&1; then
+    echo "Refusing to replace $app_root because trash is unavailable." >&2
+    exit 1
+  fi
+  trash "$app_root"
 fi
+
+mkdir -p "$app_root/Contents/MacOS"
+cp "$repo_root/.build/debug/ai-reviewer-watcher" "$app_root/Contents/MacOS/$binary_name"
 
 cat > "$app_root/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -60,4 +55,4 @@ PLIST
 
 /usr/bin/codesign --force --sign "$codesign_identity" "$app_root" >/dev/null
 
-echo "Built $app_root ($build_mode)"
+echo "Built $app_root"
