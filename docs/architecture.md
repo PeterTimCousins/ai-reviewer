@@ -64,7 +64,8 @@ Build a minimal app plus foreground CLI that:
 - Reconciles pending commits by walking recent history up to `sweepDepth`,
   skipping already reviewed SHAs, merge commits, and `[skip-review]` or
   `[no-review]` commit messages. Failed SHAs are retried only after
-  `retryFailedAfterSeconds`, including while HEAD is stable.
+  `retryFailedAfterSeconds`, including while HEAD is stable. Deterministic
+  oversize commits are recorded as skipped so later commits continue reviewing.
 - Materializes HEAD into a local cache bundle.
 - Binds diff and snapshot reads before buffering so configured size caps protect
   watcher memory.
@@ -72,12 +73,16 @@ Build a minimal app plus foreground CLI that:
   environment and read-only sandbox. Profile agents run concurrently up to
   `maxParallelReviews`, then findings are merged deterministically in profile
   order. Codex child processes are bounded by `codexTimeoutSeconds`.
+- Wraps Codex in a per-run `sandbox-exec` profile and a narrowed per-run
+  `CODEX_HOME`, so prompt-controlled reads cannot traverse into the watched
+  repository or the user's full Codex home.
 - Caps aggregate snapshot prompt content with `maxPromptSnapshotBytes` before
   passing snapshots to profile agents.
 - Copies successful reports back through AI Reviewer and records reviewed or
   failed SHAs in local state.
 - Validates repositories through Git so linked worktrees are accepted, and
   creates the configured reports directory on first run.
+- Uses one watcher lock for GUI and CLI watch modes.
 
 ## Concrete Implementation Plan
 
@@ -96,9 +101,10 @@ Build a minimal app plus foreground CLI that:
    containing only commit metadata, capped diffs, and capped changed-file
    snapshots. Do not include absolute watched-repo paths in bundles that Codex
    will read.
-6. Run Codex from the bundle directory with `env -i`, scratch `HOME`, scratch
-   `TMPDIR`, explicit `CODEX_HOME`, minimal `PATH`, read-only sandbox,
-   ephemeral execution, ignored user config, and ignored repo rules.
+6. Run Codex from the bundle directory under an OS sandbox with `env -i`,
+   scratch `HOME`, scratch `TMPDIR`, narrowed per-run `CODEX_HOME`, minimal
+   `PATH`, read-only sandbox, ephemeral execution, ignored user config, and
+   ignored repo rules.
 7. Write Codex output to the local cache first as `codex-review.md`, then have
    AI Reviewer copy the final report back to the configured repo reports path.
 8. Define review behavior through JSON profiles with global instructions,

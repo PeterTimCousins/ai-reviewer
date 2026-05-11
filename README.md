@@ -78,7 +78,8 @@ of failing invisibly in the background.
 
 AI Reviewer uses local lock files under
 `~/Library/Application Support/com.ai-reviewer/` to prevent accidental duplicate
-GUI app instances and duplicate watcher loops.
+GUI app instances and duplicate watcher loops. The foreground CLI watcher and
+GUI watcher share the same watcher lock.
 
 ## Commands
 
@@ -120,10 +121,12 @@ local state. Already reviewed SHAs are skipped.
 `watch` runs in the foreground and reviews pending commits when HEAD changes.
 Pending commits are discovered by walking up to `sweepDepth` recent commits,
 skipping already reviewed SHAs, merge commits, and commit messages containing
-`[skip-review]` or `[no-review]`. Startup reconciliation only runs when
-`reviewCurrentHeadOnStartup` is enabled in config. Failed reviews are retried
-after `retryFailedAfterSeconds`; the default is one hour. The watcher also
-checks for due failed-review retries while HEAD is stable.
+`[skip-review]` or `[no-review]`. Commits that deterministically exceed the
+profile diff limit are recorded as skipped instead of retried forever. Startup
+reconciliation only runs when `reviewCurrentHeadOnStartup` is enabled in config.
+Failed reviews are retried after `retryFailedAfterSeconds`; the default is one
+hour. The watcher also checks for due failed-review retries while HEAD is
+stable.
 
 Codex runs are terminated after `codexTimeoutSeconds`; the default is 30
 minutes. File snapshots are capped individually by `maxSnapshotBytes` during
@@ -158,10 +161,14 @@ direct access to removable volumes or protected folders.
 
 Codex subprocesses run from local bundles with:
 
+- a per-run `sandbox-exec` profile that only allows reads from the local bundle,
+  narrowed per-run Codex auth/config, scratch directories, and required system
+  tool/runtime paths
 - `env -i`
 - scratch `HOME`
 - scratch `TMPDIR`
-- explicit `CODEX_HOME`
+- per-run `CODEX_HOME` containing copied auth/config material, not the user's
+  full Codex home
 - minimal `PATH`
 - `codex --ask-for-approval never exec`
 - `--sandbox read-only`

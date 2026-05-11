@@ -260,6 +260,38 @@ struct ReviewState: Codable {
     var reviewed: [String: ReviewRecord]
     var failed: [String: ReviewFailureRecord]
 
+    init(
+        schemaVersion: Int,
+        updatedAt: String?,
+        lastSeenHead: String?,
+        lastBundlePath: String?,
+        lastReviewPath: String?,
+        skipped: [String: ReviewSkipRecord]?,
+        reviewed: [String: ReviewRecord],
+        failed: [String: ReviewFailureRecord]
+    ) {
+        self.schemaVersion = schemaVersion
+        self.updatedAt = updatedAt
+        self.lastSeenHead = lastSeenHead
+        self.lastBundlePath = lastBundlePath
+        self.lastReviewPath = lastReviewPath
+        self.skipped = skipped
+        self.reviewed = reviewed
+        self.failed = failed
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+        updatedAt = try container.decodeIfPresent(String.self, forKey: .updatedAt)
+        lastSeenHead = try container.decodeIfPresent(String.self, forKey: .lastSeenHead)
+        lastBundlePath = try container.decodeIfPresent(String.self, forKey: .lastBundlePath)
+        lastReviewPath = try container.decodeIfPresent(String.self, forKey: .lastReviewPath)
+        skipped = try container.decodeIfPresent([String: ReviewSkipRecord].self, forKey: .skipped) ?? [:]
+        reviewed = try container.decodeIfPresent([String: ReviewRecord].self, forKey: .reviewed) ?? [:]
+        failed = try container.decodeIfPresent([String: ReviewFailureRecord].self, forKey: .failed) ?? [:]
+    }
+
     static func empty() -> ReviewState {
         ReviewState(
             schemaVersion: 1,
@@ -296,6 +328,7 @@ enum AIReviewerError: Error, CustomStringConvertible {
     case invalidConfig(String)
     case invalidPath(String)
     case missingPath(String)
+    case permanentReviewSkip(String)
     case commandFailed(String)
     case unableToWrite(String)
 
@@ -311,6 +344,8 @@ enum AIReviewerError: Error, CustomStringConvertible {
             return "Invalid path: \(message)"
         case .missingPath(let path):
             return "Missing path: \(path)"
+        case .permanentReviewSkip(let message):
+            return message
         case .commandFailed(let message):
             return message
         case .unableToWrite(let path):
@@ -650,6 +685,10 @@ func validate(config: AppConfig) throws {
 
 func watch(config: AppConfig) throws -> Never {
     try validate(config: config)
+    let lock = FileLock(url: watcherLockURL())
+    guard try lock.tryLock() else {
+        throw AIReviewerError.commandFailed("AI Reviewer watcher is already running.")
+    }
 
     let repoPath = repoURL(config: config).path
     let interval = max(1, config.pollIntervalSeconds)
@@ -718,7 +757,15 @@ func gitPathspecArguments(ignorePaths: [String]) -> [String] {
 }
 
 func reviewableDiffData(repoPath: String, commit: String, ignorePaths: [String], maxDiffBytes: Int?) throws -> Data {
-    let limit = maxDiffBytes.flatMap { $0 > 0 ? $0 + 1 : nil }
+    let limit: Int?
+    if let maxDiffBytes, maxDiffBytes > 0 {
+        guard maxDiffBytes < Int.max else {
+            throw AIReviewerError.invalidConfig("maxDiffBytes is too large")
+        }
+        limit = maxDiffBytes + 1
+    } else {
+        limit = nil
+    }
 
     do {
         return try runGitData(
@@ -727,7 +774,7 @@ func reviewableDiffData(repoPath: String, commit: String, ignorePaths: [String],
             maxOutputBytes: limit
         )
     } catch AIReviewerError.invalidConfig(_) where limit != nil {
-        throw AIReviewerError.invalidConfig("reviewable diff is above profile limit \(maxDiffBytes ?? 0) bytes")
+        throw AIReviewerError.permanentReviewSkip("reviewable diff is above profile limit \(maxDiffBytes ?? 0) bytes")
     }
 }
 
@@ -822,7 +869,7 @@ func materializeCommit(config: AppConfig, profile: ReviewProfile, commit: String
         maxDiffBytes: profile.maxDiffBytes
     )
     if let maxDiffBytes = profile.maxDiffBytes, maxDiffBytes > 0, diff.count > maxDiffBytes {
-        throw AIReviewerError.invalidConfig("reviewable diff is \(diff.count) bytes, above profile limit \(maxDiffBytes)")
+        throw AIReviewerError.permanentReviewSkip("reviewable diff is \(diff.count) bytes, above profile limit \(maxDiffBytes)")
     }
     try writeData(diff, to: bundleURL.appendingPathComponent("diff.patch"))
 
@@ -899,20 +946,20 @@ func resolveBundleURL(config: AppConfig, bundle: String) throws -> URL {
         }
     }
 
-    let standardizedCandidate = candidate.standardizedFileURL
-    let standardizedRoot = bundlesURL(config: config).standardizedFileURL
-    guard standardizedCandidate.path == standardizedRoot.path || standardizedCandidate.path.hasPrefix(standardizedRoot.path + "/") else {
-        throw AIReviewerError.invalidPath("bundle must live under \(standardizedRoot.path)")
+    let resolvedCandidate = candidate.resolvingSymlinksInPath().standardizedFileURL
+    let resolvedRoot = bundlesURL(config: config).resolvingSymlinksInPath().standardizedFileURL
+    guard resolvedCandidate.path == resolvedRoot.path || resolvedCandidate.path.hasPrefix(resolvedRoot.path + "/") else {
+        throw AIReviewerError.invalidPath("bundle must live under \(resolvedRoot.path)")
     }
 
     for name in ["bundle.json", "commit.txt", "diff.patch", "changed-files.json"] {
-        let path = standardizedCandidate.appendingPathComponent(name).path
+        let path = resolvedCandidate.appendingPathComponent(name).path
         guard FileManager.default.fileExists(atPath: path) else {
             throw AIReviewerError.missingPath(path)
         }
     }
 
-    return standardizedCandidate
+    return resolvedCandidate
 }
 
 func runCodexPrompt(bundleURL: URL) -> String {
@@ -976,6 +1023,84 @@ func runCodex(config: AppConfig, bundleURL: URL) throws -> URL {
     return outputURL
 }
 
+func sandboxString(_ value: String) -> String {
+    value
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+}
+
+func copyCodexAuthMaterial(from sourcePath: String, to destinationURL: URL) throws {
+    let sourceURL = URL(fileURLWithPath: expandedPath(sourcePath))
+    try FileManager.default.createDirectory(at: destinationURL, withIntermediateDirectories: true)
+
+    for filename in ["auth.json", "config.toml", "version.json", "installation_id", "models_cache.json"] {
+        let sourceFile = sourceURL.appendingPathComponent(filename)
+        guard FileManager.default.fileExists(atPath: sourceFile.path) else {
+            continue
+        }
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: sourceFile.path)
+        let fileSize = attributes[.size] as? NSNumber
+        guard fileSize?.intValue ?? 0 <= 5_000_000 else {
+            continue
+        }
+
+        let destinationFile = destinationURL.appendingPathComponent(filename)
+        if FileManager.default.fileExists(atPath: destinationFile.path) {
+            try FileManager.default.removeItem(at: destinationFile)
+        }
+        try FileManager.default.copyItem(at: sourceFile, to: destinationFile)
+    }
+}
+
+func sandboxProfile(bundleURL: URL, runURL: URL, codexHomeURL: URL, outputURL: URL, logURL: URL) -> String {
+    let bundlePath = sandboxString(bundleURL.resolvingSymlinksInPath().standardizedFileURL.path)
+    let runPath = sandboxString(runURL.resolvingSymlinksInPath().standardizedFileURL.path)
+    let codexHomePath = sandboxString(codexHomeURL.resolvingSymlinksInPath().standardizedFileURL.path)
+    let outputPath = sandboxString(outputURL.resolvingSymlinksInPath().standardizedFileURL.path)
+    let logPath = sandboxString(logURL.resolvingSymlinksInPath().standardizedFileURL.path)
+
+    return """
+    (version 1)
+    (deny default)
+    (allow process*)
+    (allow signal (target self))
+    (allow network*)
+    (allow sysctl-read)
+    (allow mach-lookup)
+    (allow file-read-metadata)
+    (allow file-read*
+      (literal "/")
+      (literal "/dev/null")
+      (subpath "/dev")
+      (subpath "/System")
+      (subpath "/Library")
+      (subpath "/usr")
+      (subpath "/bin")
+      (subpath "/sbin")
+      (subpath "/opt/homebrew")
+      (subpath "/usr/local")
+      (subpath "/tmp")
+      (subpath "/private/tmp")
+      (subpath "/private/etc")
+      (subpath "/private/var/folders")
+      (subpath "/private/var/db/timezone")
+      (subpath "\(bundlePath)")
+      (subpath "\(runPath)")
+      (subpath "\(codexHomePath)"))
+    (allow file-write*
+      (subpath "/dev")
+      (subpath "/tmp")
+      (subpath "/private/tmp")
+      (subpath "/private/var/folders")
+      (subpath "\(bundlePath)")
+      (subpath "\(runPath)")
+      (subpath "\(codexHomePath)")
+      (literal "\(outputPath)")
+      (literal "\(logPath)"))
+    """
+}
+
 func runCodexExecution(
     config: AppConfig,
     bundleURL: URL,
@@ -991,6 +1116,15 @@ func runCodexExecution(
     try FileManager.default.createDirectory(at: homeURL, withIntermediateDirectories: true)
     try FileManager.default.createDirectory(at: tmpURL, withIntermediateDirectories: true)
     try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let runURL = homeURL.deletingLastPathComponent()
+    let runCodexHomeURL = runURL.appendingPathComponent("codex-home", isDirectory: true)
+    try copyCodexAuthMaterial(from: config.codexHome, to: runCodexHomeURL)
+    let sandboxURL = runURL.appendingPathComponent("codex.sb")
+    try writeData(
+        Data(sandboxProfile(bundleURL: bundleURL, runURL: runURL, codexHomeURL: runCodexHomeURL, outputURL: outputURL, logURL: logURL).utf8),
+        to: sandboxURL
+    )
+
     FileManager.default.createFile(atPath: logURL.path, contents: nil)
     let logHandle = try FileHandle(forWritingTo: logURL)
     try logHandle.truncate(atOffset: 0)
@@ -999,12 +1133,16 @@ func runCodexExecution(
     }
 
     let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
+    process.currentDirectoryURL = bundleURL
 
     var arguments = [
+        "-f",
+        sandboxURL.path,
+        "/usr/bin/env",
         "-i",
         "HOME=\(homeURL.path)",
-        "CODEX_HOME=\(expandedPath(config.codexHome))",
+        "CODEX_HOME=\(runCodexHomeURL.path)",
         "TMPDIR=\(tmpURL.path)",
         "PATH=\(reviewPath)",
         "USER=\(NSUserName())",
@@ -1013,6 +1151,8 @@ func runCodexExecution(
         "codex",
         "--ask-for-approval", "never",
         "exec",
+        "--disable", "shell_zsh_fork",
+        "--disable", "shell_snapshot",
         "--ignore-user-config",
         "--ignore-rules",
         "--skip-git-repo-check",
@@ -1461,6 +1601,18 @@ func reviewCommit(config: AppConfig, commit: String) throws -> URL? {
 
         print("reviewed: \(shortCommit)")
         return copiedReportURL
+    } catch AIReviewerError.permanentReviewSkip(let reason) {
+        state.skipped = state.skipped ?? [:]
+        state.skipped?[resolvedCommit] = ReviewSkipRecord(
+            sha: resolvedCommit,
+            shortSha: shortCommit,
+            skippedAt: isoNow(),
+            reason: reason
+        )
+        state.failed.removeValue(forKey: resolvedCommit)
+        try? saveState(state, config: config)
+        print("skippedReview: \(shortCommit) \(reason)")
+        return nil
     } catch {
         state.failed[resolvedCommit] = ReviewFailureRecord(
             sha: resolvedCommit,
