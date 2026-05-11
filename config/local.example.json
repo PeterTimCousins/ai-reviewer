@@ -13,5 +13,7 @@
   "hideDockIcon": true,
   "sweepDepth": 50,
   "retryFailedAfterSeconds": 3600,
-  "maxSnapshotBytes": 200000
+  "codexTimeoutSeconds": 1800,
+  "maxSnapshotBytes": 200000,
+  "maxPromptSnapshotBytes": 500000
 }

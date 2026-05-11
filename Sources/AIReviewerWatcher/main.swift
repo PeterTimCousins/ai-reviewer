@@ -49,6 +49,30 @@ final class FileLock {
     }
 }
 
+final class PipeBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+
+    func append(_ nextData: Data) {
+        guard !nextData.isEmpty else {
+            return
+        }
+
+        lock.lock()
+        data.append(nextData)
+        lock.unlock()
+    }
+
+    func snapshot() -> Data {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+
+        return data
+    }
+}
+
 struct AppConfig: Codable, Sendable {
     var repoPath: String
     var reportsPath: String
@@ -65,9 +89,15 @@ struct AppConfig: Codable, Sendable {
     var hideDockIcon: Bool?
     var sweepDepth: Int?
     var retryFailedAfterSeconds: Int?
+    var codexTimeoutSeconds: Int?
+    var maxPromptSnapshotBytes: Int?
 
     var snapshotByteLimit: Int {
         max(1, maxSnapshotBytes ?? 200_000)
+    }
+
+    var promptSnapshotByteLimit: Int {
+        max(1, maxPromptSnapshotBytes ?? 500_000)
     }
 
     var shouldReviewCurrentHeadOnStartup: Bool {
@@ -89,6 +119,10 @@ struct AppConfig: Codable, Sendable {
     var failedReviewRetrySeconds: Int {
         max(0, retryFailedAfterSeconds ?? 3_600)
     }
+
+    var codexRunTimeoutSeconds: Int {
+        max(30, codexTimeoutSeconds ?? 1_800)
+    }
 }
 
 func defaultConfig() -> AppConfig {
@@ -107,7 +141,9 @@ func defaultConfig() -> AppConfig {
         startWatcherOnLaunch: true,
         hideDockIcon: true,
         sweepDepth: 50,
-        retryFailedAfterSeconds: 3_600
+        retryFailedAfterSeconds: 3_600,
+        codexTimeoutSeconds: 1_800,
+        maxPromptSnapshotBytes: 500_000
     )
 }
 
@@ -451,14 +487,28 @@ func runGitData(repoPath: String, arguments: [String]) throws -> Data {
 
     let outputPipe = Pipe()
     let errorPipe = Pipe()
+    let outputBuffer = PipeBuffer()
+    let errorBuffer = PipeBuffer()
     process.standardOutput = outputPipe
     process.standardError = errorPipe
+
+    outputPipe.fileHandleForReading.readabilityHandler = { handle in
+        outputBuffer.append(handle.availableData)
+    }
+    errorPipe.fileHandleForReading.readabilityHandler = { handle in
+        errorBuffer.append(handle.availableData)
+    }
 
     try process.run()
     process.waitUntilExit()
 
-    let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
-    let errorOutput = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    outputPipe.fileHandleForReading.readabilityHandler = nil
+    errorPipe.fileHandleForReading.readabilityHandler = nil
+    outputBuffer.append(outputPipe.fileHandleForReading.readDataToEndOfFile())
+    errorBuffer.append(errorPipe.fileHandleForReading.readDataToEndOfFile())
+
+    let output = outputBuffer.snapshot()
+    let errorOutput = String(data: errorBuffer.snapshot(), encoding: .utf8) ?? ""
 
     guard process.terminationStatus == 0 else {
         let message = errorOutput.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -527,7 +577,9 @@ func validationSummary(config: AppConfig) throws -> String {
     reviewCurrentHeadOnStartup: \(config.shouldReviewCurrentHeadOnStartup)
     sweepDepth: \(config.reviewSweepDepth)
     retryFailedAfterSeconds: \(config.failedReviewRetrySeconds)
+    codexTimeoutSeconds: \(config.codexRunTimeoutSeconds)
     maxSnapshotBytes: \(config.snapshotByteLimit)
+    maxPromptSnapshotBytes: \(config.promptSnapshotByteLimit)
     """
 }
 
@@ -901,11 +953,24 @@ func runCodexExecution(
     process.standardInput = inputPipe
     process.standardOutput = logHandle
     process.standardError = logHandle
+    let termination = DispatchSemaphore(value: 0)
+    process.terminationHandler = { _ in
+        termination.signal()
+    }
 
     try process.run()
     inputPipe.fileHandleForWriting.write(Data(prompt.utf8))
     try inputPipe.fileHandleForWriting.close()
-    process.waitUntilExit()
+
+    if termination.wait(timeout: .now() + .seconds(config.codexRunTimeoutSeconds)) == .timedOut {
+        process.terminate()
+        if termination.wait(timeout: .now() + .seconds(5)) == .timedOut {
+            kill(process.processIdentifier, SIGKILL)
+            _ = termination.wait(timeout: .now() + .seconds(5))
+        }
+
+        throw AIReviewerError.commandFailed("codex timed out after \(config.codexRunTimeoutSeconds) seconds")
+    }
 
     guard process.terminationStatus == 0 else {
         let logData = (try? Data(contentsOf: logURL)) ?? Data()
@@ -919,14 +984,14 @@ func runCodexExecution(
     }
 }
 
-func profileAgentPrompt(bundleURL: URL, profile: ReviewProfile, agent: ReviewAgentProfile) throws -> String {
+func profileAgentPrompt(bundleURL: URL, profile: ReviewProfile, agent: ReviewAgentProfile, snapshotByteLimit: Int) throws -> String {
     let manifestData = try Data(contentsOf: bundleURL.appendingPathComponent("bundle.json"))
     let changedFilesData = try Data(contentsOf: bundleURL.appendingPathComponent("changed-files.json"))
     let commitText = try String(contentsOf: bundleURL.appendingPathComponent("commit.txt"), encoding: .utf8)
     let diffText = try String(contentsOf: bundleURL.appendingPathComponent("diff.patch"), encoding: .utf8)
     let changedFilesText = String(data: changedFilesData, encoding: .utf8) ?? "[]"
     let manifestText = String(data: manifestData, encoding: .utf8) ?? "{}"
-    let snapshotsText = snapshotPromptText(bundleURL: bundleURL)
+    let snapshotsText = snapshotPromptText(bundleURL: bundleURL, byteLimit: snapshotByteLimit)
 
     return """
     You are Codex running an isolated read-only specialist review against a local AI Reviewer bundle.
@@ -974,24 +1039,48 @@ func profileAgentPrompt(bundleURL: URL, profile: ReviewProfile, agent: ReviewAge
     """
 }
 
-func snapshotPromptText(bundleURL: URL) -> String {
+func snapshotPromptText(bundleURL: URL, byteLimit: Int) -> String {
     let snapshotsURL = bundleURL.appendingPathComponent("snapshots")
     guard let enumerator = FileManager.default.enumerator(at: snapshotsURL, includingPropertiesForKeys: [.isRegularFileKey]) else {
         return "(none)"
     }
 
     var sections: [String] = []
+    var remainingBytes = max(1, byteLimit)
+    var capped = false
     for case let url as URL in enumerator {
         guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true,
-              let data = try? Data(contentsOf: url),
-              !data.contains(0),
-              let text = String(data: data, encoding: .utf8)
+              let rawData = try? Data(contentsOf: url),
+              !rawData.contains(0)
         else {
             continue
         }
 
+        let data: Data
+        if rawData.count > remainingBytes {
+            data = rawData.prefix(remainingBytes)
+            capped = true
+        } else {
+            data = rawData
+        }
+
+        guard !data.isEmpty else {
+            continue
+        }
+
+        let text = String(decoding: data, as: UTF8.self)
         let relative = url.path.replacingOccurrences(of: snapshotsURL.path + "/", with: "")
         sections.append("--- \(relative) ---\n\(text)")
+
+        remainingBytes -= data.count
+        if remainingBytes <= 0 {
+            capped = true
+            break
+        }
+    }
+
+    if capped {
+        sections.append("--- snapshots omitted ---\nSnapshot prompt content capped at \(byteLimit) bytes.")
     }
 
     return sections.isEmpty ? "(none)" : sections.joined(separator: "\n\n")
@@ -1027,6 +1116,18 @@ func runReviewProfile(config: AppConfig, bundleURL: URL, profile: ReviewProfile)
     return outputURL
 }
 
+func safeFilenameComponent(_ value: String, fallback: String) -> String {
+    let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+    let scalars = value.unicodeScalars.map { scalar -> Character in
+        allowed.contains(scalar) ? Character(scalar) : "-"
+    }
+    let sanitized = String(scalars)
+        .trimmingCharacters(in: CharacterSet(charactersIn: ".-"))
+        .prefix(80)
+
+    return sanitized.isEmpty ? fallback : String(sanitized)
+}
+
 func runProfileAgents(
     config: AppConfig,
     bundleURL: URL,
@@ -1053,10 +1154,16 @@ func runProfileAgents(
             }
 
             do {
-                let agentURL = runURL.appendingPathComponent(agent.id)
-                let output = bundleURL.appendingPathComponent("agent-\(agent.id).md")
-                let log = bundleURL.appendingPathComponent("agent-\(agent.id).log")
-                let prompt = try profileAgentPrompt(bundleURL: bundleURL, profile: profile, agent: agent)
+                let safeAgentID = "\(index + 1)-\(safeFilenameComponent(agent.id, fallback: "agent"))"
+                let agentURL = runURL.appendingPathComponent(safeAgentID, isDirectory: true)
+                let output = bundleURL.appendingPathComponent("agent-\(safeAgentID).md")
+                let log = bundleURL.appendingPathComponent("agent-\(safeAgentID).log")
+                let prompt = try profileAgentPrompt(
+                    bundleURL: bundleURL,
+                    profile: profile,
+                    agent: agent,
+                    snapshotByteLimit: config.promptSnapshotByteLimit
+                )
                 try runCodexExecution(
                     config: config,
                     bundleURL: bundleURL,
@@ -1304,6 +1411,29 @@ func shouldRetryFailure(_ failure: ReviewFailureRecord, retryAfterSeconds: Int, 
     return now.timeIntervalSince(failedAt) >= TimeInterval(retryAfterSeconds)
 }
 
+func hasRetryableFailedReviews(config: AppConfig) throws -> Bool {
+    try validatePaths(config: config)
+
+    let state = try loadState(config: config)
+    guard !state.failed.isEmpty else {
+        return false
+    }
+
+    let repoPath = repoURL(config: config).path
+    let recentHistory = try runGit(repoPath: repoPath, arguments: ["rev-list", "--max-count=\(config.reviewSweepDepth)", "HEAD"])
+        .split(separator: "\n")
+        .map(String.init)
+
+    for commit in recentHistory {
+        if let failure = state.failed[commit],
+           shouldRetryFailure(failure, retryAfterSeconds: config.failedReviewRetrySeconds) {
+            return true
+        }
+    }
+
+    return false
+}
+
 func recordSeenHead(config: AppConfig, head: String) throws {
     var state = try loadState(config: config)
     state.lastSeenHead = head
@@ -1507,6 +1637,15 @@ final class AppWatcher: @unchecked Sendable {
             }
 
             guard head != lastHead else {
+                if try hasRetryableFailedReviews(config: config) {
+                    reviewPending(
+                        config: config,
+                        reason: "Retrying failed reviews",
+                        onUpdate: onUpdate
+                    )
+                    return
+                }
+
                 send("Watching for commits", onUpdate: onUpdate)
                 return
             }
@@ -1616,8 +1755,10 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
     private let pollIntervalField = NSTextField()
     private let sweepDepthField = NSTextField()
     private let retryFailedAfterField = NSTextField()
+    private let codexTimeoutField = NSTextField()
     private let maxParallelField = NSTextField()
     private let maxSnapshotField = NSTextField()
+    private let maxPromptSnapshotField = NSTextField()
     private let startWatcherOnLaunchCheckbox = NSButton(checkboxWithTitle: "Start watching when app opens", target: nil, action: nil)
     private let hideDockIconCheckbox = NSButton(checkboxWithTitle: "Hide Dock icon", target: nil, action: nil)
     private let reviewStartupCheckbox = NSButton(checkboxWithTitle: "Review pending commits when watcher starts", target: nil, action: nil)
@@ -1719,13 +1860,13 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildWindow() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 800, height: 740),
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 790),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "AI Reviewer"
-        window.minSize = NSSize(width: 680, height: 590)
+        window.minSize = NSSize(width: 680, height: 640)
         window.isReleasedWhenClosed = false
 
         let root = NSStackView()
@@ -1749,8 +1890,10 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         root.addArrangedSubview(row(label: "Poll Seconds", field: pollIntervalField))
         root.addArrangedSubview(row(label: "Sweep Depth", field: sweepDepthField))
         root.addArrangedSubview(row(label: "Retry Failed Secs", field: retryFailedAfterField))
+        root.addArrangedSubview(row(label: "Codex Timeout Secs", field: codexTimeoutField))
         root.addArrangedSubview(row(label: "Max Parallel", field: maxParallelField))
         root.addArrangedSubview(row(label: "Max Snapshot Bytes", field: maxSnapshotField))
+        root.addArrangedSubview(row(label: "Max Prompt Snapshot", field: maxPromptSnapshotField))
         root.addArrangedSubview(checkboxRow(startWatcherOnLaunchCheckbox))
         root.addArrangedSubview(checkboxRow(hideDockIconCheckbox))
         root.addArrangedSubview(checkboxRow(reviewStartupCheckbox))
@@ -1913,8 +2056,10 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         pollIntervalField.stringValue = "\(config.pollIntervalSeconds)"
         sweepDepthField.stringValue = "\(config.reviewSweepDepth)"
         retryFailedAfterField.stringValue = "\(config.failedReviewRetrySeconds)"
+        codexTimeoutField.stringValue = "\(config.codexRunTimeoutSeconds)"
         maxParallelField.stringValue = "\(config.maxParallelReviews)"
         maxSnapshotField.stringValue = "\(config.snapshotByteLimit)"
+        maxPromptSnapshotField.stringValue = "\(config.promptSnapshotByteLimit)"
         startWatcherOnLaunchCheckbox.state = config.shouldStartWatcherOnLaunch ? .on : .off
         hideDockIconCheckbox.state = config.shouldHideDockIcon ? .on : .off
         reviewStartupCheckbox.state = config.shouldReviewCurrentHeadOnStartup ? .on : .off
@@ -1925,8 +2070,10 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         guard let pollInterval = Int(pollIntervalField.stringValue),
               let sweepDepth = Int(sweepDepthField.stringValue),
               let retryFailedAfter = Int(retryFailedAfterField.stringValue),
+              let codexTimeout = Int(codexTimeoutField.stringValue),
               let maxParallel = Int(maxParallelField.stringValue),
-              let maxSnapshot = Int(maxSnapshotField.stringValue)
+              let maxSnapshot = Int(maxSnapshotField.stringValue),
+              let maxPromptSnapshot = Int(maxPromptSnapshotField.stringValue)
         else {
             throw AIReviewerError.invalidConfig("numeric settings must be valid integers")
         }
@@ -1946,7 +2093,9 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
             startWatcherOnLaunch: startWatcherOnLaunchCheckbox.state == .on,
             hideDockIcon: hideDockIconCheckbox.state == .on,
             sweepDepth: max(1, sweepDepth),
-            retryFailedAfterSeconds: max(0, retryFailedAfter)
+            retryFailedAfterSeconds: max(0, retryFailedAfter),
+            codexTimeoutSeconds: max(30, codexTimeout),
+            maxPromptSnapshotBytes: max(1, maxPromptSnapshot)
         )
     }
 

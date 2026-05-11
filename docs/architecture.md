@@ -63,12 +63,14 @@ Build a minimal app plus foreground CLI that:
 - Reconciles pending commits by walking recent history up to `sweepDepth`,
   skipping already reviewed SHAs, merge commits, and `[skip-review]` or
   `[no-review]` commit messages. Failed SHAs are retried only after
-  `retryFailedAfterSeconds`.
+  `retryFailedAfterSeconds`, including while HEAD is stable.
 - Materializes HEAD into a local cache bundle.
 - Runs the configured review profile against a local bundle using the stripped
   environment and read-only sandbox. Profile agents run concurrently up to
   `maxParallelReviews`, then findings are merged deterministically in profile
-  order.
+  order. Codex child processes are bounded by `codexTimeoutSeconds`.
+- Caps aggregate snapshot prompt content with `maxPromptSnapshotBytes` before
+  passing snapshots to profile agents.
 - Copies successful reports back through AI Reviewer and records reviewed or
   failed SHAs in local state.
 
@@ -108,7 +110,8 @@ utility, with the settings UI remaining thin over the same operations used by
 the CLI:
 
 - choose watched repository with `NSOpenPanel`
-- configure reports path, cache path, Codex home, poll interval, and parallelism
+- configure reports path, cache path, Codex home, poll interval, parallelism,
+  Codex timeout, and prompt snapshot limits
 - choose a review profile JSON file
 - validate permissions and Git status
 - materialize HEAD and run a local-bundle Codex review

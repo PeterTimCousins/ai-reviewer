@@ -122,7 +122,13 @@ Pending commits are discovered by walking up to `sweepDepth` recent commits,
 skipping already reviewed SHAs, merge commits, and commit messages containing
 `[skip-review]` or `[no-review]`. Startup reconciliation only runs when
 `reviewCurrentHeadOnStartup` is enabled in config. Failed reviews are retried
-after `retryFailedAfterSeconds`; the default is one hour.
+after `retryFailedAfterSeconds`; the default is one hour. The watcher also
+checks for due failed-review retries while HEAD is stable.
+
+Codex runs are terminated after `codexTimeoutSeconds`; the default is 30
+minutes. File snapshots are capped individually by `maxSnapshotBytes` during
+bundle materialization, and capped again in aggregate by
+`maxPromptSnapshotBytes` before being embedded in specialist prompts.
 
 ## Planned Runtime Locations
 
@@ -195,7 +201,9 @@ The settings UI currently covers:
 - poll interval
 - sweep depth
 - retry failed seconds
+- Codex timeout seconds
 - max parallel reviews/profile agents
+- max prompt snapshot bytes
 - start watching when app opens
 - hide Dock icon
 - review pending commits on watcher startup
