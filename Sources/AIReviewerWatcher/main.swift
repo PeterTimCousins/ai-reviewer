@@ -3057,6 +3057,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private func refreshReviewHistory() {
         do {
             let config = try configFromFields()
+            pruneStaleRunningCommits(config: config)
             reviewItems = try loadReviewHistory(
                 config: config,
                 runningCommits: runningCommits,
@@ -3079,6 +3080,16 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             reviewDetailTextView.string = "\(error)"
             summaryField.stringValue = "Unable to load review history"
             statusField.stringValue = "\(error)"
+        }
+    }
+
+    private func pruneStaleRunningCommits(config: AppConfig) {
+        guard let state = try? loadState(config: config) else {
+            return
+        }
+
+        runningCommits = runningCommits.filter { commit in
+            activeManualCommits.contains(commit) || !hasReviewLedgerEntry(state, commit: commit)
         }
     }
 
