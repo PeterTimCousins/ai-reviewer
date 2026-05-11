@@ -3481,23 +3481,27 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
     private func applyWatcherUpdate(_ update: WatcherUpdate) {
         watcherRunning = update.isRunning
-        if update.lastError != nil || update.status.localizedCaseInsensitiveContains("failed") {
+        let status = update.status.lowercased()
+
+        if update.lastError != nil || status.contains("failed") {
             hasStatusIssue = true
-        } else if update.status.localizedCaseInsensitiveContains("completed") ||
-                    update.status.localizedCaseInsensitiveContains("Watching") ||
-                    update.status.localizedCaseInsensitiveContains("No pending") ||
-                    update.status.localizedCaseInsensitiveContains("Starting") {
+        } else if status.contains("completed") ||
+                    status.contains("watching") ||
+                    status.contains("no pending") ||
+                    status.contains("starting") {
             hasStatusIssue = false
         }
 
-        if let lastHead = update.lastHead,
-           update.status.localizedCaseInsensitiveContains("review") || update.status.localizedCaseInsensitiveContains("retry") {
-            runningCommits.insert(lastHead)
-        } else if update.status.localizedCaseInsensitiveContains("completed") ||
-                    update.status.localizedCaseInsensitiveContains("failed") ||
-                    update.status.localizedCaseInsensitiveContains("No pending") {
-            if let lastHead = update.lastHead, !activeManualCommits.contains(lastHead) {
+        if let lastHead = update.lastHead {
+            if status.contains("completed") ||
+                status.contains("failed") ||
+                status.contains("no pending") ||
+                status.contains("watching") {
                 runningCommits.remove(lastHead)
+            } else if status.contains("head changed") ||
+                        status.contains("reviewing pending") ||
+                        status.contains("retrying failed") {
+                runningCommits.insert(lastHead)
             }
         }
 
