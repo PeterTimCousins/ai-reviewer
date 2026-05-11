@@ -3175,6 +3175,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             try saveConfig(config, to: configURL)
             applyActivationPolicy(config: config)
             let loginItemStatus = try syncLoginItemSetting()
+            drainManualReviewQueue(config: config)
             if showStatus {
                 statusField.stringValue = "Saved \(configURL.path)\nLogin item: \(loginItemStatus)"
             }
