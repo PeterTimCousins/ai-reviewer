@@ -25,14 +25,15 @@ bundle and runs with:
 
 ## Review Flow
 
-1. Watch `.git/logs/HEAD` or poll it.
-2. Walk recent commits and skip already reviewed, bypassed, merge, empty, and
+1. Run the AI Reviewer watcher under launchd or in the foreground.
+2. Poll the configured repository HEAD from the AI Reviewer process.
+3. Walk recent commits and skip already reviewed, bypassed, merge, empty, and
    oversized commits.
-3. Materialize a bundle under `~/Library/Caches/com.ai-reviewer/bundles/<sha>/`.
-4. Run Codex specialists against the bundle, not the live repo.
-5. Write the final report locally as `codex-review.md`.
-6. Copy the report back to `<repoPath>/<reportsPath>/`.
-7. Record the SHA in local state.
+4. Materialize a bundle under `~/Library/Caches/com.ai-reviewer/bundles/<sha>/`.
+5. Run Codex specialists against the bundle, not the live repo.
+6. Write the final report locally as `codex-review.md`.
+7. Copy the report back to `<repoPath>/<reportsPath>/`.
+8. Record the SHA in local state.
 
 ## Current Implementation Milestone
 
@@ -42,7 +43,8 @@ Build a foreground CLI that:
 - Validates repository and report paths.
 - Reads `HEAD` and `.git/logs/HEAD`.
 - Prints the detected repo status.
-- Runs a foreground `--watch` polling loop that reviews changed HEADs.
+- Runs a foreground `--watch` polling loop that reconciles startup HEAD and
+  reviews changed HEADs.
 - Materializes HEAD into a local cache bundle.
 - Runs Codex against a local bundle using the stripped environment and read-only
   sandbox.
@@ -72,7 +74,10 @@ menu-bar/login item wrapper.
    ephemeral execution, ignored user config, and ignored repo rules.
 7. Write Codex output to the local cache first as `codex-review.md`, then have
    AI Reviewer copy the final report back to the configured repo reports path.
-8. Evolve the current settings window into a menu-bar app and login item after
+8. Install a launchd user agent that starts a local wrapper and keeps AI
+   Reviewer running in `watch` mode. Do not use launchd `WatchPaths` on the
+   watched repository; the app/helper should remain the repository reader.
+9. Evolve the current settings window into a menu-bar app and login item after
    the foreground watcher can run one review cycle end to end.
 
 ## Public App Roadmap

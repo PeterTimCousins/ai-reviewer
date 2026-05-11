@@ -89,7 +89,8 @@ bundle.
 the configured reports path, and records the SHA in local state. Already
 reviewed SHAs are skipped.
 
-`watch` runs in the foreground and calls `review-once` when HEAD changes.
+`watch` runs in the foreground, reconciles the current HEAD at startup, and
+calls `review-once` when HEAD changes.
 
 ## Planned Runtime Locations
 
@@ -103,6 +104,23 @@ Install the built app bundle with:
 
 ```bash
 scripts/install.sh
+```
+
+Install a launchd user agent after installing the app and app-support config:
+
+```bash
+scripts/install.sh --config config/local.json
+scripts/install-launch-agent.sh
+```
+
+The launch agent keeps AI Reviewer running in `watch` mode. It does not use
+launchd `WatchPaths` on the watched repository; launchd starts a local wrapper,
+and AI Reviewer is the process that reads the configured repo.
+
+Uninstall the launch agent with:
+
+```bash
+scripts/uninstall-launch-agent.sh
 ```
 
 ## Permission Policy

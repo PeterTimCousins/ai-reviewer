@@ -310,6 +310,11 @@ func watch(config: AppConfig) throws -> Never {
 
     print("watching: \(repoPath)")
     print("initialHead: \(lastHead)")
+    do {
+        _ = try reviewOnce(config: config)
+    } catch {
+        fputs("watch startup warning: \(error)\n", stderr)
+    }
 
     while true {
         Thread.sleep(forTimeInterval: TimeInterval(interval))
