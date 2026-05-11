@@ -1938,7 +1938,7 @@ func readTextFileIfPresent(path: String?) -> String? {
     return try? String(contentsOfFile: path, encoding: .utf8)
 }
 
-func readLogText() -> String {
+func readLogText(lineLimit: Int = 250) -> String {
     let logURL = watcherLogURL()
     guard let data = try? Data(contentsOf: logURL),
           let text = String(data: data, encoding: .utf8)
@@ -1946,7 +1946,7 @@ func readLogText() -> String {
         return "No watcher log has been written yet."
     }
 
-    let lines = text.split(separator: "\n", omittingEmptySubsequences: false).suffix(400)
+    let lines = text.split(separator: "\n", omittingEmptySubsequences: false).suffix(lineLimit)
     return lines.joined(separator: "\n")
 }
 
@@ -2410,7 +2410,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
             refreshReviewHistory()
         case .logs:
             replaceContent(with: buildLogsView())
-            refreshLogs()
+            refreshLogs(scrollToBottom: true)
         case .settings:
             replaceContent(with: buildSettingsView())
         }
@@ -2425,7 +2425,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
         case .reviews:
             refreshReviewHistory()
         case .logs:
-            refreshLogs()
+            refreshLogs(scrollToBottom: true)
         case .settings:
             do {
                 let config = try configFromFields()
@@ -2440,14 +2440,18 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
     private func buildReviewsView() -> NSView {
         configureReviewTableIfNeeded()
 
-        let split = NSSplitView()
-        split.isVertical = true
-        split.dividerStyle = .thin
+        let layout = NSStackView()
+        layout.orientation = .horizontal
+        layout.alignment = .top
+        layout.spacing = 14
 
         let tableScroll = NSScrollView()
         tableScroll.hasVerticalScroller = true
+        tableScroll.borderType = .noBorder
         tableScroll.documentView = reviewTableView
-        tableScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 430).isActive = true
+        tableScroll.translatesAutoresizingMaskIntoConstraints = false
+        tableScroll.widthAnchor.constraint(equalToConstant: 560).isActive = true
+        tableScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 430).isActive = true
 
         let detailStack = NSStackView()
         detailStack.orientation = .vertical
@@ -2473,17 +2477,19 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
         reviewDetailTextView.textContainerInset = NSSize(width: 10, height: 10)
         let detailScroll = NSScrollView()
         detailScroll.hasVerticalScroller = true
+        detailScroll.borderType = .noBorder
         detailScroll.documentView = reviewDetailTextView
         detailScroll.translatesAutoresizingMaskIntoConstraints = false
-        detailScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 390).isActive = true
+        detailScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 400).isActive = true
 
         detailStack.addArrangedSubview(actionRow)
         detailStack.addArrangedSubview(detailScroll)
         detailScroll.widthAnchor.constraint(equalTo: detailStack.widthAnchor).isActive = true
 
-        split.addArrangedSubview(tableScroll)
-        split.addArrangedSubview(detailStack)
-        return split
+        layout.addArrangedSubview(tableScroll)
+        layout.addArrangedSubview(detailStack)
+        detailStack.widthAnchor.constraint(greaterThanOrEqualToConstant: 360).isActive = true
+        return layout
     }
 
     private func configureReviewTableIfNeeded() {
@@ -2499,7 +2505,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
         reviewTableView.allowsEmptySelection = true
 
         for column in [
-            ("status", "Status", 88.0),
+            ("status", "Status", 112.0),
             ("commit", "Commit", 86.0),
             ("subject", "Commit", 250.0),
             ("date", "Date", 130.0)
@@ -2522,6 +2528,9 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
         actions.spacing = 8
         actions.addArrangedSubview(button(title: "Refresh Logs", action: #selector(refreshLogsAction)))
         actions.addArrangedSubview(button(title: "Open Logs Folder", action: #selector(openLogs)))
+        let note = NSTextField(labelWithString: "Showing latest 250 lines")
+        note.textColor = .secondaryLabelColor
+        actions.addArrangedSubview(note)
         stack.addArrangedSubview(actions)
 
         logsTextView.isEditable = false
@@ -2531,6 +2540,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
 
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
+        scroll.borderType = .noBorder
         scroll.documentView = logsTextView
         stack.addArrangedSubview(scroll)
         scroll.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
@@ -2581,7 +2591,22 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
 
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
-        scroll.documentView = form
+        scroll.borderType = .noBorder
+
+        let document = NSView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        form.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(form)
+        NSLayoutConstraint.activate([
+            form.leadingAnchor.constraint(equalTo: document.leadingAnchor),
+            form.trailingAnchor.constraint(lessThanOrEqualTo: document.trailingAnchor),
+            form.topAnchor.constraint(equalTo: document.topAnchor),
+            form.bottomAnchor.constraint(equalTo: document.bottomAnchor),
+            document.widthAnchor.constraint(greaterThanOrEqualToConstant: 850),
+            document.heightAnchor.constraint(greaterThanOrEqualToConstant: 660)
+        ])
+        document.frame = NSRect(x: 0, y: 0, width: 940, height: 660)
+        scroll.documentView = document
         return scroll
     }
 
@@ -2596,10 +2621,12 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
 
         let item = reviewItems[row]
         let identifier = tableColumn?.identifier.rawValue ?? "subject"
+        if identifier == "status" {
+            return statusCell(for: item.status)
+        }
+
         let value: String
         switch identifier {
-        case "status":
-            value = item.status.rawValue
         case "commit":
             value = item.shortSha
         case "date":
@@ -2615,6 +2642,48 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
         return text
     }
 
+    private func statusCell(for status: ReviewHistoryStatus) -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 6
+
+        if let image = statusImage(for: status) {
+            let imageView = NSImageView(image: image)
+            imageView.contentTintColor = color(for: status)
+            imageView.widthAnchor.constraint(equalToConstant: 14).isActive = true
+            imageView.heightAnchor.constraint(equalToConstant: 14).isActive = true
+            stack.addArrangedSubview(imageView)
+        }
+
+        let text = NSTextField(labelWithString: status.rawValue)
+        text.textColor = color(for: status)
+        text.maximumNumberOfLines = 1
+        stack.addArrangedSubview(text)
+        return stack
+    }
+
+    private func statusImage(for status: ReviewHistoryStatus) -> NSImage? {
+        if #available(macOS 11.0, *) {
+            let name: String
+            switch status {
+            case .completed:
+                name = "checkmark.circle.fill"
+            case .failed:
+                name = "xmark.octagon.fill"
+            case .skipped:
+                name = "forward.circle.fill"
+            case .running:
+                name = "arrow.triangle.2.circlepath.circle.fill"
+            case .pending:
+                name = "clock.fill"
+            }
+            return NSImage(systemSymbolName: name, accessibilityDescription: status.rawValue)
+        }
+
+        return nil
+    }
+
     func tableViewSelectionDidChange(_ notification: Notification) {
         let row = reviewTableView.selectedRow
         selectedReviewIndex = row >= 0 && row < reviewItems.count ? row : nil
@@ -2624,7 +2693,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
     private func color(for status: ReviewHistoryStatus) -> NSColor {
         switch status {
         case .completed:
-            return .labelColor
+            return .systemGreen
         case .failed:
             return .systemRed
         case .skipped:
@@ -2632,7 +2701,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
         case .running:
             return .systemBlue
         case .pending:
-            return .secondaryLabelColor
+            return .systemGray
         }
     }
 
@@ -2765,11 +2834,30 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
     }
 
     @objc private func refreshLogsAction() {
-        refreshLogs()
+        refreshLogs(scrollToBottom: true)
     }
 
-    private func refreshLogs() {
+    private func refreshLogs(scrollToBottom: Bool, preservePosition: Bool = false) {
+        let scrollView = logsTextView.enclosingScrollView
+        let clipView = scrollView?.contentView
+        let previousOrigin = clipView?.bounds.origin ?? .zero
+        let visibleMaxY = (clipView?.bounds.maxY ?? 0)
+        let documentHeight = logsTextView.bounds.height
+        let wasNearBottom = documentHeight - visibleMaxY < 24
+
         logsTextView.string = readLogText()
+        if let textContainer = logsTextView.textContainer {
+            logsTextView.layoutManager?.ensureLayout(for: textContainer)
+        }
+
+        if preservePosition && !wasNearBottom {
+            if let clipView {
+                clipView.scroll(to: previousOrigin)
+                scrollView?.reflectScrolledClipView(clipView)
+            }
+        } else if scrollToBottom || wasNearBottom {
+            logsTextView.scrollToEndOfDocument(nil)
+        }
     }
 
     @objc private func showSettingsWindow() {
@@ -3070,7 +3158,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
         if activeSection == .reviews {
             refreshReviewHistory()
         } else if activeSection == .logs {
-            refreshLogs()
+            refreshLogs(scrollToBottom: false, preservePosition: true)
         }
         if !update.isRunning {
             watcherLock.unlock()
