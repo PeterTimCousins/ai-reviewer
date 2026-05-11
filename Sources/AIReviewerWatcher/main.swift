@@ -457,6 +457,10 @@ func watcherLockURL() -> URL {
     appSupportURL().appendingPathComponent("watcher.lock")
 }
 
+func reviewOperationLockURL() -> URL {
+    appSupportURL().appendingPathComponent("review-operation.lock")
+}
+
 func appLogsURL() -> URL {
     FileManager.default
         .homeDirectoryForCurrentUser
@@ -1565,6 +1569,10 @@ func reviewOnce(config: AppConfig) throws -> URL? {
 
 func reviewCommit(config: AppConfig, commit: String) throws -> URL? {
     try validatePaths(config: config)
+    let operationLock = FileLock(url: reviewOperationLockURL())
+    guard try operationLock.tryLock() else {
+        throw AIReviewerError.commandFailed("Another review is already running.")
+    }
 
     let repoPath = repoURL(config: config).path
     let resolvedCommit = try runGit(repoPath: repoPath, arguments: ["rev-parse", commit])
