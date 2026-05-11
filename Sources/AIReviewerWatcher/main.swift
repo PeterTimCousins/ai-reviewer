@@ -2298,7 +2298,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         buildWindow()
         let config = loadConfigIntoFields()
         refreshLoginItemCheckbox()
-        applyActivationPolicy(config: config)
+        applyActivationPolicy(config: config, windowVisible: false)
         showSection(.reviews)
         window?.center()
 
@@ -2323,6 +2323,21 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     func windowWillClose(_ notification: Notification) {
         if activeSection == .settings {
             persistSettingsFromFields(showStatus: false)
+        }
+        if let config = try? configFromFields() {
+            applyActivationPolicy(config: config, windowVisible: false)
+        }
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) {
+        if let config = try? configFromFields() {
+            applyActivationPolicy(config: config, windowVisible: false)
+        }
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        if let config = try? configFromFields() {
+            applyActivationPolicy(config: config, windowVisible: true)
         }
     }
 
@@ -3006,6 +3021,9 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 
     @objc private func showSettingsWindow() {
+        if let config = try? configFromFields() {
+            applyActivationPolicy(config: config, windowVisible: true)
+        }
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -3090,8 +3108,8 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         return loginItemStatusText(service.status)
     }
 
-    private func applyActivationPolicy(config: AppConfig) {
-        NSApp.setActivationPolicy(config.shouldHideDockIcon ? .accessory : .regular)
+    private func applyActivationPolicy(config: AppConfig, windowVisible: Bool) {
+        NSApp.setActivationPolicy(config.shouldHideDockIcon && !windowVisible ? .accessory : .regular)
     }
 
     @discardableResult
@@ -3173,7 +3191,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         do {
             let config = try configFromFields()
             try saveConfig(config, to: configURL)
-            applyActivationPolicy(config: config)
+            applyActivationPolicy(config: config, windowVisible: window?.isVisible == true && window?.isMiniaturized == false)
             let loginItemStatus = try syncLoginItemSetting()
             drainManualReviewQueue(config: config)
             if showStatus {
@@ -3257,7 +3275,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         do {
             let config = try configFromFields()
             try saveConfig(config, to: configURL)
-            applyActivationPolicy(config: config)
+            applyActivationPolicy(config: config, windowVisible: window?.isVisible == true && window?.isMiniaturized == false)
             guard try watcherLock.tryLock() else {
                 watcherRunning = false
                 updateWatcherControls(status: "Watcher: already running in another AI Reviewer instance")
