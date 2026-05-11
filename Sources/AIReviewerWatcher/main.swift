@@ -95,15 +95,54 @@ func validate(config: AppConfig) throws {
     print("pollIntervalSeconds: \(config.pollIntervalSeconds)")
 }
 
+func watch(config: AppConfig) throws -> Never {
+    let repoPath = expandedPath(config.repoPath)
+    let interval = max(1, config.pollIntervalSeconds)
+    var lastHead = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
+
+    print("watching: \(repoPath)")
+    print("initialHead: \(lastHead)")
+
+    while true {
+        Thread.sleep(forTimeInterval: TimeInterval(interval))
+
+        do {
+            let head = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
+            if head != lastHead {
+                print("headChanged: \(lastHead) -> \(head)")
+                lastHead = head
+            }
+        } catch {
+            fputs("watch warning: \(error)\n", stderr)
+        }
+    }
+}
+
 let args = CommandLine.arguments
 
 do {
-    guard args.count == 3, args[1] == "--config" else {
-        throw AIReviewerError.missingArgument("Usage: ai-reviewer-watcher --config <path>")
+    guard (args.count == 3 || args.count == 4), args[1] == "--config" else {
+        throw AIReviewerError.missingArgument("Usage: ai-reviewer-watcher --config <path> [--once|--watch]")
+    }
+
+    let watchMode: Bool
+    if args.count == 4 {
+        if args[3] == "--watch" {
+            watchMode = true
+        } else if args[3] == "--once" {
+            watchMode = false
+        } else {
+            throw AIReviewerError.missingArgument("Usage: ai-reviewer-watcher --config <path> [--once|--watch]")
+        }
+    } else {
+        watchMode = false
     }
 
     let config = try loadConfig(path: args[2])
     try validate(config: config)
+    if watchMode {
+        try watch(config: config)
+    }
 } catch {
     fputs("\(error)\n", stderr)
     exit(1)

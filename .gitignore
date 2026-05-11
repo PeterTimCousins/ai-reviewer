@@ -1,10 +1,13 @@
 .DS_Store
 .build/
 .swiftpm/
+build/
 DerivedData/
 *.xcodeproj/project.xcworkspace/xcuserdata/
 *.xcodeproj/xcuserdata/
 *.xcuserstate
+*.xcuserdata/
+*.swp
 
 # Local runtime state
 config/local.json
