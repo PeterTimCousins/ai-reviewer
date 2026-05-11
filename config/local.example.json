@@ -7,5 +7,6 @@
   "codexModel": null,
   "reviewCachePath": "~/Library/Caches/com.ai-reviewer",
   "statePath": null,
+  "reviewCurrentHeadOnStartup": false,
   "maxSnapshotBytes": 200000
 }

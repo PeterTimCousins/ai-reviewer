@@ -43,8 +43,8 @@ Build a foreground CLI that:
 - Validates repository and report paths.
 - Reads `HEAD` and `.git/logs/HEAD`.
 - Prints the detected repo status.
-- Runs a foreground `--watch` polling loop that reconciles startup HEAD and
-  reviews changed HEADs.
+- Runs a foreground `--watch` polling loop that reviews changed HEADs. Startup
+  HEAD reconciliation is controlled by `reviewCurrentHeadOnStartup`.
 - Materializes HEAD into a local cache bundle.
 - Runs Codex against a local bundle using the stripped environment and read-only
   sandbox.
@@ -74,9 +74,11 @@ menu-bar/login item wrapper.
    ephemeral execution, ignored user config, and ignored repo rules.
 7. Write Codex output to the local cache first as `codex-review.md`, then have
    AI Reviewer copy the final report back to the configured repo reports path.
-8. Install a launchd user agent that starts a local wrapper and keeps AI
-   Reviewer running in `watch` mode. Do not use launchd `WatchPaths` on the
-   watched repository; the app/helper should remain the repository reader.
+8. Install an experimental launchd user agent that starts the app executable
+   directly and keeps AI Reviewer running in `watch` mode. Do not use launchd
+   `WatchPaths` on the watched repository; the app/helper should remain the
+   repository reader. Treat this mode as unproven until the installed-app TCC
+   flow is tested end to end.
 9. Evolve the current settings window into a menu-bar app and login item after
    the foreground watcher can run one review cycle end to end.
 

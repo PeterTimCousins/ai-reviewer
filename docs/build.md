@@ -64,6 +64,10 @@ Install the background launchd watcher with:
 scripts/install-launch-agent.sh
 ```
 
+LaunchAgent support is experimental until the installed-app TCC flow is tested.
+Before loading it, open the installed app, choose the watched repository in the
+GUI, save settings, and validate from that app identity.
+
 Uninstall it with:
 
 ```bash

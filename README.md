@@ -89,8 +89,9 @@ bundle.
 the configured reports path, and records the SHA in local state. Already
 reviewed SHAs are skipped.
 
-`watch` runs in the foreground, reconciles the current HEAD at startup, and
-calls `review-once` when HEAD changes.
+`watch` runs in the foreground and calls `review-once` when HEAD changes. It
+only reconciles the current HEAD at startup when `reviewCurrentHeadOnStartup` is
+enabled in config.
 
 ## Planned Runtime Locations
 
@@ -113,9 +114,14 @@ scripts/install.sh --config config/local.json
 scripts/install-launch-agent.sh
 ```
 
+LaunchAgent support is experimental until the installed-app TCC flow is proven:
+open `AI Reviewer.app`, choose the watched repository in the GUI, save settings,
+and validate from that installed app identity before loading the agent.
+
 The launch agent keeps AI Reviewer running in `watch` mode. It does not use
-launchd `WatchPaths` on the watched repository; launchd starts a local wrapper,
-and AI Reviewer is the process that reads the configured repo.
+launchd `WatchPaths` on the watched repository; launchd starts the app
+executable directly, and AI Reviewer is the process that reads the configured
+repo.
 
 Uninstall the launch agent with:
 
@@ -175,6 +181,7 @@ to cover:
 - state path
 - poll interval
 - max parallel reviews
+- review current HEAD on watcher startup
 - watcher enabled/disabled and recent review state
 
 The repository picker should use a native macOS open panel so users explicitly

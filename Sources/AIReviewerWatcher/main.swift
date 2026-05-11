@@ -1,7 +1,7 @@
 import AppKit
 import Foundation
 
-struct AppConfig: Codable {
+struct AppConfig: Codable, Sendable {
     var repoPath: String
     var reportsPath: String
     var maxParallelReviews: Int
@@ -11,9 +11,14 @@ struct AppConfig: Codable {
     var maxSnapshotBytes: Int?
     var codexModel: String?
     var statePath: String?
+    var reviewCurrentHeadOnStartup: Bool?
 
     var snapshotByteLimit: Int {
         max(1, maxSnapshotBytes ?? 200_000)
+    }
+
+    var shouldReviewCurrentHeadOnStartup: Bool {
+        reviewCurrentHeadOnStartup ?? false
     }
 }
 
@@ -27,7 +32,8 @@ func defaultConfig() -> AppConfig {
         reviewCachePath: "~/Library/Caches/com.ai-reviewer",
         maxSnapshotBytes: 200_000,
         codexModel: nil,
-        statePath: nil
+        statePath: nil,
+        reviewCurrentHeadOnStartup: false
     )
 }
 
@@ -293,6 +299,7 @@ func validationSummary(config: AppConfig) throws -> String {
     branch: \(branch.isEmpty ? "(detached)" : branch)
     maxParallelReviews: \(config.maxParallelReviews)
     pollIntervalSeconds: \(config.pollIntervalSeconds)
+    reviewCurrentHeadOnStartup: \(config.shouldReviewCurrentHeadOnStartup)
     maxSnapshotBytes: \(config.snapshotByteLimit)
     """
 }
@@ -310,10 +317,12 @@ func watch(config: AppConfig) throws -> Never {
 
     print("watching: \(repoPath)")
     print("initialHead: \(lastHead)")
-    do {
-        _ = try reviewOnce(config: config)
-    } catch {
-        fputs("watch startup warning: \(error)\n", stderr)
+    if config.shouldReviewCurrentHeadOnStartup {
+        do {
+            _ = try reviewOnce(config: config)
+        } catch {
+            fputs("watch startup warning: \(error)\n", stderr)
+        }
     }
 
     while true {
@@ -371,6 +380,15 @@ func writeData(_ data: Data, to url: URL) throws {
     }
 }
 
+func trashExistingItem(at url: URL) throws {
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        return
+    }
+
+    var trashedURL: NSURL?
+    try FileManager.default.trashItem(at: url, resultingItemURL: &trashedURL)
+}
+
 func materializeSnapshot(repoPath: String, commit: String, path: String, snapshotsURL: URL, byteLimit: Int) throws -> (relativePath: String, bytes: Int, capped: Bool)? {
     let statusPath = try safeRelativePath(path)
     let data: Data
@@ -402,9 +420,7 @@ func materializeHead(config: AppConfig) throws -> URL {
         .appendingPathComponent(commit)
     let snapshotsURL = bundleURL.appendingPathComponent("snapshots")
 
-    if FileManager.default.fileExists(atPath: bundleURL.path) {
-        try FileManager.default.removeItem(at: bundleURL)
-    }
+    try trashExistingItem(at: bundleURL)
     try FileManager.default.createDirectory(at: bundleURL, withIntermediateDirectories: true)
 
     let commitText = try runGitData(repoPath: repoPath, arguments: ["show", "--no-patch", "--format=fuller", commit])
@@ -722,6 +738,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
     private let pollIntervalField = NSTextField()
     private let maxParallelField = NSTextField()
     private let maxSnapshotField = NSTextField()
+    private let reviewStartupCheckbox = NSButton(checkboxWithTitle: "Review current HEAD when watcher starts", target: nil, action: nil)
     private let statusField = NSTextField(labelWithString: "Idle")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -750,7 +767,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildWindow() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 800, height: 510),
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 550),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -778,6 +795,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         root.addArrangedSubview(row(label: "Poll Seconds", field: pollIntervalField))
         root.addArrangedSubview(row(label: "Max Parallel", field: maxParallelField))
         root.addArrangedSubview(row(label: "Max Snapshot Bytes", field: maxSnapshotField))
+        root.addArrangedSubview(checkboxRow(reviewStartupCheckbox))
 
         let buttonRow = NSStackView()
         buttonRow.orientation = .horizontal
@@ -831,6 +849,20 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         return stack
     }
 
+    private func checkboxRow(_ checkbox: NSButton) -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 10
+
+        let spacer = NSView()
+        spacer.widthAnchor.constraint(equalToConstant: 140).isActive = true
+
+        stack.addArrangedSubview(spacer)
+        stack.addArrangedSubview(checkbox)
+        return stack
+    }
+
     private func button(title: String, action: Selector) -> NSButton {
         let button = NSButton(title: title, target: self, action: action)
         button.bezelStyle = .rounded
@@ -857,6 +889,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         pollIntervalField.stringValue = "\(config.pollIntervalSeconds)"
         maxParallelField.stringValue = "\(config.maxParallelReviews)"
         maxSnapshotField.stringValue = "\(config.snapshotByteLimit)"
+        reviewStartupCheckbox.state = config.shouldReviewCurrentHeadOnStartup ? .on : .off
     }
 
     private func configFromFields() throws -> AppConfig {
@@ -876,7 +909,8 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
             reviewCachePath: cacheField.stringValue,
             maxSnapshotBytes: max(1, maxSnapshot),
             codexModel: codexModelField.stringValue.isEmpty ? nil : codexModelField.stringValue,
-            statePath: statePathField.stringValue.isEmpty ? nil : statePathField.stringValue
+            statePath: statePathField.stringValue.isEmpty ? nil : statePathField.stringValue,
+            reviewCurrentHeadOnStartup: reviewStartupCheckbox.state == .on
         )
     }
 
@@ -903,45 +937,53 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func validateSettings() {
-        do {
-            let config = try configFromFields()
-            statusField.stringValue = try validationSummary(config: config)
-        } catch {
-            statusField.stringValue = "\(error)"
+        runConfiguredOperation("Validating") { config in
+            try validationSummary(config: config)
         }
     }
 
     @objc private func materializeHeadFromSettings() {
-        do {
-            let config = try configFromFields()
-            try saveConfig(config, to: configURL)
+        runConfiguredOperation("Materializing HEAD") { config in
             let bundleURL = try materializeHead(config: config)
-            statusField.stringValue = "Materialized HEAD into \(bundleURL.path)"
-        } catch {
-            statusField.stringValue = "\(error)"
+            return "Materialized HEAD into \(bundleURL.path)"
         }
     }
 
     @objc private func reviewHeadFromSettings() {
-        do {
-            let config = try configFromFields()
-            try saveConfig(config, to: configURL)
+        runConfiguredOperation("Reviewing HEAD") { config in
             let bundleURL = try materializeHead(config: config)
             let reviewURL = try runCodex(config: config, bundleURL: bundleURL)
-            statusField.stringValue = "Review written to \(reviewURL.path)"
-        } catch {
-            statusField.stringValue = "\(error)"
+            return "Review written to \(reviewURL.path)"
         }
     }
 
     @objc private func reviewOnceFromSettings() {
+        runConfiguredOperation("Running one-shot review") { config in
+            if let reportURL = try reviewOnce(config: config) {
+                return "Review copied to \(reportURL.path)"
+            }
+
+            return "HEAD already reviewed"
+        }
+    }
+
+    private func runConfiguredOperation(_ label: String, operation: @escaping @Sendable (AppConfig) throws -> String) {
         do {
             let config = try configFromFields()
             try saveConfig(config, to: configURL)
-            if let reportURL = try reviewOnce(config: config) {
-                statusField.stringValue = "Review copied to \(reportURL.path)"
-            } else {
-                statusField.stringValue = "HEAD already reviewed"
+
+            statusField.stringValue = "\(label)..."
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result: String
+                do {
+                    result = try operation(config)
+                } catch {
+                    result = "\(error)"
+                }
+
+                DispatchQueue.main.async { [weak self] in
+                    self?.statusField.stringValue = result
+                }
             }
         } catch {
             statusField.stringValue = "\(error)"

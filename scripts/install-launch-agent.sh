@@ -7,8 +7,11 @@ Usage:
   scripts/install-launch-agent.sh [--no-load] [--config <path>] [--app <path>]
 
 Installs a launchd user agent that keeps AI Reviewer running in foreground
-watch mode. launchd starts a local wrapper only; AI Reviewer is the process
-that reads the configured repository.
+watch mode. launchd starts the app executable directly; AI Reviewer is the
+process that reads the configured repository.
+
+Experimental: use this only after validating the installed app can access the
+chosen repository through the intended macOS permission flow.
 USAGE
 }
 
@@ -52,7 +55,6 @@ done
 label="com.ai-reviewer.watcher"
 plist_path="${HOME}/Library/LaunchAgents/${label}.plist"
 support_dir="${HOME}/Library/Application Support/com.ai-reviewer"
-wrapper_path="${support_dir}/watcher.sh"
 log_dir="${HOME}/Library/Logs/com.ai-reviewer"
 stdout_log="${log_dir}/watcher.stdout.log"
 stderr_log="${log_dir}/watcher.stderr.log"
@@ -70,15 +72,14 @@ if [[ ! -f "$config_path" ]]; then
   exit 1
 fi
 
+cat >&2 <<'WARNING'
+Warning: launch agent support is experimental.
+Before loading it, validate the installed app flow manually: open AI Reviewer.app,
+choose the watched repository in the GUI, save settings, and confirm validation
+works from the installed app identity.
+WARNING
+
 mkdir -p "$support_dir" "$(dirname "$plist_path")" "$log_dir"
-
-cat > "$wrapper_path" <<WRAPPER
-#!/bin/bash
-set -euo pipefail
-
-exec "${executable_path}" watch --config "${config_path}"
-WRAPPER
-chmod +x "$wrapper_path"
 
 if [[ -f "$plist_path" ]]; then
   backup="${plist_path}.backup.$(date '+%Y%m%d%H%M%S')"
@@ -98,8 +99,10 @@ cat > "$plist_path" <<PLIST
 
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/bash</string>
-    <string>${wrapper_path}</string>
+    <string>${executable_path}</string>
+    <string>watch</string>
+    <string>--config</string>
+    <string>${config_path}</string>
   </array>
 
   <key>RunAtLoad</key>
@@ -136,7 +139,6 @@ plutil -lint "$plist_path" >/dev/null
 echo "Installed launch agent config:"
 echo "  Label:   $label"
 echo "  Plist:   $plist_path"
-echo "  Wrapper: $wrapper_path"
 echo "  Config:  $config_path"
 echo "  App:     $app_path"
 echo "  Logs:    $stdout_log"
