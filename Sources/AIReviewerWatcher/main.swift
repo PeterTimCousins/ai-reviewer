@@ -2450,13 +2450,17 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
         tableScroll.borderType = .noBorder
         tableScroll.documentView = reviewTableView
         tableScroll.translatesAutoresizingMaskIntoConstraints = false
-        tableScroll.widthAnchor.constraint(equalToConstant: 560).isActive = true
+        tableScroll.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        tableScroll.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        tableScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 500).isActive = true
         tableScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 430).isActive = true
 
         let detailStack = NSStackView()
         detailStack.orientation = .vertical
         detailStack.alignment = .leading
         detailStack.spacing = 8
+        detailStack.setContentHuggingPriority(.required, for: .horizontal)
+        detailStack.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         let actionRow = NSStackView()
         actionRow.orientation = .horizontal
@@ -2488,7 +2492,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
 
         layout.addArrangedSubview(tableScroll)
         layout.addArrangedSubview(detailStack)
-        detailStack.widthAnchor.constraint(greaterThanOrEqualToConstant: 360).isActive = true
+        detailStack.widthAnchor.constraint(equalToConstant: 360).isActive = true
         return layout
     }
 
