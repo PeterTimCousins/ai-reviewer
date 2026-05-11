@@ -1,0 +1,8 @@
+{
+  "repoPath": "/Volumes/4TB External SSD/Dropshipping Web Application/dropship-app",
+  "reportsPath": "tmp_docs/reviews",
+  "maxParallelReviews": 3,
+  "pollIntervalSeconds": 10,
+  "codexHome": "~/.codex",
+  "reviewCachePath": "~/Library/Caches/com.ai-reviewer"
+}
