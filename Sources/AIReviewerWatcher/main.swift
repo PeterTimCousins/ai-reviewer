@@ -2466,7 +2466,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
         actionRow.orientation = .horizontal
         actionRow.spacing = 8
         let rerun = button(title: "Rerun Review", action: #selector(rerunSelectedReview))
-        let openReview = button(title: "Open Review", action: #selector(openSelectedReview))
+        let openReview = button(title: "Show Review", action: #selector(openSelectedReview))
         let openBundle = button(title: "Open Bundle", action: #selector(openSelectedBundle))
         rerunReviewButton = rerun
         openReviewButton = openReview
@@ -2824,7 +2824,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
             return
         }
 
-        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
     }
 
     @objc private func openSelectedBundle() {
