@@ -775,7 +775,12 @@ func watch(config: AppConfig) throws -> Never {
             fputs("watch startup warning: \(error)\n", stderr)
         }
     } else {
-        try recordSeenHead(config: config, head: lastHead)
+        do {
+            _ = try reconcileCurrentHead(config: config)
+        } catch {
+            fputs("watch startup reconciliation warning: \(error)\n", stderr)
+            try recordSeenHead(config: config, head: lastHead)
+        }
     }
 
     while true {
@@ -1761,6 +1766,57 @@ func recordSeenHead(config: AppConfig, head: String) throws {
     }
 }
 
+func hasReviewLedgerEntry(_ state: ReviewState, commit: String) -> Bool {
+    state.reviewed[commit] != nil ||
+        state.failed[commit] != nil ||
+        (state.skipped ?? [:])[commit] != nil
+}
+
+func currentHeadNeedsStartupReconciliation(config: AppConfig) throws -> Bool {
+    try validatePaths(config: config)
+
+    let repoPath = repoURL(config: config).path
+    let head = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
+    let state = try loadState(config: config)
+    return !hasReviewLedgerEntry(state, commit: head)
+}
+
+func reconcileCurrentHead(config: AppConfig) throws -> [URL] {
+    try validatePaths(config: config)
+
+    let repoPath = repoURL(config: config).path
+    let head = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
+    let state = try loadState(config: config)
+    guard !hasReviewLedgerEntry(state, commit: head) else {
+        try recordSeenHead(config: config, head: head)
+        return []
+    }
+
+    let shortHead = try runGit(repoPath: repoPath, arguments: ["rev-parse", "--short", head])
+    let parentCount = try runGit(repoPath: repoPath, arguments: ["log", "-1", "--format=%P", head])
+        .split(separator: " ")
+        .count
+    if parentCount > 1 {
+        try mutateState(config: config) { state in
+            state.lastSeenHead = head
+            state.skipped = state.skipped ?? [:]
+            state.skipped?[head] = ReviewSkipRecord(
+                sha: head,
+                shortSha: shortHead,
+                skippedAt: isoNow(),
+                reason: "merge commit"
+            )
+        }
+        return []
+    }
+
+    if let report = try reviewCommit(config: config, commit: head) {
+        return [report]
+    }
+
+    return []
+}
+
 func pendingReviewCommits(config: AppConfig) throws -> [String] {
     try validatePaths(config: config)
 
@@ -2091,6 +2147,8 @@ final class AppWatcher: @unchecked Sendable {
 
                 if config.shouldReviewCurrentHeadOnStartup {
                     self.reviewPending(config: config, reason: "Reviewing pending commits on startup", onUpdate: onUpdate)
+                } else if try currentHeadNeedsStartupReconciliation(config: config) {
+                    self.reviewCurrentHead(config: config, reason: "Reconciling unreviewed current HEAD", onUpdate: onUpdate)
                 } else {
                     try recordSeenHead(config: config, head: self.lastHead ?? "")
                 }
@@ -2172,6 +2230,31 @@ final class AppWatcher: @unchecked Sendable {
 
         do {
             let reports = try reviewPendingCommits(config: config)
+            if let reportURL = reports.last {
+                lastReview = reportURL.path
+                send("Review completed (\(reports.count) commit\(reports.count == 1 ? "" : "s"))", onUpdate: onUpdate)
+            } else {
+                send("No pending commits", onUpdate: onUpdate)
+            }
+        } catch {
+            lastError = "\(error)"
+            send("Review failed", onUpdate: onUpdate)
+        }
+
+        isReviewing = false
+    }
+
+    private func reviewCurrentHead(config: AppConfig, reason: String, onUpdate: @escaping @Sendable (WatcherUpdate) -> Void) {
+        guard isRunning else {
+            return
+        }
+
+        isReviewing = true
+        lastError = nil
+        send(reason, onUpdate: onUpdate)
+
+        do {
+            let reports = try reconcileCurrentHead(config: config)
             if let reportURL = reports.last {
                 lastReview = reportURL.path
                 send("Review completed (\(reports.count) commit\(reports.count == 1 ? "" : "s"))", onUpdate: onUpdate)
@@ -3500,7 +3583,8 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 runningCommits.remove(lastHead)
             } else if status.contains("head changed") ||
                         status.contains("reviewing pending") ||
-                        status.contains("retrying failed") {
+                        status.contains("retrying failed") ||
+                        status.contains("reconciling unreviewed") {
                 runningCommits.insert(lastHead)
             }
         }
