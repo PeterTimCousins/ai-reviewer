@@ -23,8 +23,9 @@ This is early-stage software. The current app can:
 - validate a local JSON config
 - watch a repository HEAD in the foreground
 - materialize the current HEAD into a local cache bundle
+- run Codex against a local cache bundle with a stripped environment
 
-Codex execution and report copying are intentionally not wired in yet.
+Report copying is intentionally not wired in yet.
 
 ## Quick Start
 
@@ -38,6 +39,7 @@ Edit `config/local.json`, then run:
 ```bash
 scripts/smoke.sh
 build/AI\ Reviewer.app/Contents/MacOS/ai-reviewer-watcher materialize-head --config config/local.json
+build/AI\ Reviewer.app/Contents/MacOS/ai-reviewer-watcher review-head --config config/local.json
 ```
 
 `config/local.json` is ignored by Git. `config/example.json` is safe for public
@@ -55,6 +57,8 @@ open build/AI\ Reviewer.app
 ai-reviewer-watcher validate --config <path>
 ai-reviewer-watcher watch --config <path>
 ai-reviewer-watcher materialize-head --config <path>
+ai-reviewer-watcher run-codex --config <path> --bundle <sha-or-path>
+ai-reviewer-watcher review-head --config <path>
 ```
 
 `materialize-head` writes to:
@@ -70,6 +74,14 @@ The bundle contains:
 - `diff.patch`
 - `changed-files.json`
 - capped snapshots under `snapshots/`
+
+`run-codex` writes:
+
+- `codex-review.md`
+- `codex.log`
+
+`review-head` materializes the current HEAD, then runs Codex against that
+bundle.
 
 ## Planned Runtime Locations
 
@@ -90,7 +102,7 @@ AI Reviewer should be the only process that receives access to the watched
 repository. Codex should not be granted Full Disk Access and should not need
 direct access to removable volumes or protected folders.
 
-When Codex execution is added, subprocesses should run from local bundles with:
+Codex subprocesses run from local bundles with:
 
 - `env -i`
 - scratch `HOME`
@@ -102,6 +114,9 @@ When Codex execution is added, subprocesses should run from local bundles with:
 - `--ephemeral`
 - `--ignore-user-config`
 - `--ignore-rules`
+
+The app passes `--cd <bundle>` and `--skip-git-repo-check`, so Codex does not
+need a Git checkout or direct access to the watched repository.
 
 Deny unrelated macOS permission prompts such as Media Library, Photos, Contacts,
 Calendar, Camera, and Microphone.
@@ -119,7 +134,7 @@ AI_REVIEWER_CODESIGN_IDENTITY="Developer ID Application: Example" scripts/build.
 
 The app currently includes a basic settings window for editing the app-support
 config, choosing a watched repository, validating settings, materializing HEAD,
-and opening the cache folder.
+running a HEAD review, and opening the cache folder.
 
 The intended product shape is a menu-bar app. The settings UI should continue
 to cover:
@@ -128,6 +143,7 @@ to cover:
 - reports path inside that repository
 - cache path
 - Codex home path
+- Codex model
 - poll interval
 - max parallel reviews
 - watcher enabled/disabled

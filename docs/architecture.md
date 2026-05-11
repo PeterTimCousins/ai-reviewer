@@ -30,7 +30,7 @@ bundle and runs with:
    oversized commits.
 3. Materialize a bundle under `~/Library/Caches/com.ai-reviewer/bundles/<sha>/`.
 4. Run Codex specialists against the bundle, not the live repo.
-5. Write the final report locally.
+5. Write the final report locally as `codex-review.md`.
 6. Copy the report back to `<repoPath>/<reportsPath>/`.
 7. Record the SHA in local state and, optionally, the repo review ledger.
 
@@ -44,8 +44,10 @@ Build a foreground CLI that:
 - Prints the detected repo status.
 - Runs a simple `--watch` polling loop that reports HEAD changes.
 - Materializes HEAD into a local cache bundle.
+- Runs Codex against a local bundle using the stripped environment and read-only
+  sandbox.
 
-After that works, add review execution, report copying, and a menu-bar/login
+After that works, add report copying, state/ledger tracking, and a menu-bar/login
 item wrapper.
 
 ## Concrete Implementation Plan
@@ -66,8 +68,8 @@ item wrapper.
 6. Run Codex from the bundle directory with `env -i`, scratch `HOME`, scratch
    `TMPDIR`, explicit `CODEX_HOME`, minimal `PATH`, read-only sandbox,
    ephemeral execution, ignored user config, and ignored repo rules.
-7. Write Codex output to the local cache first, then have AI Reviewer copy the
-   final report back to the configured repo reports path.
+7. Write Codex output to the local cache first as `codex-review.md`, then have
+   AI Reviewer copy the final report back to the configured repo reports path.
 8. Evolve the current settings window into a menu-bar app and login item after
    the foreground watcher can run one review cycle end to end.
 
@@ -80,6 +82,7 @@ the CLI:
 - choose watched repository with `NSOpenPanel`
 - configure reports path, cache path, Codex home, poll interval, and parallelism
 - validate permissions and Git status
+- materialize HEAD and run a local-bundle Codex review
 - start and stop the watcher
 - open cache and log locations
 - show last seen commit, last materialized bundle, and recent errors

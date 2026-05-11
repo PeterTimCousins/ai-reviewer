@@ -8,7 +8,8 @@ struct AppConfig: Codable {
     var pollIntervalSeconds: Int
     var codexHome: String
     var reviewCachePath: String
-    let maxSnapshotBytes: Int?
+    var maxSnapshotBytes: Int?
+    var codexModel: String?
 
     var snapshotByteLimit: Int {
         max(1, maxSnapshotBytes ?? 200_000)
@@ -23,7 +24,8 @@ func defaultConfig() -> AppConfig {
         pollIntervalSeconds: 10,
         codexHome: "~/.codex",
         reviewCachePath: "~/Library/Caches/com.ai-reviewer",
-        maxSnapshotBytes: 200_000
+        maxSnapshotBytes: 200_000,
+        codexModel: nil
     )
 }
 
@@ -49,6 +51,8 @@ enum Command: String {
     case validate
     case watch
     case materializeHead = "materialize-head"
+    case runCodex = "run-codex"
+    case reviewHead = "review-head"
 }
 
 enum AIReviewerError: Error, CustomStringConvertible {
@@ -86,6 +90,8 @@ func usage() -> String {
       ai-reviewer-watcher validate --config <path>
       ai-reviewer-watcher watch --config <path>
       ai-reviewer-watcher materialize-head --config <path>
+      ai-reviewer-watcher run-codex --config <path> --bundle <sha-or-path>
+      ai-reviewer-watcher review-head --config <path>
     """
 }
 
@@ -160,6 +166,10 @@ func reportsURL(config: AppConfig) -> URL {
 
 func cacheURL(config: AppConfig) -> URL {
     URL(fileURLWithPath: expandedPath(config.reviewCachePath))
+}
+
+func bundlesURL(config: AppConfig) -> URL {
+    cacheURL(config: config).appendingPathComponent("bundles")
 }
 
 func validatePaths(config: AppConfig) throws {
@@ -282,7 +292,7 @@ func materializeSnapshot(repoPath: String, commit: String, path: String, snapsho
     return (relativeSnapshotPath, outputData.count, capped)
 }
 
-func materializeHead(config: AppConfig) throws {
+func materializeHead(config: AppConfig) throws -> URL {
     try validatePaths(config: config)
 
     let repoPath = repoURL(config: config).path
@@ -290,8 +300,7 @@ func materializeHead(config: AppConfig) throws {
     let commit = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
     let shortCommit = try runGit(repoPath: repoPath, arguments: ["rev-parse", "--short", "HEAD"])
 
-    let bundleURL = cacheURL(config: config)
-        .appendingPathComponent("bundles")
+    let bundleURL = bundlesURL(config: config)
         .appendingPathComponent(commit)
     let snapshotsURL = bundleURL.appendingPathComponent("snapshots")
 
@@ -351,17 +360,184 @@ func materializeHead(config: AppConfig) throws {
     print("materialized: \(bundleURL.path)")
     print("commit: \(shortCommit)")
     print("changedFiles: \(changedFiles.count)")
+
+    return bundleURL
 }
 
-func parseCommand(_ args: [String]) throws -> (Command, String) {
-    guard args.count == 4,
+func resolveBundleURL(config: AppConfig, bundle: String) throws -> URL {
+    let candidate: URL
+    if bundle.contains("/") || bundle.hasPrefix("~") {
+        candidate = URL(fileURLWithPath: expandedPath(bundle))
+    } else {
+        let root = bundlesURL(config: config)
+        let exact = root.appendingPathComponent(bundle)
+        if FileManager.default.fileExists(atPath: exact.path) {
+            candidate = exact
+        } else {
+            let contents = try FileManager.default.contentsOfDirectory(atPath: root.path)
+            let matches = contents.filter { $0.hasPrefix(bundle) }
+            guard matches.count == 1, let match = matches.first else {
+                throw AIReviewerError.missingPath("bundle \(bundle) under \(root.path)")
+            }
+            candidate = root.appendingPathComponent(match)
+        }
+    }
+
+    let standardizedCandidate = candidate.standardizedFileURL
+    let standardizedRoot = bundlesURL(config: config).standardizedFileURL
+    guard standardizedCandidate.path == standardizedRoot.path || standardizedCandidate.path.hasPrefix(standardizedRoot.path + "/") else {
+        throw AIReviewerError.invalidPath("bundle must live under \(standardizedRoot.path)")
+    }
+
+    for name in ["bundle.json", "commit.txt", "diff.patch", "changed-files.json"] {
+        let path = standardizedCandidate.appendingPathComponent(name).path
+        guard FileManager.default.fileExists(atPath: path) else {
+            throw AIReviewerError.missingPath(path)
+        }
+    }
+
+    return standardizedCandidate
+}
+
+func runCodexPrompt(bundleURL: URL) -> String {
+    """
+    You are Codex running a read-only review against a local AI Reviewer bundle.
+
+    Security boundary:
+    - Your working directory is the local bundle directory.
+    - Review only files in this bundle.
+    - Do not access any path outside the current working directory.
+    - Do not edit files, create files, run tests, install packages, or call network services.
+    - The live source repository is intentionally not available.
+
+    Bundle files:
+    - bundle.json: commit metadata and changed-file manifest
+    - commit.txt: commit metadata
+    - diff.patch: patch for the reviewed commit
+    - changed-files.json: changed files and snapshot metadata
+    - snapshots/: capped post-commit file snapshots
+
+    Review only the changes represented by this bundle. Do not report pre-existing
+    issues unless this diff clearly makes them worse.
+
+    Output format:
+    REVIEW
+    VERDICT: PASS or FAIL
+    FINDINGS:
+    - [score|category] path:line - concrete issue
+
+    If there are no concrete issues, write:
+    REVIEW
+    VERDICT: PASS
+    FINDINGS:
+    - none
+    """
+}
+
+func runCodex(config: AppConfig, bundleURL: URL) throws -> URL {
+    let runRoot = cacheURL(config: config).appendingPathComponent("codex-runs")
+    let runID = "\(bundleURL.lastPathComponent)-\(Int(Date().timeIntervalSince1970))"
+    let runURL = runRoot.appendingPathComponent(runID)
+    let homeURL = runURL.appendingPathComponent("home")
+    let tmpURL = runURL.appendingPathComponent("tmp")
+    let outputURL = bundleURL.appendingPathComponent("codex-review.md")
+    let logURL = bundleURL.appendingPathComponent("codex.log")
+    let prompt = runCodexPrompt(bundleURL: bundleURL)
+    let reviewPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+    try FileManager.default.createDirectory(at: homeURL, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: tmpURL, withIntermediateDirectories: true)
+    FileManager.default.createFile(atPath: logURL.path, contents: nil)
+    let logHandle = try FileHandle(forWritingTo: logURL)
+    try logHandle.truncate(atOffset: 0)
+    defer {
+        try? logHandle.close()
+    }
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+
+    var arguments = [
+        "-i",
+        "HOME=\(homeURL.path)",
+        "CODEX_HOME=\(expandedPath(config.codexHome))",
+        "TMPDIR=\(tmpURL.path)",
+        "PATH=\(reviewPath)",
+        "USER=\(NSUserName())",
+        "LOGNAME=\(NSUserName())",
+        "SHELL=/bin/bash",
+        "codex",
+        "--ask-for-approval", "never",
+        "exec",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--skip-git-repo-check",
+        "--cd", bundleURL.path,
+        "--sandbox", "read-only",
+        "--ephemeral",
+        "--color", "never",
+        "-c", "shell_environment_policy.inherit=none"
+    ]
+
+    if let model = config.codexModel, !model.isEmpty {
+        arguments += ["--model", model]
+    }
+
+    arguments += ["--output-last-message", outputURL.path, "-"]
+    process.arguments = arguments
+
+    let inputPipe = Pipe()
+    process.standardInput = inputPipe
+    process.standardOutput = logHandle
+    process.standardError = logHandle
+
+    try process.run()
+    inputPipe.fileHandleForWriting.write(Data(prompt.utf8))
+    try inputPipe.fileHandleForWriting.close()
+    process.waitUntilExit()
+
+    guard process.terminationStatus == 0 else {
+        let logData = (try? Data(contentsOf: logURL)) ?? Data()
+        let logText = String(data: logData, encoding: .utf8) ?? ""
+        let tail = logText.split(separator: "\n").suffix(40).joined(separator: "\n")
+        throw AIReviewerError.commandFailed("codex exited with status \(process.terminationStatus)\n\(tail)")
+    }
+
+    guard FileManager.default.fileExists(atPath: outputURL.path) else {
+        throw AIReviewerError.missingPath(outputURL.path)
+    }
+
+    print("codexReview: \(outputURL.path)")
+    print("codexLog: \(logURL.path)")
+    return outputURL
+}
+
+struct ParsedCommand {
+    let command: Command
+    let configPath: String
+    let bundle: String?
+}
+
+func parseCommand(_ args: [String]) throws -> ParsedCommand {
+    guard args.count >= 4,
           let command = Command(rawValue: args[1]),
           args[2] == "--config"
     else {
         throw AIReviewerError.missingArgument(usage())
     }
 
-    return (command, args[3])
+    switch command {
+    case .validate, .watch, .materializeHead, .reviewHead:
+        guard args.count == 4 else {
+            throw AIReviewerError.missingArgument(usage())
+        }
+        return ParsedCommand(command: command, configPath: args[3], bundle: nil)
+    case .runCodex:
+        guard args.count == 6, args[4] == "--bundle" else {
+            throw AIReviewerError.missingArgument(usage())
+        }
+        return ParsedCommand(command: command, configPath: args[3], bundle: args[5])
+    }
 }
 
 @MainActor
@@ -373,6 +549,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
     private let reportsField = NSTextField()
     private let cacheField = NSTextField()
     private let codexHomeField = NSTextField()
+    private let codexModelField = NSTextField()
     private let pollIntervalField = NSTextField()
     private let maxParallelField = NSTextField()
     private let maxSnapshotField = NSTextField()
@@ -404,7 +581,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildWindow() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 430),
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 470),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -427,6 +604,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         root.addArrangedSubview(row(label: "Reports Path", field: reportsField))
         root.addArrangedSubview(row(label: "Cache Path", field: cacheField))
         root.addArrangedSubview(row(label: "Codex Home", field: codexHomeField))
+        root.addArrangedSubview(row(label: "Codex Model", field: codexModelField))
         root.addArrangedSubview(row(label: "Poll Seconds", field: pollIntervalField))
         root.addArrangedSubview(row(label: "Max Parallel", field: maxParallelField))
         root.addArrangedSubview(row(label: "Max Snapshot Bytes", field: maxSnapshotField))
@@ -437,6 +615,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         buttonRow.addArrangedSubview(button(title: "Save", action: #selector(saveSettings)))
         buttonRow.addArrangedSubview(button(title: "Validate", action: #selector(validateSettings)))
         buttonRow.addArrangedSubview(button(title: "Materialize HEAD", action: #selector(materializeHeadFromSettings)))
+        buttonRow.addArrangedSubview(button(title: "Review HEAD", action: #selector(reviewHeadFromSettings)))
         buttonRow.addArrangedSubview(button(title: "Open Cache", action: #selector(openCache)))
         root.addArrangedSubview(buttonRow)
 
@@ -502,6 +681,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         reportsField.stringValue = config.reportsPath
         cacheField.stringValue = config.reviewCachePath
         codexHomeField.stringValue = config.codexHome
+        codexModelField.stringValue = config.codexModel ?? ""
         pollIntervalField.stringValue = "\(config.pollIntervalSeconds)"
         maxParallelField.stringValue = "\(config.maxParallelReviews)"
         maxSnapshotField.stringValue = "\(config.snapshotByteLimit)"
@@ -522,7 +702,8 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
             pollIntervalSeconds: max(1, pollInterval),
             codexHome: codexHomeField.stringValue,
             reviewCachePath: cacheField.stringValue,
-            maxSnapshotBytes: max(1, maxSnapshot)
+            maxSnapshotBytes: max(1, maxSnapshot),
+            codexModel: codexModelField.stringValue.isEmpty ? nil : codexModelField.stringValue
         )
     }
 
@@ -561,8 +742,20 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         do {
             let config = try configFromFields()
             try saveConfig(config, to: configURL)
-            try materializeHead(config: config)
-            statusField.stringValue = "Materialized HEAD into \(cacheURL(config: config).path)"
+            let bundleURL = try materializeHead(config: config)
+            statusField.stringValue = "Materialized HEAD into \(bundleURL.path)"
+        } catch {
+            statusField.stringValue = "\(error)"
+        }
+    }
+
+    @objc private func reviewHeadFromSettings() {
+        do {
+            let config = try configFromFields()
+            try saveConfig(config, to: configURL)
+            let bundleURL = try materializeHead(config: config)
+            let reviewURL = try runCodex(config: config, bundleURL: bundleURL)
+            statusField.stringValue = "Review written to \(reviewURL.path)"
         } catch {
             statusField.stringValue = "\(error)"
         }
@@ -592,16 +785,25 @@ if CommandLine.arguments.count == 1 {
     runSettingsApp()
 } else {
     do {
-        let (command, configPath) = try parseCommand(CommandLine.arguments)
-        let config = try loadConfig(path: configPath)
+        let parsed = try parseCommand(CommandLine.arguments)
+        let config = try loadConfig(path: parsed.configPath)
 
-        switch command {
+        switch parsed.command {
         case .validate:
             try validate(config: config)
         case .watch:
             try watch(config: config)
         case .materializeHead:
-            try materializeHead(config: config)
+            _ = try materializeHead(config: config)
+        case .runCodex:
+            guard let bundle = parsed.bundle else {
+                throw AIReviewerError.missingArgument(usage())
+            }
+            let bundleURL = try resolveBundleURL(config: config, bundle: bundle)
+            _ = try runCodex(config: config, bundleURL: bundleURL)
+        case .reviewHead:
+            let bundleURL = try materializeHead(config: config)
+            _ = try runCodex(config: config, bundleURL: bundleURL)
         }
     } catch {
         fputs("\(error)\n", stderr)

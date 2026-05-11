@@ -4,6 +4,7 @@
   "maxParallelReviews": 1,
   "pollIntervalSeconds": 10,
   "codexHome": "~/.codex",
+  "codexModel": null,
   "reviewCachePath": "~/Library/Caches/com.ai-reviewer",
   "maxSnapshotBytes": 200000
 }

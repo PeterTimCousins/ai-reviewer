@@ -39,3 +39,9 @@ scripts/smoke.sh
 ```
 
 The public `config/example.json` intentionally uses placeholder paths.
+
+Run the first local-bundle review with:
+
+```bash
+build/AI\ Reviewer.app/Contents/MacOS/ai-reviewer-watcher review-head --config config/local.json
+```
