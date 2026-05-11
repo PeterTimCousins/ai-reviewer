@@ -1681,9 +1681,12 @@ func pendingReviewCommits(config: AppConfig) throws -> [String] {
     let head = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
     let output: String
     if let lastSeenHead = state.lastSeenHead,
-       !lastSeenHead.isEmpty,
-       (try? runGit(repoPath: repoPath, arguments: ["merge-base", "--is-ancestor", lastSeenHead, head])) != nil {
-        output = try runGit(repoPath: repoPath, arguments: ["rev-list", "--reverse", "--max-count=\(config.reviewSweepDepth)", "\(lastSeenHead)..\(head)"])
+       !lastSeenHead.isEmpty {
+        if (try? runGit(repoPath: repoPath, arguments: ["merge-base", "--is-ancestor", lastSeenHead, head])) != nil {
+            output = try runGit(repoPath: repoPath, arguments: ["rev-list", "--reverse", "--max-count=\(config.reviewSweepDepth)", "\(lastSeenHead)..\(head)"])
+        } else {
+            output = head
+        }
     } else {
         output = try runGit(repoPath: repoPath, arguments: ["rev-list", "--reverse", "--max-count=\(config.reviewSweepDepth)", "HEAD"])
     }
