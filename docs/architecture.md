@@ -34,17 +34,18 @@ bundle and runs with:
 6. Copy the report back to `<repoPath>/<reportsPath>/`.
 7. Record the SHA in local state and, optionally, the repo review ledger.
 
-## First Implementation Milestone
+## Current Implementation Milestone
 
 Build a foreground CLI that:
 
-- Loads `config/example.json` or a supplied config path.
+- Loads a supplied config path.
 - Validates repository and report paths.
 - Reads `HEAD` and `.git/logs/HEAD`.
 - Prints the detected repo status.
 - Runs a simple `--watch` polling loop that reports HEAD changes.
+- Materializes HEAD into a local cache bundle.
 
-After that works, add materialization, review execution, and a menu-bar/login
+After that works, add review execution, report copying, and a menu-bar/login
 item wrapper.
 
 ## Concrete Implementation Plan
@@ -60,7 +61,8 @@ item wrapper.
    reviewed SHAs, bypassed SHAs, and in-flight jobs.
 5. Materialize bundles under `~/Library/Caches/com.ai-reviewer/bundles/<sha>/`
    containing only commit metadata, capped diffs, and capped changed-file
-   snapshots.
+   snapshots. Do not include absolute watched-repo paths in bundles that Codex
+   will read.
 6. Run Codex from the bundle directory with `env -i`, scratch `HOME`, scratch
    `TMPDIR`, explicit `CODEX_HOME`, minimal `PATH`, read-only sandbox,
    ephemeral execution, ignored user config, and ignored repo rules.
@@ -68,3 +70,18 @@ item wrapper.
    final report back to the configured repo reports path.
 8. Add a menu-bar app and login item after the foreground watcher can run one
    review cycle end to end.
+
+## Public App Roadmap
+
+The public app should evolve toward a menu-bar utility with a settings window.
+The settings UI should be thin over the same app operations used by the CLI:
+
+- choose watched repository with `NSOpenPanel`
+- configure reports path, cache path, Codex home, poll interval, and parallelism
+- validate permissions and Git status
+- start and stop the watcher
+- open cache and log locations
+- show last seen commit, last materialized bundle, and recent errors
+
+Picking the repository through a native open panel is important because it gives
+macOS a clear user-intent signal for removable volume access.

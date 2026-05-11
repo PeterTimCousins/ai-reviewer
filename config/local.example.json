@@ -1,5 +1,5 @@
 {
-  "repoPath": "/path/to/your/git/repo",
+  "repoPath": "/Volumes/Example/your-repo",
   "reportsPath": "tmp_docs/reviews",
   "maxParallelReviews": 1,
   "pollIntervalSeconds": 10,

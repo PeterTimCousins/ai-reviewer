@@ -1,40 +1,68 @@
 # AI Reviewer
 
-AI Reviewer is a small macOS watcher for running background AI code reviews
-without granting the AI CLI broad disk permissions.
+AI Reviewer is a macOS utility for running background AI code reviews without
+granting the AI CLI broad disk permissions.
 
 The intended model is:
 
 1. A stable macOS app/helper watches a configured Git repository.
-2. The app is the only process granted access to the external repo/removable
-   volume.
+2. The app is the only process granted access to that repository, including
+   removable volumes.
 3. For each commit, the app materializes a local review bundle containing only
    commit metadata, diffs, and capped changed-file snapshots.
 4. Codex runs only against that local bundle with a stripped environment,
    read-only sandboxing, and non-interactive approvals.
 5. The app copies the final review report back to the configured reports path.
 
-This repo is intentionally separate from the dropship app so its permission
-model, install lifecycle, and review queue can be managed independently.
+## Status
 
-## Current Status
+This is early-stage software. The current app can:
 
-The first implementation target is a foreground Swift helper that can load
-config, validate the watched repository and reports path, and read Git HEAD
-state.
+- build a small macOS app bundle with bundle identifier `com.ai-reviewer`
+- validate a local JSON config
+- watch a repository HEAD in the foreground
+- materialize the current HEAD into a local cache bundle
 
-`scripts/build.sh` packages the Swift executable as a macOS app bundle with:
+Codex execution and report copying are intentionally not wired in yet.
 
-- Bundle path: `build/AI Reviewer.app`
-- Bundle identifier: `com.ai-reviewer`
-- Executable: `Contents/MacOS/ai-reviewer-watcher`
-
-By default the app is ad-hoc signed. For a permission identity that survives
-rebuilds, set a real signing identity before building:
+## Quick Start
 
 ```bash
-AI_REVIEWER_CODESIGN_IDENTITY="Developer ID Application: Example" scripts/build.sh
+scripts/build.sh
+cp config/local.example.json config/local.json
 ```
+
+Edit `config/local.json`, then run:
+
+```bash
+scripts/smoke.sh
+build/AI\ Reviewer.app/Contents/MacOS/ai-reviewer-watcher materialize-head --config config/local.json
+```
+
+`config/local.json` is ignored by Git. `config/example.json` is safe for public
+use and contains placeholder paths only.
+
+## Commands
+
+```bash
+ai-reviewer-watcher validate --config <path>
+ai-reviewer-watcher watch --config <path>
+ai-reviewer-watcher materialize-head --config <path>
+```
+
+`materialize-head` writes to:
+
+```text
+~/Library/Caches/com.ai-reviewer/bundles/<sha>/
+```
+
+The bundle contains:
+
+- `bundle.json`
+- `commit.txt`
+- `diff.patch`
+- `changed-files.json`
+- capped snapshots under `snapshots/`
 
 ## Planned Runtime Locations
 
@@ -43,27 +71,55 @@ AI_REVIEWER_CODESIGN_IDENTITY="Developer ID Application: Example" scripts/build.
 - Bundles/cache: `~/Library/Caches/com.ai-reviewer/`
 - Logs: `~/Library/Logs/com.ai-reviewer/`
 
-## Permission Policy
-
-Allow the AI Reviewer app to access only the repository/removable volume it
-needs to watch. Do not grant Full Disk Access to Codex. Deny unrelated prompts
-such as Media Library, Photos, Contacts, Calendar, Camera, or Microphone.
-
-## Build And Smoke Test
-
-```bash
-scripts/build.sh
-scripts/smoke.sh
-```
-
-Run the foreground watcher loop with:
-
-```bash
-build/AI\ Reviewer.app/Contents/MacOS/ai-reviewer-watcher --config config/example.json --watch
-```
-
-Install the app bundle to the planned stable path with:
+Install the built app bundle with:
 
 ```bash
 scripts/install.sh
 ```
+
+## Permission Policy
+
+AI Reviewer should be the only process that receives access to the watched
+repository. Codex should not be granted Full Disk Access and should not need
+direct access to removable volumes or protected folders.
+
+When Codex execution is added, subprocesses should run from local bundles with:
+
+- `env -i`
+- scratch `HOME`
+- scratch `TMPDIR`
+- explicit `CODEX_HOME`
+- minimal `PATH`
+- `codex --ask-for-approval never exec`
+- `--sandbox read-only`
+- `--ephemeral`
+- `--ignore-user-config`
+- `--ignore-rules`
+
+Deny unrelated macOS permission prompts such as Media Library, Photos, Contacts,
+Calendar, Camera, and Microphone.
+
+## Signing
+
+By default the app is ad-hoc signed. For a permission identity that is more
+stable across rebuilds, set a real signing identity before building:
+
+```bash
+AI_REVIEWER_CODESIGN_IDENTITY="Developer ID Application: Example" scripts/build.sh
+```
+
+## GUI Roadmap
+
+The intended product shape is a menu-bar app with a settings window. The first
+settings UI should configure:
+
+- watched repository
+- reports path inside that repository
+- cache path
+- Codex home path
+- poll interval
+- max parallel reviews
+- watcher enabled/disabled
+
+The repository picker should use a native macOS open panel so users explicitly
+grant the app access to the watched repo.

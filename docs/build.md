@@ -24,3 +24,12 @@ AI_REVIEWER_CODESIGN_IDENTITY="Developer ID Application: Example" scripts/build.
 ```
 
 `scripts/install.sh` copies the built bundle to `~/Applications/AI Reviewer.app`.
+
+For local testing, copy the ignored config template and edit the paths:
+
+```bash
+cp config/local.example.json config/local.json
+scripts/smoke.sh
+```
+
+The public `config/example.json` intentionally uses placeholder paths.
