@@ -23,6 +23,11 @@ bundle and runs with:
 - `--ignore-user-config`
 - `--ignore-rules`
 
+Review instructions are supplied by AI Reviewer profiles. The app reads a
+profile JSON file, materializes that profile into the local bundle, and passes
+the relevant profile instructions to each Codex subprocess. Codex does not read
+repo-local agent files or scripts from the watched repository.
+
 ## Review Flow
 
 1. Run the AI Reviewer watcher inside the app process, or use the foreground
@@ -31,10 +36,11 @@ bundle and runs with:
 3. Walk recent commits and skip already reviewed, bypassed, merge, empty, and
    oversized commits.
 4. Materialize a bundle under `~/Library/Caches/com.ai-reviewer/bundles/<sha>/`.
-5. Run Codex specialists against the bundle, not the live repo.
-6. Write the final report locally as `codex-review.md`.
-7. Copy the report back to `<repoPath>/<reportsPath>/`.
-8. Record the SHA in local state.
+5. Copy the active review profile into the bundle as `review-profile.json`.
+6. Run Codex specialists from the profile against the bundle, not the live repo.
+7. Write the final report locally as `codex-review.md`.
+8. Copy the report back to `<repoPath>/<reportsPath>/`.
+9. Record the SHA in local state.
 
 ## Current Implementation Milestone
 
@@ -48,8 +54,8 @@ Build a minimal app plus foreground CLI that:
 - Runs a foreground `--watch` polling loop for CLI development. Startup HEAD
   reconciliation is controlled by `reviewCurrentHeadOnStartup`.
 - Materializes HEAD into a local cache bundle.
-- Runs Codex against a local bundle using the stripped environment and read-only
-  sandbox.
+- Runs the configured review profile against a local bundle using the stripped
+  environment and read-only sandbox.
 - Copies successful reports back through AI Reviewer and records reviewed or
   failed SHAs in local state.
 
@@ -76,9 +82,11 @@ menu-bar/login item wrapper.
    ephemeral execution, ignored user config, and ignored repo rules.
 7. Write Codex output to the local cache first as `codex-review.md`, then have
    AI Reviewer copy the final report back to the configured repo reports path.
-8. Evolve the current settings window into a menu-bar app and login item after
+8. Define review behavior through JSON profiles with global instructions,
+   specialist agents, model overrides, ignore paths, and size gates.
+9. Evolve the current settings window into a menu-bar app and login item after
    the app-owned watcher can run one review cycle end to end.
-9. Keep watcher lifecycle logs under `~/Library/Logs/com.ai-reviewer/` so
+10. Keep watcher lifecycle logs under `~/Library/Logs/com.ai-reviewer/` so
    validation does not require Accessibility, AppleScript, or UI automation.
 
 ## Public App Roadmap
@@ -89,6 +97,7 @@ the CLI:
 
 - choose watched repository with `NSOpenPanel`
 - configure reports path, cache path, Codex home, poll interval, and parallelism
+- choose a review profile JSON file
 - validate permissions and Git status
 - materialize HEAD and run a local-bundle Codex review
 - run the one-shot review workflow with copy-back and state recording

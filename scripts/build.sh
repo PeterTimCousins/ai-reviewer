@@ -24,7 +24,9 @@ if [[ -e "$app_root" ]]; then
 fi
 
 mkdir -p "$app_root/Contents/MacOS"
+mkdir -p "$app_root/Contents/Resources"
 cp "$repo_root/.build/debug/ai-reviewer-watcher" "$app_root/Contents/MacOS/$binary_name"
+cp -R "$repo_root/profiles" "$app_root/Contents/Resources/profiles"
 
 cat > "$app_root/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

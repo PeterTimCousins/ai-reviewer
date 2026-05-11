@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import UniformTypeIdentifiers
 
 struct AppConfig: Codable, Sendable {
     var repoPath: String
@@ -10,6 +11,7 @@ struct AppConfig: Codable, Sendable {
     var reviewCachePath: String
     var maxSnapshotBytes: Int?
     var codexModel: String?
+    var reviewProfilePath: String?
     var statePath: String?
     var reviewCurrentHeadOnStartup: Bool?
 
@@ -32,6 +34,7 @@ func defaultConfig() -> AppConfig {
         reviewCachePath: "~/Library/Caches/com.ai-reviewer",
         maxSnapshotBytes: 200_000,
         codexModel: nil,
+        reviewProfilePath: nil,
         statePath: nil,
         reviewCurrentHeadOnStartup: false
     )
@@ -52,7 +55,34 @@ struct BundleManifest: Codable {
     let shortCommit: String
     let branch: String
     let createdAt: String
+    let reviewProfile: String
     let changedFiles: [ChangedFile]
+}
+
+struct ReviewProfile: Codable, Sendable {
+    var schemaVersion: Int
+    var name: String
+    var description: String?
+    var maxDiffBytes: Int?
+    var ignorePaths: [String]
+    var globalInstructions: String
+    var defaultModel: String?
+    var agents: [ReviewAgentProfile]
+}
+
+struct ReviewAgentProfile: Codable, Sendable {
+    var id: String
+    var title: String
+    var category: String
+    var model: String?
+    var instructions: String
+    var alwaysRun: Bool?
+    var runIfPathContains: [String]?
+    var runIfDiffContains: [String]?
+
+    var shouldAlwaysRun: Bool {
+        alwaysRun ?? true
+    }
 }
 
 struct ReviewRecord: Codable {
@@ -222,6 +252,79 @@ func stateURL(config: AppConfig) -> URL {
     return appSupportURL().appendingPathComponent("state.json")
 }
 
+func bundledProfileURL(name: String) -> URL? {
+    Bundle.main.resourceURL?
+        .appendingPathComponent("profiles")
+        .appendingPathComponent(name)
+}
+
+func defaultReviewProfile() -> ReviewProfile {
+    ReviewProfile(
+        schemaVersion: 1,
+        name: "Default Review",
+        description: "General post-commit review profile.",
+        maxDiffBytes: 200_000,
+        ignorePaths: [],
+        globalInstructions: """
+        You are Codex running a precise, read-only post-commit code review.
+        Review only changes introduced by the commit represented in the bundle.
+        Do not report pre-existing issues unless this diff clearly makes them worse.
+        Report only concrete correctness, security, data, workflow, or maintainability issues visible from the diff and included snapshots.
+        """,
+        defaultModel: nil,
+        agents: [
+            ReviewAgentProfile(
+                id: "correctness",
+                title: "Correctness",
+                category: "correctness",
+                model: nil,
+                instructions: "Check for concrete bugs: missing awaits, null/undefined access, wrong variable usage, inverted conditions, error handling gaps, data loss, and API contract breakage.",
+                alwaysRun: true,
+                runIfPathContains: nil,
+                runIfDiffContains: nil
+            ),
+            ReviewAgentProfile(
+                id: "security",
+                title: "Security",
+                category: "security",
+                model: nil,
+                instructions: "Check for security issues: injection, auth or authorization gaps, unsafe filesystem/shell/network use, secret exposure, tenant or user isolation failures, and unsafe logging.",
+                alwaysRun: true,
+                runIfPathContains: nil,
+                runIfDiffContains: nil
+            ),
+            ReviewAgentProfile(
+                id: "quality",
+                title: "Quality",
+                category: "quality",
+                model: nil,
+                instructions: "Check for maintainability risks that can cause real future defects: duplicated logic, unclear state transitions, overly broad abstractions, dead compatibility shims, and fragile UI state.",
+                alwaysRun: true,
+                runIfPathContains: nil,
+                runIfDiffContains: nil
+            )
+        ]
+    )
+}
+
+func loadReviewProfile(config: AppConfig) throws -> ReviewProfile {
+    let decoder = JSONDecoder()
+
+    if let profilePath = config.reviewProfilePath, !profilePath.isEmpty {
+        let url = URL(fileURLWithPath: expandedPath(profilePath))
+        let data = try Data(contentsOf: url)
+        return try decoder.decode(ReviewProfile.self, from: data)
+    }
+
+    if let url = bundledProfileURL(name: "default-review.json"),
+       FileManager.default.fileExists(atPath: url.path) {
+        let data = try Data(contentsOf: url)
+        return try decoder.decode(ReviewProfile.self, from: data)
+    }
+
+    return defaultReviewProfile()
+}
+
 func isoNow() -> String {
     ISO8601DateFormatter().string(from: Date())
 }
@@ -297,6 +400,7 @@ func validationSummary(config: AppConfig) throws -> String {
     let repoPath = repoURL(config: config).path
     let head = try runGit(repoPath: repoPath, arguments: ["rev-parse", "--short", "HEAD"])
     let branch = try runGit(repoPath: repoPath, arguments: ["branch", "--show-current"])
+    let profile = try loadReviewProfile(config: config)
 
     return """
     AI Reviewer
@@ -305,6 +409,7 @@ func validationSummary(config: AppConfig) throws -> String {
     cache: \(cacheURL(config: config).path)
     state: \(stateURL(config: config).path)
     codexHome: \(expandedPath(config.codexHome))
+    reviewProfile: \(profile.name)
     head: \(head)
     branch: \(branch.isEmpty ? "(detached)" : branch)
     maxParallelReviews: \(config.maxParallelReviews)
@@ -352,7 +457,11 @@ func watch(config: AppConfig) throws -> Never {
 }
 
 func parseChangedFiles(repoPath: String, commit: String) throws -> [(status: String, path: String, oldPath: String?)] {
-    let output = try runGit(repoPath: repoPath, arguments: ["diff-tree", "--no-commit-id", "--name-status", "-r", "-M", commit])
+    try parseChangedFiles(repoPath: repoPath, commit: commit, ignorePaths: [])
+}
+
+func parseChangedFiles(repoPath: String, commit: String, ignorePaths: [String]) throws -> [(status: String, path: String, oldPath: String?)] {
+    let output = try runGit(repoPath: repoPath, arguments: ["diff-tree", "--no-commit-id", "--name-status", "-r", "-M", commit] + gitPathspecArguments(ignorePaths: ignorePaths))
 
     return output
         .split(separator: "\n", omittingEmptySubsequences: true)
@@ -368,6 +477,21 @@ func parseChangedFiles(repoPath: String, commit: String) throws -> [(status: Str
 
             return (status: status, path: parts.dropFirst().joined(separator: "\t"), oldPath: nil)
         }
+}
+
+func gitPathspecArguments(ignorePaths: [String]) -> [String] {
+    guard !ignorePaths.isEmpty else {
+        return []
+    }
+
+    return ["--", "."] + ignorePaths.map { ":(exclude)\($0)" }
+}
+
+func reviewableDiffData(repoPath: String, commit: String, ignorePaths: [String]) throws -> Data {
+    try runGitData(
+        repoPath: repoPath,
+        arguments: ["show", "--format=", "--find-renames", "--patch", commit] + gitPathspecArguments(ignorePaths: ignorePaths)
+    )
 }
 
 func safeRelativePath(_ path: String) throws -> String {
@@ -419,6 +543,11 @@ func materializeSnapshot(repoPath: String, commit: String, path: String, snapsho
 }
 
 func materializeHead(config: AppConfig) throws -> URL {
+    let profile = try loadReviewProfile(config: config)
+    return try materializeHead(config: config, profile: profile)
+}
+
+func materializeHead(config: AppConfig, profile: ReviewProfile) throws -> URL {
     try validatePaths(config: config)
 
     let repoPath = repoURL(config: config).path
@@ -436,10 +565,17 @@ func materializeHead(config: AppConfig) throws -> URL {
     let commitText = try runGitData(repoPath: repoPath, arguments: ["show", "--no-patch", "--format=fuller", commit])
     try writeData(commitText, to: bundleURL.appendingPathComponent("commit.txt"))
 
-    let diff = try runGitData(repoPath: repoPath, arguments: ["show", "--format=", "--find-renames", "--patch", commit])
+    let diff = try reviewableDiffData(repoPath: repoPath, commit: commit, ignorePaths: profile.ignorePaths)
+    if let maxDiffBytes = profile.maxDiffBytes, maxDiffBytes > 0, diff.count > maxDiffBytes {
+        throw AIReviewerError.invalidConfig("reviewable diff is \(diff.count) bytes, above profile limit \(maxDiffBytes)")
+    }
     try writeData(diff, to: bundleURL.appendingPathComponent("diff.patch"))
 
-    let changedFiles = try parseChangedFiles(repoPath: repoPath, commit: commit).map { changed -> ChangedFile in
+    let profileEncoder = JSONEncoder()
+    profileEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    try writeData(try profileEncoder.encode(profile), to: bundleURL.appendingPathComponent("review-profile.json"))
+
+    let changedFiles = try parseChangedFiles(repoPath: repoPath, commit: commit, ignorePaths: profile.ignorePaths).map { changed -> ChangedFile in
         let snapshot: (relativePath: String, bytes: Int, capped: Bool)?
         if changed.status.hasPrefix("D") {
             snapshot = nil
@@ -476,6 +612,7 @@ func materializeHead(config: AppConfig) throws -> URL {
         shortCommit: shortCommit,
         branch: branch.isEmpty ? "(detached)" : branch,
         createdAt: ISO8601DateFormatter().string(from: Date()),
+        reviewProfile: profile.name,
         changedFiles: changedFiles
     )
     let manifestData = try encoder.encode(manifest)
@@ -567,10 +704,38 @@ func runCodex(config: AppConfig, bundleURL: URL) throws -> URL {
     let outputURL = bundleURL.appendingPathComponent("codex-review.md")
     let logURL = bundleURL.appendingPathComponent("codex.log")
     let prompt = runCodexPrompt(bundleURL: bundleURL)
+
+    try runCodexExecution(
+        config: config,
+        bundleURL: bundleURL,
+        prompt: prompt,
+        model: config.codexModel,
+        outputURL: outputURL,
+        logURL: logURL,
+        homeURL: homeURL,
+        tmpURL: tmpURL
+    )
+
+    print("codexReview: \(outputURL.path)")
+    print("codexLog: \(logURL.path)")
+    return outputURL
+}
+
+func runCodexExecution(
+    config: AppConfig,
+    bundleURL: URL,
+    prompt: String,
+    model: String?,
+    outputURL: URL,
+    logURL: URL,
+    homeURL: URL,
+    tmpURL: URL
+) throws {
     let reviewPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
     try FileManager.default.createDirectory(at: homeURL, withIntermediateDirectories: true)
     try FileManager.default.createDirectory(at: tmpURL, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
     FileManager.default.createFile(atPath: logURL.path, contents: nil)
     let logHandle = try FileHandle(forWritingTo: logURL)
     try logHandle.truncate(atOffset: 0)
@@ -603,7 +768,7 @@ func runCodex(config: AppConfig, bundleURL: URL) throws -> URL {
         "-c", "shell_environment_policy.inherit=none"
     ]
 
-    if let model = config.codexModel, !model.isEmpty {
+    if let model, !model.isEmpty {
         arguments += ["--model", model]
     }
 
@@ -630,10 +795,202 @@ func runCodex(config: AppConfig, bundleURL: URL) throws -> URL {
     guard FileManager.default.fileExists(atPath: outputURL.path) else {
         throw AIReviewerError.missingPath(outputURL.path)
     }
+}
 
+func profileAgentPrompt(bundleURL: URL, profile: ReviewProfile, agent: ReviewAgentProfile) throws -> String {
+    let manifestData = try Data(contentsOf: bundleURL.appendingPathComponent("bundle.json"))
+    let changedFilesData = try Data(contentsOf: bundleURL.appendingPathComponent("changed-files.json"))
+    let commitText = try String(contentsOf: bundleURL.appendingPathComponent("commit.txt"), encoding: .utf8)
+    let diffText = try String(contentsOf: bundleURL.appendingPathComponent("diff.patch"), encoding: .utf8)
+    let changedFilesText = String(data: changedFilesData, encoding: .utf8) ?? "[]"
+    let manifestText = String(data: manifestData, encoding: .utf8) ?? "{}"
+    let snapshotsText = snapshotPromptText(bundleURL: bundleURL)
+
+    return """
+    You are Codex running an isolated read-only specialist review against a local AI Reviewer bundle.
+
+    Security boundary:
+    - Your working directory is the local bundle directory.
+    - Review only files and prompt content in this bundle.
+    - Do not access paths outside the current working directory.
+    - Do not edit files, create files, run tests, install packages, or call network services.
+    - The live source repository is intentionally not available.
+
+    Output rules for this specialist:
+    - Output only finding lines or exactly NO_ISSUES.
+    - Finding format: [score|\(agent.category)] file:line - explanation
+    - Do not include headers, summaries, code examples, markdown fences, or prose.
+    - Report only concrete issues that are visible from the diff and included snapshots.
+    - Scores: 80 minor but real risk, 90 clear defect, 95 serious/security/data risk, 100 production incident.
+
+    Review profile:
+    \(profile.name)
+
+    Global instructions:
+    \(profile.globalInstructions)
+
+    Specialist:
+    \(agent.title)
+
+    Specialist instructions:
+    \(agent.instructions)
+
+    Bundle manifest:
+    \(manifestText)
+
+    Changed files:
+    \(changedFilesText)
+
+    Commit:
+    \(commitText)
+
+    Diff:
+    \(diffText)
+
+    Post-commit snapshots:
+    \(snapshotsText)
+    """
+}
+
+func snapshotPromptText(bundleURL: URL) -> String {
+    let snapshotsURL = bundleURL.appendingPathComponent("snapshots")
+    guard let enumerator = FileManager.default.enumerator(at: snapshotsURL, includingPropertiesForKeys: [.isRegularFileKey]) else {
+        return "(none)"
+    }
+
+    var sections: [String] = []
+    for case let url as URL in enumerator {
+        guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true,
+              let data = try? Data(contentsOf: url),
+              !data.contains(0),
+              let text = String(data: data, encoding: .utf8)
+        else {
+            continue
+        }
+
+        let relative = url.path.replacingOccurrences(of: snapshotsURL.path + "/", with: "")
+        sections.append("--- \(relative) ---\n\(text)")
+    }
+
+    return sections.isEmpty ? "(none)" : sections.joined(separator: "\n\n")
+}
+
+func runReviewProfile(config: AppConfig, bundleURL: URL, profile: ReviewProfile) throws -> URL {
+    let outputURL = bundleURL.appendingPathComponent("codex-review.md")
+    let runRoot = cacheURL(config: config).appendingPathComponent("codex-runs")
+    let runID = "\(bundleURL.lastPathComponent)-profile-\(Int(Date().timeIntervalSince1970))"
+    let runURL = runRoot.appendingPathComponent(runID)
+    let diffText = (try? String(contentsOf: bundleURL.appendingPathComponent("diff.patch"), encoding: .utf8)) ?? ""
+    let changedFiles = try loadBundleChangedFiles(bundleURL: bundleURL)
+    let agents = runnableAgents(profile: profile, changedFiles: changedFiles, diffText: diffText)
+
+    if changedFiles.isEmpty {
+        let manifest = try loadBundleManifest(bundleURL: bundleURL)
+        try writeData(Data(profileReviewText(manifest: manifest, profile: profile, agents: [], findings: []).utf8), to: outputURL)
+        return outputURL
+    }
+
+    var outputs: [(agent: ReviewAgentProfile, output: String)] = []
+    for agent in agents {
+        let agentURL = runURL.appendingPathComponent(agent.id)
+        let output = bundleURL.appendingPathComponent("agent-\(agent.id).md")
+        let log = bundleURL.appendingPathComponent("agent-\(agent.id).log")
+        let prompt = try profileAgentPrompt(bundleURL: bundleURL, profile: profile, agent: agent)
+        try runCodexExecution(
+            config: config,
+            bundleURL: bundleURL,
+            prompt: prompt,
+            model: agent.model ?? config.codexModel ?? profile.defaultModel,
+            outputURL: output,
+            logURL: log,
+            homeURL: agentURL.appendingPathComponent("home"),
+            tmpURL: agentURL.appendingPathComponent("tmp")
+        )
+        outputs.append((agent: agent, output: (try? String(contentsOf: output, encoding: .utf8)) ?? ""))
+    }
+
+    let findings = requiredFindings(from: outputs)
+    let manifest = try loadBundleManifest(bundleURL: bundleURL)
+    try writeData(Data(profileReviewText(manifest: manifest, profile: profile, agents: agents, findings: findings).utf8), to: outputURL)
     print("codexReview: \(outputURL.path)")
-    print("codexLog: \(logURL.path)")
     return outputURL
+}
+
+func loadBundleManifest(bundleURL: URL) throws -> BundleManifest {
+    let data = try Data(contentsOf: bundleURL.appendingPathComponent("bundle.json"))
+    return try JSONDecoder().decode(BundleManifest.self, from: data)
+}
+
+func loadBundleChangedFiles(bundleURL: URL) throws -> [ChangedFile] {
+    let data = try Data(contentsOf: bundleURL.appendingPathComponent("changed-files.json"))
+    return try JSONDecoder().decode([ChangedFile].self, from: data)
+}
+
+func runnableAgents(profile: ReviewProfile, changedFiles: [ChangedFile], diffText: String) -> [ReviewAgentProfile] {
+    profile.agents.filter { agent in
+        if agent.shouldAlwaysRun {
+            return true
+        }
+
+        let pathMatch = agent.runIfPathContains?.contains { token in
+            changedFiles.contains { $0.path.localizedCaseInsensitiveContains(token) }
+        } ?? false
+        let diffMatch = agent.runIfDiffContains?.contains { token in
+            diffText.localizedCaseInsensitiveContains(token)
+        } ?? false
+        return pathMatch || diffMatch
+    }
+}
+
+func requiredFindings(from outputs: [(agent: ReviewAgentProfile, output: String)]) -> [String] {
+    var order: [String] = []
+    var best: [String: (score: Int, line: String)] = [:]
+
+    for item in outputs {
+        for rawLine in item.output.split(separator: "\n", omittingEmptySubsequences: true) {
+            let line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard line.hasPrefix("["),
+                  let close = line.firstIndex(of: "]"),
+                  let pipe = line.firstIndex(of: "|"),
+                  pipe < close,
+                  let score = Int(line[line.index(after: line.startIndex)..<pipe])
+            else {
+                continue
+            }
+
+            let remainder = line[line.index(after: close)...].trimmingCharacters(in: .whitespaces)
+            let location = remainder.split(separator: " ", maxSplits: 1).first.map(String.init) ?? line
+            if best[location] == nil {
+                order.append(location)
+                best[location] = (score, line)
+            } else if let existing = best[location], score > existing.score {
+                best[location] = (score, line)
+            }
+        }
+    }
+
+    return order.compactMap { best[$0]?.line }
+}
+
+func profileReviewText(manifest: BundleManifest, profile: ReviewProfile, agents: [ReviewAgentProfile], findings: [String]) -> String {
+    let maxScore = findings.compactMap { line -> Int? in
+        guard let pipe = line.firstIndex(of: "|") else {
+            return nil
+        }
+        return Int(line[line.index(after: line.startIndex)..<pipe])
+    }.max() ?? 0
+    let verdict = maxScore >= 95 ? "FAIL" : (maxScore >= 80 ? "WARN" : "PASS")
+    let files = manifest.changedFiles.map(\.path).joined(separator: ", ")
+    let body = findings.isEmpty ? "" : "\n\n" + findings.joined(separator: "\n")
+    let agentList = agents.map(\.id).joined(separator: ", ")
+
+    return """
+    REVIEW sha:\(manifest.shortCommit) date:\(String(manifest.createdAt.prefix(10)))
+    PROFILE: \(profile.name)
+    AGENTS: \(agentList.isEmpty ? "(none)" : agentList)
+    FILES: \(files.isEmpty ? "(none)" : files)
+    VERDICT: \(verdict)\(body)
+    """
 }
 
 func copyReportBack(config: AppConfig, reviewURL: URL, shortCommit: String) throws -> URL {
@@ -669,12 +1026,13 @@ func reviewOnce(config: AppConfig) throws -> URL? {
     var reviewURL: URL?
 
     do {
-        let materializedBundleURL = try materializeHead(config: config)
+        let profile = try loadReviewProfile(config: config)
+        let materializedBundleURL = try materializeHead(config: config, profile: profile)
         bundleURL = materializedBundleURL
         state.lastBundlePath = materializedBundleURL.path
         try saveState(state, config: config)
 
-        let localReviewURL = try runCodex(config: config, bundleURL: materializedBundleURL)
+        let localReviewURL = try runReviewProfile(config: config, bundleURL: materializedBundleURL, profile: profile)
         reviewURL = localReviewURL
         state.lastReviewPath = localReviewURL.path
 
@@ -913,6 +1271,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
     private let cacheField = NSTextField()
     private let codexHomeField = NSTextField()
     private let codexModelField = NSTextField()
+    private let reviewProfileField = NSTextField()
     private let statePathField = NSTextField()
     private let pollIntervalField = NSTextField()
     private let maxParallelField = NSTextField()
@@ -1032,6 +1391,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         root.addArrangedSubview(row(label: "Cache Path", field: cacheField))
         root.addArrangedSubview(row(label: "Codex Home", field: codexHomeField))
         root.addArrangedSubview(row(label: "Codex Model", field: codexModelField))
+        root.addArrangedSubview(row(label: "Review Profile", field: reviewProfileField, buttonTitle: "Choose", action: #selector(chooseReviewProfile)))
         root.addArrangedSubview(row(label: "State Path", field: statePathField))
         root.addArrangedSubview(row(label: "Poll Seconds", field: pollIntervalField))
         root.addArrangedSubview(row(label: "Max Parallel", field: maxParallelField))
@@ -1149,6 +1509,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         cacheField.stringValue = config.reviewCachePath
         codexHomeField.stringValue = config.codexHome
         codexModelField.stringValue = config.codexModel ?? ""
+        reviewProfileField.stringValue = config.reviewProfilePath ?? ""
         statePathField.stringValue = config.statePath ?? ""
         pollIntervalField.stringValue = "\(config.pollIntervalSeconds)"
         maxParallelField.stringValue = "\(config.maxParallelReviews)"
@@ -1173,6 +1534,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
             reviewCachePath: cacheField.stringValue,
             maxSnapshotBytes: max(1, maxSnapshot),
             codexModel: codexModelField.stringValue.isEmpty ? nil : codexModelField.stringValue,
+            reviewProfilePath: reviewProfileField.stringValue.isEmpty ? nil : reviewProfileField.stringValue,
             statePath: statePathField.stringValue.isEmpty ? nil : statePathField.stringValue,
             reviewCurrentHeadOnStartup: reviewStartupCheckbox.state == .on
         )
@@ -1187,6 +1549,19 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
 
         if panel.runModal() == .OK, let url = panel.url {
             repoField.stringValue = url.path
+        }
+    }
+
+    @objc private func chooseReviewProfile() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.json]
+        panel.prompt = "Choose"
+
+        if panel.runModal() == .OK, let url = panel.url {
+            reviewProfileField.stringValue = url.path
         }
     }
 
@@ -1215,8 +1590,9 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func reviewHeadFromSettings() {
         runConfiguredOperation("Reviewing HEAD") { config in
-            let bundleURL = try materializeHead(config: config)
-            let reviewURL = try runCodex(config: config, bundleURL: bundleURL)
+            let profile = try loadReviewProfile(config: config)
+            let bundleURL = try materializeHead(config: config, profile: profile)
+            let reviewURL = try runReviewProfile(config: config, bundleURL: bundleURL, profile: profile)
             return "Review written to \(reviewURL.path)"
         }
     }
@@ -1361,8 +1737,9 @@ if CommandLine.arguments.count == 1 {
             let bundleURL = try resolveBundleURL(config: config, bundle: bundle)
             _ = try runCodex(config: config, bundleURL: bundleURL)
         case .reviewHead:
-            let bundleURL = try materializeHead(config: config)
-            _ = try runCodex(config: config, bundleURL: bundleURL)
+            let profile = try loadReviewProfile(config: config)
+            let bundleURL = try materializeHead(config: config, profile: profile)
+            _ = try runReviewProfile(config: config, bundleURL: bundleURL, profile: profile)
         case .reviewOnce:
             _ = try reviewOnce(config: config)
         }

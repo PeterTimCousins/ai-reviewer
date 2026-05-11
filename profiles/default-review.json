@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "name": "Default Review",
+  "description": "General-purpose post-commit review profile.",
+  "maxDiffBytes": 200000,
+  "ignorePaths": [],
+  "globalInstructions": "You are Codex running a precise, read-only post-commit code review. Review only changes introduced by the commit represented in the bundle. Do not report pre-existing issues unless this diff clearly makes them worse. Report only concrete correctness, security, data, workflow, or maintainability issues visible from the diff and included snapshots.",
+  "defaultModel": null,
+  "agents": [
+    {
+      "id": "correctness",
+      "title": "Correctness",
+      "category": "correctness",
+      "model": null,
+      "instructions": "Check for concrete bugs: missing awaits, null or undefined access, wrong variable usage, inverted conditions, error handling gaps, data loss, and API contract breakage.",
+      "alwaysRun": true
+    },
+    {
+      "id": "security",
+      "title": "Security",
+      "category": "security",
+      "model": null,
+      "instructions": "Check for security issues: injection, auth or authorization gaps, unsafe filesystem, shell, or network use, secret exposure, tenant or user isolation failures, and unsafe logging.",
+      "alwaysRun": true
+    },
+    {
+      "id": "quality",
+      "title": "Quality",
+      "category": "quality",
+      "model": null,
+      "instructions": "Check for maintainability risks that can cause real future defects: duplicated logic, unclear state transitions, overly broad abstractions, dead compatibility shims, and fragile UI state.",
+      "alwaysRun": true
+    }
+  ]
+}

@@ -11,7 +11,8 @@ The intended model is:
 3. For each commit, the app materializes a local review bundle containing only
    commit metadata, diffs, and capped changed-file snapshots.
 4. Codex runs only against that local bundle with a stripped environment,
-   read-only sandboxing, and non-interactive approvals.
+   read-only sandboxing, non-interactive approvals, and the configured review
+   profile instructions.
 5. The app copies the final review report back to the configured reports path.
 
 ## Status
@@ -25,6 +26,8 @@ This is early-stage software. The current app can:
 - watch a repository HEAD in the foreground from the CLI
 - materialize the current HEAD into a local cache bundle
 - run Codex against a local cache bundle with a stripped environment
+- run profile-driven specialist reviews from bundled or user-selected JSON
+  profiles
 - copy completed review reports back to the configured reports directory
 - track reviewed and failed SHAs in local state
 
@@ -46,6 +49,10 @@ build/AI\ Reviewer.app/Contents/MacOS/ai-reviewer-watcher review-once --config c
 
 `config/local.json` is ignored by Git. `config/example.json` is safe for public
 use and contains placeholder paths only.
+
+Review profiles live under `profiles/`. A blank `reviewProfilePath` uses the
+bundled default profile. To use a specific profile, set `reviewProfilePath` to
+an absolute path or choose a JSON profile in the settings window.
 
 Open the settings window with:
 
@@ -87,12 +94,12 @@ The bundle contains:
 - `codex-review.md`
 - `codex.log`
 
-`review-head` materializes the current HEAD, then runs Codex against that
-bundle.
+`review-head` materializes the current HEAD, then runs the configured review
+profile against that bundle.
 
-`review-once` materializes HEAD, runs Codex, copies `codex-review.md` back to
-the configured reports path, and records the SHA in local state. Already
-reviewed SHAs are skipped.
+`review-once` materializes HEAD, runs the configured review profile, copies
+`codex-review.md` back to the configured reports path, and records the SHA in
+local state. Already reviewed SHAs are skipped.
 
 `watch` runs in the foreground and calls `review-once` when HEAD changes. It
 only reconciles the current HEAD at startup when `reviewCurrentHeadOnStartup` is
@@ -162,6 +169,7 @@ The settings UI currently covers:
 - cache path
 - Codex home path
 - Codex model
+- Review profile path
 - state path
 - poll interval
 - max parallel reviews
@@ -170,3 +178,24 @@ The settings UI currently covers:
 
 The repository picker should use a native macOS open panel so users explicitly
 grant the app access to the watched repo.
+
+## Review Profiles
+
+A review profile is a JSON file that defines:
+
+- ignored paths, such as generated report folders
+- maximum reviewable diff bytes
+- global review instructions
+- specialist agents, categories, optional model overrides, and conditional
+  activation rules
+
+AI Reviewer copies the active profile into each local bundle as
+`review-profile.json`. Specialist Codex runs receive the profile instructions
+through prompts while their working directory remains the local bundle.
+
+Bundled profiles:
+
+- `profiles/default-review.json`: general-purpose three-specialist review
+- `profiles/dropship-review.json`: dropship-app profile with compliance, bug,
+  impact, quality, security, architecture, and conditional integrator/workflow
+  specialists

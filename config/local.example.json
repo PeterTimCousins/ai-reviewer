@@ -5,6 +5,7 @@
   "pollIntervalSeconds": 10,
   "codexHome": "~/.codex",
   "codexModel": null,
+  "reviewProfilePath": null,
   "reviewCachePath": "~/Library/Caches/com.ai-reviewer",
   "statePath": null,
   "reviewCurrentHeadOnStartup": false,
