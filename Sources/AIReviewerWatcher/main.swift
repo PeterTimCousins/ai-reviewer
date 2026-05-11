@@ -2234,6 +2234,10 @@ final class AppWatcher: @unchecked Sendable {
     }
 }
 
+final class FlippedDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 @MainActor
 final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
     private enum MainSection: Int {
@@ -2812,7 +2816,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             form.addArrangedSubview(advancedButtons)
         }
 
-        let container = NSView()
+        let container = FlippedDocumentView()
         container.translatesAutoresizingMaskIntoConstraints = false
         form.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(form)
