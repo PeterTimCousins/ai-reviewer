@@ -151,7 +151,8 @@ AI_REVIEWER_CODESIGN_IDENTITY="Developer ID Application: Example" scripts/build.
 The app currently includes a basic settings window for editing the app-support
 config, choosing a watched repository, validating settings, materializing HEAD,
 running a HEAD review, running the one-shot review workflow, starting and
-stopping the app-owned watcher, and opening the cache and log folders.
+stopping the app-owned watcher, opening the cache and log folders, and staying
+available from the macOS menu bar when the settings window is closed.
 
 The intended product shape is a menu-bar app that owns the watcher lifecycle.
 The settings UI currently covers:

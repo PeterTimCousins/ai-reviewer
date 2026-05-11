@@ -904,6 +904,7 @@ final class AppWatcher: @unchecked Sendable {
 final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
     private let configURL = defaultAppConfigURL()
     private var window: NSWindow?
+    private var statusItem: NSStatusItem?
     private let appWatcher = AppWatcher()
     private var watcherRunning = false
 
@@ -921,10 +922,14 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
     private let watcherField = NSTextField(labelWithString: "Watcher: stopped")
     private var startWatcherButton: NSButton?
     private var stopWatcherButton: NSButton?
+    private var watcherStatusMenuItem: NSMenuItem?
+    private var startWatcherMenuItem: NSMenuItem?
+    private var stopWatcherMenuItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         buildMenu()
+        buildStatusItem()
         buildWindow()
         loadConfigIntoFields()
         window?.center()
@@ -933,7 +938,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        !watcherRunning
+        false
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -957,6 +962,49 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = mainMenu
     }
 
+    private func buildStatusItem() {
+        let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.button?.title = "AI"
+        statusItem.button?.toolTip = "AI Reviewer"
+
+        let menu = NSMenu()
+        let status = NSMenuItem(title: "Watcher: stopped", action: nil, keyEquivalent: "")
+        watcherStatusMenuItem = status
+        menu.addItem(status)
+        menu.addItem(NSMenuItem.separator())
+
+        let settings = NSMenuItem(title: "Settings...", action: #selector(showSettingsWindow), keyEquivalent: "")
+        settings.target = self
+        menu.addItem(settings)
+
+        let start = NSMenuItem(title: "Start Watching", action: #selector(startWatching), keyEquivalent: "")
+        start.target = self
+        startWatcherMenuItem = start
+        menu.addItem(start)
+
+        let stop = NSMenuItem(title: "Stop Watching", action: #selector(stopWatching), keyEquivalent: "")
+        stop.target = self
+        stop.isEnabled = false
+        stopWatcherMenuItem = stop
+        menu.addItem(stop)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let openLogs = NSMenuItem(title: "Open Logs", action: #selector(openLogs), keyEquivalent: "")
+        openLogs.target = self
+        menu.addItem(openLogs)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let quit = NSMenuItem(title: "Quit AI Reviewer", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        quit.target = NSApp
+        menu.addItem(quit)
+
+        statusItem.menu = menu
+        self.statusItem = statusItem
+        updateWatcherControls(status: "Watcher: stopped")
+    }
+
     private func buildWindow() {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 800, height: 620),
@@ -966,6 +1014,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         )
         window.title = "AI Reviewer"
         window.minSize = NSSize(width: 680, height: 480)
+        window.isReleasedWhenClosed = false
 
         let root = NSStackView()
         root.orientation = .vertical
@@ -1187,8 +1236,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
             let config = try configFromFields()
             try saveConfig(config, to: configURL)
             watcherRunning = true
-            startWatcherButton?.isEnabled = false
-            stopWatcherButton?.isEnabled = true
+            updateWatcherControls(status: "Watcher: starting...")
             watcherField.stringValue = "Watcher: starting..."
             appWatcher.start(config: config) { [weak self] update in
                 DispatchQueue.main.async {
@@ -1196,14 +1244,15 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         } catch {
+            watcherRunning = false
+            updateWatcherControls(status: "Watcher: \(error)")
             watcherField.stringValue = "Watcher: \(error)"
         }
     }
 
     @objc private func stopWatching() {
         watcherRunning = false
-        startWatcherButton?.isEnabled = true
-        stopWatcherButton?.isEnabled = false
+        updateWatcherControls(status: "Watcher: stopping...")
         watcherField.stringValue = "Watcher: stopping..."
         appWatcher.stop { [weak self] update in
             DispatchQueue.main.async {
@@ -1214,8 +1263,6 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
 
     private func applyWatcherUpdate(_ update: WatcherUpdate) {
         watcherRunning = update.isRunning
-        startWatcherButton?.isEnabled = !update.isRunning
-        stopWatcherButton?.isEnabled = update.isRunning
 
         var lines = ["Watcher: \(update.status)"]
         if let lastHead = update.lastHead {
@@ -1228,6 +1275,16 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
             lines.append("Last error: \(lastError)")
         }
         watcherField.stringValue = lines.joined(separator: "\n")
+        updateWatcherControls(status: lines[0])
+    }
+
+    private func updateWatcherControls(status: String) {
+        startWatcherButton?.isEnabled = !watcherRunning
+        stopWatcherButton?.isEnabled = watcherRunning
+        startWatcherMenuItem?.isEnabled = !watcherRunning
+        stopWatcherMenuItem?.isEnabled = watcherRunning
+        watcherStatusMenuItem?.title = status
+        statusItem?.button?.toolTip = status
     }
 
     private func runConfiguredOperation(_ label: String, operation: @escaping @Sendable (AppConfig) throws -> String) {

@@ -93,6 +93,7 @@ the CLI:
 - materialize HEAD and run a local-bundle Codex review
 - run the one-shot review workflow with copy-back and state recording
 - start and stop the app-owned watcher
+- keep a menu bar status item available after the settings window is closed
 - open cache and log locations
 - show last seen commit, last materialized bundle, and recent errors
 
