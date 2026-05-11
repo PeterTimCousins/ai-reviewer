@@ -56,7 +56,9 @@ Build a minimal app plus foreground CLI that:
   reconciliation is controlled by `reviewCurrentHeadOnStartup`.
 - Materializes HEAD into a local cache bundle.
 - Runs the configured review profile against a local bundle using the stripped
-  environment and read-only sandbox.
+  environment and read-only sandbox. Profile agents run concurrently up to
+  `maxParallelReviews`, then findings are merged deterministically in profile
+  order.
 - Copies successful reports back through AI Reviewer and records reviewed or
   failed SHAs in local state.
 

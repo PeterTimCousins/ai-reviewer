@@ -178,7 +178,7 @@ The settings UI currently covers:
 - Review profile path
 - state path
 - poll interval
-- max parallel reviews
+- max parallel reviews/profile agents
 - review current HEAD on watcher startup
 - watcher enabled/disabled and recent review state
 

@@ -957,30 +957,110 @@ func runReviewProfile(config: AppConfig, bundleURL: URL, profile: ReviewProfile)
         return outputURL
     }
 
-    var outputs: [(agent: ReviewAgentProfile, output: String)] = []
-    for agent in agents {
-        let agentURL = runURL.appendingPathComponent(agent.id)
-        let output = bundleURL.appendingPathComponent("agent-\(agent.id).md")
-        let log = bundleURL.appendingPathComponent("agent-\(agent.id).log")
-        let prompt = try profileAgentPrompt(bundleURL: bundleURL, profile: profile, agent: agent)
-        try runCodexExecution(
-            config: config,
-            bundleURL: bundleURL,
-            prompt: prompt,
-            model: agent.model ?? config.codexModel ?? profile.defaultModel,
-            outputURL: output,
-            logURL: log,
-            homeURL: agentURL.appendingPathComponent("home"),
-            tmpURL: agentURL.appendingPathComponent("tmp")
-        )
-        outputs.append((agent: agent, output: (try? String(contentsOf: output, encoding: .utf8)) ?? ""))
-    }
+    let outputs = try runProfileAgents(
+        config: config,
+        bundleURL: bundleURL,
+        profile: profile,
+        agents: agents,
+        runURL: runURL
+    )
 
     let findings = requiredFindings(from: outputs)
     let manifest = try loadBundleManifest(bundleURL: bundleURL)
     try writeData(Data(profileReviewText(manifest: manifest, profile: profile, agents: agents, findings: findings).utf8), to: outputURL)
     print("codexReview: \(outputURL.path)")
     return outputURL
+}
+
+func runProfileAgents(
+    config: AppConfig,
+    bundleURL: URL,
+    profile: ReviewProfile,
+    agents: [ReviewAgentProfile],
+    runURL: URL
+) throws -> [(agent: ReviewAgentProfile, output: String)] {
+    let parallelism = max(1, min(config.maxParallelReviews, agents.count))
+    let queue = DispatchQueue(label: "com.ai-reviewer.profile-agents", attributes: .concurrent)
+    let group = DispatchGroup()
+    let semaphore = DispatchSemaphore(value: parallelism)
+    let results = ProfileAgentResults(count: agents.count)
+
+    print("profileAgents: \(agents.map(\.id).joined(separator: ","))")
+    print("profileAgentParallelism: \(parallelism)")
+
+    for (index, agent) in agents.enumerated() {
+        semaphore.wait()
+        group.enter()
+        queue.async {
+            defer {
+                semaphore.signal()
+                group.leave()
+            }
+
+            do {
+                let agentURL = runURL.appendingPathComponent(agent.id)
+                let output = bundleURL.appendingPathComponent("agent-\(agent.id).md")
+                let log = bundleURL.appendingPathComponent("agent-\(agent.id).log")
+                let prompt = try profileAgentPrompt(bundleURL: bundleURL, profile: profile, agent: agent)
+                try runCodexExecution(
+                    config: config,
+                    bundleURL: bundleURL,
+                    prompt: prompt,
+                    model: agent.model ?? config.codexModel ?? profile.defaultModel,
+                    outputURL: output,
+                    logURL: log,
+                    homeURL: agentURL.appendingPathComponent("home"),
+                    tmpURL: agentURL.appendingPathComponent("tmp")
+                )
+                let outputText = (try? String(contentsOf: output, encoding: .utf8)) ?? ""
+
+                results.set(index: index, agent: agent, output: outputText)
+            } catch {
+                results.fail(error)
+            }
+        }
+    }
+
+    group.wait()
+
+    return try results.ordered()
+}
+
+final class ProfileAgentResults: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [(agent: ReviewAgentProfile, output: String)?]
+    private var firstError: Error?
+
+    init(count: Int) {
+        values = Array(repeating: nil, count: count)
+    }
+
+    func set(index: Int, agent: ReviewAgentProfile, output: String) {
+        lock.lock()
+        values[index] = (agent: agent, output: output)
+        lock.unlock()
+    }
+
+    func fail(_ error: Error) {
+        lock.lock()
+        if firstError == nil {
+            firstError = error
+        }
+        lock.unlock()
+    }
+
+    func ordered() throws -> [(agent: ReviewAgentProfile, output: String)] {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+
+        if let firstError {
+            throw firstError
+        }
+
+        return values.compactMap { $0 }
+    }
 }
 
 func loadBundleManifest(bundleURL: URL) throws -> BundleManifest {
