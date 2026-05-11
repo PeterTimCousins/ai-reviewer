@@ -61,8 +61,9 @@ Build a minimal app plus foreground CLI that:
 - Opens to a review manager view that joins recent Git history with local
   reviewed, failed, skipped, running, and pending review state.
 - Loads selected review output and watcher logs in the app.
-- Supports an intentional manual rerun for a selected commit by clearing that
-  commit's ledger entries before invoking the normal review path.
+- Supports intentional manual reruns by clearing the selected commit's ledger
+  entries, placing the commit in an in-app queue, and draining that queue up to
+  `maxParallelCommitReviews`.
 - Runs a foreground `--watch` polling loop for CLI development. Startup HEAD
   reconciliation is controlled by `reviewCurrentHeadOnStartup`; failed-review
   retries are also checked while HEAD is stable.
@@ -76,8 +77,10 @@ Build a minimal app plus foreground CLI that:
   watcher memory.
 - Runs the configured review profile against a local bundle using the stripped
   environment and read-only sandbox. Profile agents run concurrently up to
-  `maxParallelReviews`, then findings are merged deterministically in profile
-  order. Codex child processes are bounded by `codexTimeoutSeconds`.
+  `maxParallelReviews` inside each commit review, then findings are merged
+  deterministically in profile order. Whole commit reviews can run concurrently
+  up to `maxParallelCommitReviews`. Codex child processes are bounded by
+  `codexTimeoutSeconds`.
 - Wraps Codex in a per-run `sandbox-exec` profile and a narrowed per-run
   `CODEX_HOME`, so prompt-controlled reads cannot traverse into the watched
   repository or the user's full Codex home.
@@ -125,8 +128,9 @@ The app is now a menu-bar-oriented review manager, with the UI remaining thin
 over the same operations used by the CLI:
 
 - choose watched repository with `NSOpenPanel`
-- configure reports path, cache path, Codex home, poll interval, parallelism,
-  Codex timeout, and prompt snapshot limits
+- configure reports path, cache path, Codex home, poll interval, commit-review
+  concurrency, per-review agent concurrency, Codex timeout, and prompt snapshot
+  limits
 - choose a review profile JSON file
 - validate permissions and Git status
 - materialize HEAD and run a local-bundle Codex review

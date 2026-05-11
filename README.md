@@ -29,7 +29,7 @@ This is early-stage software. The current app can:
 - show recent Git commit history with completed, failed, skipped, running, and
   pending review state
 - load completed review output and watcher logs in the app
-- manually rerun a review for a selected commit
+- manually queue a rerun for a selected commit
 - watch a repository HEAD in the foreground from the CLI
 - materialize the current HEAD into a local cache bundle
 - run Codex against a local cache bundle with a stripped environment
@@ -204,6 +204,9 @@ skipped, running, or pending. Selecting a completed review loads the review
 text in the app; selecting a failed or skipped review shows the recorded reason.
 The selected commit can be manually rerun, which intentionally clears that
 commit's reviewed/failed/skipped ledger entries before running the review again.
+Manual reruns enter an in-app queue. `maxParallelCommitReviews` controls how
+many whole commit reviews may run at once; the default is `1`. `maxParallelReviews`
+controls specialist-agent concurrency inside one commit review.
 
 The **Logs** view tails the watcher log from
 `~/Library/Logs/com.ai-reviewer/watcher.log`.
@@ -222,7 +225,8 @@ covers:
 - sweep depth
 - retry failed seconds
 - Codex timeout seconds
-- max parallel reviews/profile agents
+- max concurrent commit reviews
+- max agents per review
 - max prompt snapshot bytes
 - start watching when app opens
 - hide Dock icon

@@ -47,6 +47,29 @@ final class FileLock {
         close(descriptor)
         descriptor = -1
     }
+
+    func lock() throws {
+        if descriptor >= 0 {
+            return
+        }
+
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let fd = open(url.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        guard fd >= 0 else {
+            throw AIReviewerError.unableToWrite(url.path)
+        }
+
+        if flock(fd, LOCK_EX) == 0 {
+            descriptor = fd
+            let payload = "\(ProcessInfo.processInfo.processIdentifier)\n"
+            _ = ftruncate(fd, 0)
+            _ = write(fd, payload, payload.utf8.count)
+            return
+        }
+
+        close(fd)
+        throw AIReviewerError.unableToWrite(url.path)
+    }
 }
 
 final class PipeBuffer: @unchecked Sendable {
@@ -117,6 +140,7 @@ struct AppConfig: Codable, Sendable {
     var repoPath: String
     var reportsPath: String
     var maxParallelReviews: Int
+    var maxParallelCommitReviews: Int?
     var pollIntervalSeconds: Int
     var codexHome: String
     var reviewCachePath: String
@@ -163,6 +187,10 @@ struct AppConfig: Codable, Sendable {
     var codexRunTimeoutSeconds: Int {
         max(30, codexTimeoutSeconds ?? 1_800)
     }
+
+    var commitReviewConcurrency: Int {
+        max(1, maxParallelCommitReviews ?? 1)
+    }
 }
 
 func defaultConfig() -> AppConfig {
@@ -170,6 +198,7 @@ func defaultConfig() -> AppConfig {
         repoPath: "",
         reportsPath: "tmp_docs/reviews",
         maxParallelReviews: 1,
+        maxParallelCommitReviews: 1,
         pollIntervalSeconds: 10,
         codexHome: "~/.codex",
         reviewCachePath: "~/Library/Caches/com.ai-reviewer",
@@ -317,6 +346,7 @@ enum ReviewHistoryStatus: String {
     case completed = "Completed"
     case failed = "Failed"
     case skipped = "Skipped"
+    case queued = "Queued"
     case running = "Running"
     case pending = "Pending"
 }
@@ -437,6 +467,16 @@ func saveState(_ state: ReviewState, config: AppConfig) throws {
     try data.write(to: url, options: .atomic)
 }
 
+@discardableResult
+func mutateState(config: AppConfig, _ update: (inout ReviewState) throws -> Void) throws -> ReviewState {
+    let lock = FileLock(url: stateMutationLockURL())
+    try lock.lock()
+    var state = try loadState(config: config)
+    try update(&state)
+    try saveState(state, config: config)
+    return state
+}
+
 func defaultAppConfigURL() -> URL {
     FileManager.default
         .homeDirectoryForCurrentUser
@@ -457,8 +497,14 @@ func watcherLockURL() -> URL {
     appSupportURL().appendingPathComponent("watcher.lock")
 }
 
-func reviewOperationLockURL() -> URL {
-    appSupportURL().appendingPathComponent("review-operation.lock")
+func stateMutationLockURL() -> URL {
+    appSupportURL().appendingPathComponent("state.lock")
+}
+
+func reviewCommitLockURL(commit: String) -> URL {
+    appSupportURL()
+        .appendingPathComponent("review-locks", isDirectory: true)
+        .appendingPathComponent("\(commit).lock")
 }
 
 func appLogsURL() -> URL {
@@ -691,7 +737,8 @@ func validationSummary(config: AppConfig) throws -> String {
     reviewProfile: \(profile.name)
     head: \(head)
     branch: \(branch.isEmpty ? "(detached)" : branch)
-    maxParallelReviews: \(config.maxParallelReviews)
+    maxParallelAgentsPerReview: \(config.maxParallelReviews)
+    maxParallelCommitReviews: \(config.commitReviewConcurrency)
     pollIntervalSeconds: \(config.pollIntervalSeconds)
     startWatcherOnLaunch: \(config.shouldStartWatcherOnLaunch)
     hideDockIcon: \(config.shouldHideDockIcon)
@@ -1024,7 +1071,7 @@ func runCodexPrompt(bundleURL: URL) -> String {
 
 func runCodex(config: AppConfig, bundleURL: URL) throws -> URL {
     let runRoot = cacheURL(config: config).appendingPathComponent("codex-runs")
-    let runID = "\(bundleURL.lastPathComponent)-\(Int(Date().timeIntervalSince1970))"
+    let runID = "\(bundleURL.lastPathComponent)-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString)"
     let runURL = runRoot.appendingPathComponent(runID)
     let homeURL = runURL.appendingPathComponent("home")
     let tmpURL = runURL.appendingPathComponent("tmp")
@@ -1335,7 +1382,7 @@ func snapshotPromptText(bundleURL: URL, byteLimit: Int) -> String {
 func runReviewProfile(config: AppConfig, bundleURL: URL, profile: ReviewProfile) throws -> URL {
     let outputURL = bundleURL.appendingPathComponent("codex-review.md")
     let runRoot = cacheURL(config: config).appendingPathComponent("codex-runs")
-    let runID = "\(bundleURL.lastPathComponent)-profile-\(Int(Date().timeIntervalSince1970))"
+    let runID = "\(bundleURL.lastPathComponent)-profile-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString)"
     let runURL = runRoot.appendingPathComponent(runID)
     let diffText = (try? String(contentsOf: bundleURL.appendingPathComponent("diff.patch"), encoding: .utf8)) ?? ""
     let changedFiles = try loadBundleChangedFiles(bundleURL: bundleURL)
@@ -1569,34 +1616,41 @@ func reviewOnce(config: AppConfig) throws -> URL? {
 
 func reviewCommit(config: AppConfig, commit: String) throws -> URL? {
     try validatePaths(config: config)
-    let operationLock = FileLock(url: reviewOperationLockURL())
-    guard try operationLock.tryLock() else {
-        throw AIReviewerError.commandFailed("Another review is already running.")
-    }
 
     let repoPath = repoURL(config: config).path
     let resolvedCommit = try runGit(repoPath: repoPath, arguments: ["rev-parse", commit])
     let shortCommit = try runGit(repoPath: repoPath, arguments: ["rev-parse", "--short", resolvedCommit])
-    var state = try loadState(config: config)
-    state.lastSeenHead = resolvedCommit
+    let commitLock = FileLock(url: reviewCommitLockURL(commit: resolvedCommit))
+    guard try commitLock.tryLock() else {
+        throw AIReviewerError.commandFailed("Review for \(shortCommit) is already running.")
+    }
 
     if try shouldSkipCommit(repoPath: repoPath, commit: resolvedCommit) {
-        state.skipped = state.skipped ?? [:]
-        state.skipped?[resolvedCommit] = ReviewSkipRecord(
-            sha: resolvedCommit,
-            shortSha: shortCommit,
-            skippedAt: isoNow(),
-            reason: "commit message bypass marker"
-        )
-        try saveState(state, config: config)
+        try mutateState(config: config) { state in
+            state.lastSeenHead = resolvedCommit
+            state.skipped = state.skipped ?? [:]
+            state.skipped?[resolvedCommit] = ReviewSkipRecord(
+                sha: resolvedCommit,
+                shortSha: shortCommit,
+                skippedAt: isoNow(),
+                reason: "commit message bypass marker"
+            )
+        }
         print("skippedReview: \(shortCommit)")
         return nil
     }
 
-    if let reviewed = state.reviewed[resolvedCommit] {
-        state.lastBundlePath = reviewed.bundlePath
-        state.lastReviewPath = reviewed.localReviewPath
-        try saveState(state, config: config)
+    var alreadyReviewed: ReviewRecord?
+    try mutateState(config: config) { state in
+        state.lastSeenHead = resolvedCommit
+        if let reviewed = state.reviewed[resolvedCommit] {
+            alreadyReviewed = reviewed
+            state.lastBundlePath = reviewed.bundlePath
+            state.lastReviewPath = reviewed.localReviewPath
+        }
+    }
+
+    if let reviewed = alreadyReviewed {
         print("alreadyReviewed: \(shortCommit)")
         print("copiedReport: \(reviewed.copiedReportPath)")
         return nil
@@ -1609,49 +1663,54 @@ func reviewCommit(config: AppConfig, commit: String) throws -> URL? {
         let profile = try loadReviewProfile(config: config)
         let materializedBundleURL = try materializeCommit(config: config, profile: profile, commit: resolvedCommit)
         bundleURL = materializedBundleURL
-        state.lastBundlePath = materializedBundleURL.path
-        try saveState(state, config: config)
+        try mutateState(config: config) { state in
+            state.lastBundlePath = materializedBundleURL.path
+        }
 
         let localReviewURL = try runReviewProfile(config: config, bundleURL: materializedBundleURL, profile: profile)
         reviewURL = localReviewURL
-        state.lastReviewPath = localReviewURL.path
 
         let copiedReportURL = try copyReportBack(config: config, reviewURL: localReviewURL, shortCommit: shortCommit)
-        state.reviewed[resolvedCommit] = ReviewRecord(
-            sha: resolvedCommit,
-            shortSha: shortCommit,
-            reviewedAt: isoNow(),
-            bundlePath: materializedBundleURL.path,
-            localReviewPath: localReviewURL.path,
-            copiedReportPath: copiedReportURL.path
-        )
-        state.failed.removeValue(forKey: resolvedCommit)
-        try saveState(state, config: config)
+        try mutateState(config: config) { state in
+            state.lastReviewPath = localReviewURL.path
+            state.reviewed[resolvedCommit] = ReviewRecord(
+                sha: resolvedCommit,
+                shortSha: shortCommit,
+                reviewedAt: isoNow(),
+                bundlePath: materializedBundleURL.path,
+                localReviewPath: localReviewURL.path,
+                copiedReportPath: copiedReportURL.path
+            )
+            state.failed.removeValue(forKey: resolvedCommit)
+            state.skipped?.removeValue(forKey: resolvedCommit)
+        }
 
         print("reviewed: \(shortCommit)")
         return copiedReportURL
     } catch AIReviewerError.permanentReviewSkip(let reason) {
-        state.skipped = state.skipped ?? [:]
-        state.skipped?[resolvedCommit] = ReviewSkipRecord(
-            sha: resolvedCommit,
-            shortSha: shortCommit,
-            skippedAt: isoNow(),
-            reason: reason
-        )
-        state.failed.removeValue(forKey: resolvedCommit)
-        try? saveState(state, config: config)
+        _ = try? mutateState(config: config) { state in
+            state.skipped = state.skipped ?? [:]
+            state.skipped?[resolvedCommit] = ReviewSkipRecord(
+                sha: resolvedCommit,
+                shortSha: shortCommit,
+                skippedAt: isoNow(),
+                reason: reason
+            )
+            state.failed.removeValue(forKey: resolvedCommit)
+        }
         print("skippedReview: \(shortCommit) \(reason)")
         return nil
     } catch {
-        state.failed[resolvedCommit] = ReviewFailureRecord(
-            sha: resolvedCommit,
-            shortSha: shortCommit,
-            failedAt: isoNow(),
-            error: "\(error)",
-            bundlePath: bundleURL?.path,
-            localReviewPath: reviewURL?.path
-        )
-        try? saveState(state, config: config)
+        _ = try? mutateState(config: config) { state in
+            state.failed[resolvedCommit] = ReviewFailureRecord(
+                sha: resolvedCommit,
+                shortSha: shortCommit,
+                failedAt: isoNow(),
+                error: "\(error)",
+                bundlePath: bundleURL?.path,
+                localReviewPath: reviewURL?.path
+            )
+        }
         throw error
     }
 }
@@ -1697,16 +1756,16 @@ func hasRetryableFailedReviews(config: AppConfig) throws -> Bool {
 }
 
 func recordSeenHead(config: AppConfig, head: String) throws {
-    var state = try loadState(config: config)
-    state.lastSeenHead = head
-    try saveState(state, config: config)
+    try mutateState(config: config) { state in
+        state.lastSeenHead = head
+    }
 }
 
 func pendingReviewCommits(config: AppConfig) throws -> [String] {
     try validatePaths(config: config)
 
     let repoPath = repoURL(config: config).path
-    var state = try loadState(config: config)
+    let state = try loadState(config: config)
     let head = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
     let output: String
     if let lastSeenHead = state.lastSeenHead,
@@ -1729,6 +1788,7 @@ func pendingReviewCommits(config: AppConfig) throws -> [String] {
     let candidates = recentHistory.filter { rangeCandidates.contains($0) || state.failed[$0] != nil }
 
     var pending: [String] = []
+    var newSkips: [String: ReviewSkipRecord] = [:]
 
     for commit in candidates {
         if reviewed.contains(commit) || skipped.contains(commit) {
@@ -1744,8 +1804,7 @@ func pendingReviewCommits(config: AppConfig) throws -> [String] {
             .split(separator: " ")
             .count
         if parentCount > 1 {
-            state.skipped = state.skipped ?? [:]
-            state.skipped?[commit] = ReviewSkipRecord(
+            newSkips[commit] = ReviewSkipRecord(
                 sha: commit,
                 shortSha: try runGit(repoPath: repoPath, arguments: ["rev-parse", "--short", commit]),
                 skippedAt: isoNow(),
@@ -1755,8 +1814,7 @@ func pendingReviewCommits(config: AppConfig) throws -> [String] {
         }
 
         if try shouldSkipCommit(repoPath: repoPath, commit: commit) {
-            state.skipped = state.skipped ?? [:]
-            state.skipped?[commit] = ReviewSkipRecord(
+            newSkips[commit] = ReviewSkipRecord(
                 sha: commit,
                 shortSha: try runGit(repoPath: repoPath, arguments: ["rev-parse", "--short", commit]),
                 skippedAt: isoNow(),
@@ -1768,8 +1826,13 @@ func pendingReviewCommits(config: AppConfig) throws -> [String] {
         pending.append(commit)
     }
 
-    if state.skipped != nil {
-        try saveState(state, config: config)
+    if !newSkips.isEmpty {
+        try mutateState(config: config) { state in
+            state.skipped = state.skipped ?? [:]
+            for (commit, record) in newSkips {
+                state.skipped?[commit] = record
+            }
+        }
     }
 
     return pending
@@ -1815,7 +1878,7 @@ func preferredReviewPath(_ record: ReviewRecord) -> String? {
     return record.copiedReportPath
 }
 
-func loadReviewHistory(config: AppConfig, runningCommits: Set<String> = []) throws -> [ReviewHistoryItem] {
+func loadReviewHistory(config: AppConfig, runningCommits: Set<String> = [], queuedCommits: Set<String> = []) throws -> [ReviewHistoryItem] {
     try validatePaths(config: config)
 
     let repoPath = repoURL(config: config).path
@@ -1851,6 +1914,21 @@ func loadReviewHistory(config: AppConfig, runningCommits: Set<String> = []) thro
                     subject: subject,
                     status: .running,
                     detail: "Review is currently running.",
+                    reviewPath: nil,
+                    localReviewPath: nil,
+                    bundlePath: nil,
+                    logPath: nil
+                )
+            }
+
+            if queuedCommits.contains(sha) {
+                return ReviewHistoryItem(
+                    sha: sha,
+                    shortSha: shortSha,
+                    date: date,
+                    subject: subject,
+                    status: .queued,
+                    detail: "Review is queued.",
                     reviewPath: nil,
                     localReviewPath: nil,
                     bundlePath: nil,
@@ -1922,11 +2000,11 @@ func loadReviewHistory(config: AppConfig, runningCommits: Set<String> = []) thro
 func rerunReviewCommit(config: AppConfig, commit: String) throws -> URL? {
     let repoPath = repoURL(config: config).path
     let resolvedCommit = try runGit(repoPath: repoPath, arguments: ["rev-parse", commit])
-    var state = try loadState(config: config)
-    state.reviewed.removeValue(forKey: resolvedCommit)
-    state.failed.removeValue(forKey: resolvedCommit)
-    state.skipped?.removeValue(forKey: resolvedCommit)
-    try saveState(state, config: config)
+    try mutateState(config: config) { state in
+        state.reviewed.removeValue(forKey: resolvedCommit)
+        state.failed.removeValue(forKey: resolvedCommit)
+        state.skipped?.removeValue(forKey: resolvedCommit)
+    }
     return try reviewCommit(config: config, commit: resolvedCommit)
 }
 
@@ -2174,6 +2252,8 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var reviewItems: [ReviewHistoryItem] = []
     private var selectedReviewIndex: Int?
     private var runningCommits = Set<String>()
+    private var queuedManualCommits: [String] = []
+    private var activeManualCommits = Set<String>()
 
     private let repoField = NSTextField()
     private let reportsField = NSTextField()
@@ -2186,6 +2266,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private let sweepDepthField = NSTextField()
     private let retryFailedAfterField = NSTextField()
     private let codexTimeoutField = NSTextField()
+    private let maxParallelCommitReviewsField = NSTextField()
     private let maxParallelField = NSTextField()
     private let maxSnapshotField = NSTextField()
     private let maxPromptSnapshotField = NSTextField()
@@ -2584,7 +2665,8 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         form.addArrangedSubview(row(label: "Sweep Depth", field: sweepDepthField))
         form.addArrangedSubview(row(label: "Retry Failed Secs", field: retryFailedAfterField))
         form.addArrangedSubview(row(label: "Codex Timeout Secs", field: codexTimeoutField))
-        form.addArrangedSubview(row(label: "Max Parallel", field: maxParallelField))
+        form.addArrangedSubview(row(label: "Max Concurrent Reviews", field: maxParallelCommitReviewsField))
+        form.addArrangedSubview(row(label: "Max Agents / Review", field: maxParallelField))
         form.addArrangedSubview(row(label: "Max Snapshot Bytes", field: maxSnapshotField))
         form.addArrangedSubview(row(label: "Max Prompt Snapshot", field: maxPromptSnapshotField))
         form.addArrangedSubview(checkboxRow(startWatcherOnLaunchCheckbox))
@@ -2699,6 +2781,8 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 name = "xmark.octagon.fill"
             case .skipped:
                 name = "forward.circle.fill"
+            case .queued:
+                name = "list.bullet.circle.fill"
             case .running:
                 name = "arrow.triangle.2.circlepath.circle.fill"
             case .pending:
@@ -2724,6 +2808,8 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             return .systemRed
         case .skipped:
             return .systemOrange
+        case .queued:
+            return .systemPurple
         case .running:
             return .systemBlue
         case .pending:
@@ -2744,7 +2830,11 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private func refreshReviewHistory() {
         do {
             let config = try configFromFields()
-            reviewItems = try loadReviewHistory(config: config, runningCommits: runningCommits)
+            reviewItems = try loadReviewHistory(
+                config: config,
+                runningCommits: runningCommits,
+                queuedCommits: Set(queuedManualCommits)
+            )
             reviewTableView.reloadData()
             if reviewItems.indices.contains(selectedReviewIndex ?? -1) {
                 reviewTableView.selectRowIndexes(IndexSet(integer: selectedReviewIndex ?? 0), byExtendingSelection: false)
@@ -2769,9 +2859,10 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let completed = reviewItems.filter { $0.status == .completed }.count
         let failed = reviewItems.filter { $0.status == .failed }.count
         let skipped = reviewItems.filter { $0.status == .skipped }.count
+        let queued = reviewItems.filter { $0.status == .queued || $0.status == .running }.count
         let pending = reviewItems.filter { $0.status == .pending }.count
         let repoName = URL(fileURLWithPath: expandedPath(config.repoPath)).lastPathComponent
-        summaryField.stringValue = "\(repoName) - \(completed) completed, \(failed) failed, \(skipped) skipped, \(pending) pending in last \(config.reviewSweepDepth) commits"
+        summaryField.stringValue = "\(repoName) - \(completed) completed, \(failed) failed, \(skipped) skipped, \(queued) active, \(pending) pending in last \(config.reviewSweepDepth) commits"
     }
 
     private func updateSelectedReviewDetail() {
@@ -2783,7 +2874,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             return
         }
 
-        rerunReviewButton?.isEnabled = item.status != .running
+        rerunReviewButton?.isEnabled = item.status != .running && item.status != .queued
         openReviewButton?.isEnabled = item.reviewPath != nil
         openBundleButton?.isEnabled = item.bundlePath != nil
 
@@ -2813,29 +2904,57 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
         do {
             let config = try configFromFields()
-            runningCommits.insert(item.sha)
-            refreshReviewHistory()
-            statusField.stringValue = "Rerunning \(item.shortSha)..."
-            DispatchQueue.global(qos: .userInitiated).async {
-                let result: String
-                do {
-                    if let reportURL = try rerunReviewCommit(config: config, commit: item.sha) {
-                        result = "Review copied to \(reportURL.path)"
-                    } else {
-                        result = "Review did not produce a report for \(item.shortSha)"
-                    }
-                } catch {
-                    result = "\(error)"
-                }
-
-                DispatchQueue.main.async { [weak self] in
-                    self?.runningCommits.remove(item.sha)
-                    self?.statusField.stringValue = result
-                    self?.refreshReviewHistory()
-                }
+            if runningCommits.contains(item.sha) || queuedManualCommits.contains(item.sha) {
+                statusField.stringValue = "\(item.shortSha) is already queued or running."
+                return
             }
+
+            queuedManualCommits.append(item.sha)
+            refreshReviewHistory()
+            statusField.stringValue = "Queued \(item.shortSha)"
+            drainManualReviewQueue(config: config)
         } catch {
             statusField.stringValue = "\(error)"
+        }
+    }
+
+    private func drainManualReviewQueue(config: AppConfig) {
+        let limit = config.commitReviewConcurrency
+        while activeManualCommits.count < limit, !queuedManualCommits.isEmpty {
+            let commit = queuedManualCommits.removeFirst()
+            activeManualCommits.insert(commit)
+            runningCommits.insert(commit)
+            refreshReviewHistory()
+            runManualReview(config: config, commit: commit)
+        }
+    }
+
+    private func runManualReview(config: AppConfig, commit: String) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result: String
+            let short = String(commit.prefix(8))
+            do {
+                if let reportURL = try rerunReviewCommit(config: config, commit: commit) {
+                    result = "Review copied to \(reportURL.path)"
+                } else {
+                    result = "Review did not produce a report for \(short)"
+                }
+            } catch {
+                result = "\(error)"
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else {
+                    return
+                }
+                self.activeManualCommits.remove(commit)
+                self.runningCommits.remove(commit)
+                self.statusField.stringValue = result
+                self.refreshReviewHistory()
+                if let nextConfig = try? self.configFromFields() {
+                    self.drainManualReviewQueue(config: nextConfig)
+                }
+            }
         }
     }
 
@@ -2998,6 +3117,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         sweepDepthField.stringValue = "\(config.reviewSweepDepth)"
         retryFailedAfterField.stringValue = "\(config.failedReviewRetrySeconds)"
         codexTimeoutField.stringValue = "\(config.codexRunTimeoutSeconds)"
+        maxParallelCommitReviewsField.stringValue = "\(config.commitReviewConcurrency)"
         maxParallelField.stringValue = "\(config.maxParallelReviews)"
         maxSnapshotField.stringValue = "\(config.snapshotByteLimit)"
         maxPromptSnapshotField.stringValue = "\(config.promptSnapshotByteLimit)"
@@ -3018,6 +3138,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
               let sweepDepth = Int(sweepDepthField.stringValue),
               let retryFailedAfter = Int(retryFailedAfterField.stringValue),
               let codexTimeout = Int(codexTimeoutField.stringValue),
+              let maxConcurrentReviews = Int(maxParallelCommitReviewsField.stringValue),
               let maxParallel = Int(maxParallelField.stringValue),
               let maxSnapshot = Int(maxSnapshotField.stringValue),
               let maxPromptSnapshot = Int(maxPromptSnapshotField.stringValue)
@@ -3029,6 +3150,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             repoPath: repoField.stringValue,
             reportsPath: reportsField.stringValue,
             maxParallelReviews: max(1, maxParallel),
+            maxParallelCommitReviews: max(1, maxConcurrentReviews),
             pollIntervalSeconds: max(1, pollInterval),
             codexHome: codexHomeField.stringValue,
             reviewCachePath: cacheField.stringValue,
@@ -3183,7 +3305,9 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         } else if update.status.localizedCaseInsensitiveContains("completed") ||
                     update.status.localizedCaseInsensitiveContains("failed") ||
                     update.status.localizedCaseInsensitiveContains("No pending") {
-            runningCommits.removeAll()
+            if let lastHead = update.lastHead, !activeManualCommits.contains(lastHead) {
+                runningCommits.remove(lastHead)
+            }
         }
 
         var lines = ["Watcher: \(update.status)"]

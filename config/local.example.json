@@ -2,6 +2,7 @@
   "repoPath": "/Volumes/Example/your-repo",
   "reportsPath": "tmp_docs/reviews",
   "maxParallelReviews": 1,
+  "maxParallelCommitReviews": 1,
   "pollIntervalSeconds": 10,
   "codexHome": "~/.codex",
   "codexModel": null,
