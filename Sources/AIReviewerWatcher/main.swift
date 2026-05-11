@@ -2242,6 +2242,13 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         case settings = 2
     }
 
+    private enum MenuBadgeState {
+        case completed
+        case running
+        case queued
+        case issue
+    }
+
     private let configURL = defaultAppConfigURL()
     private var window: NSWindow?
     private var statusItem: NSStatusItem?
@@ -2254,6 +2261,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var runningCommits = Set<String>()
     private var queuedManualCommits: [String] = []
     private var activeManualCommits = Set<String>()
+    private var hasStatusIssue = false
 
     private let repoField = NSTextField()
     private let reportsField = NSTextField()
@@ -2361,8 +2369,8 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
     private func buildStatusItem() {
         let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "AI"
         statusItem.button?.toolTip = "AI Reviewer"
+        statusItem.button?.imagePosition = .imageOnly
 
         let menu = NSMenu()
         let status = NSMenuItem(title: "Watcher: stopped", action: nil, keyEquivalent: "")
@@ -2399,7 +2407,99 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
         statusItem.menu = menu
         self.statusItem = statusItem
+        updateStatusItemIcon()
         updateWatcherControls(status: "Watcher: stopped")
+    }
+
+    private func currentMenuBadgeState() -> MenuBadgeState {
+        if hasStatusIssue {
+            return .issue
+        }
+        if !queuedManualCommits.isEmpty {
+            return .queued
+        }
+        if !runningCommits.isEmpty || !activeManualCommits.isEmpty {
+            return .running
+        }
+        return .completed
+    }
+
+    private func updateStatusItemIcon() {
+        statusItem?.button?.image = statusItemImage(state: currentMenuBadgeState())
+    }
+
+    private func statusItemImage(state: MenuBadgeState) -> NSImage {
+        let image = NSImage(size: NSSize(width: 24, height: 22))
+        image.lockFocus()
+
+        let baseRect = NSRect(x: 0, y: 1, width: 20, height: 20)
+        if let appIcon = menuBarBaseIcon() {
+            appIcon.draw(in: baseRect)
+        } else {
+            NSColor.labelColor.setFill()
+            NSBezierPath(roundedRect: baseRect, xRadius: 4, yRadius: 4).fill()
+        }
+
+        let badgeRect = NSRect(x: 13, y: 1, width: 10, height: 10)
+        badgeColor(for: state).setFill()
+        NSBezierPath(ovalIn: badgeRect).fill()
+
+        let glyph = badgeGlyph(for: state)
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 7, weight: .bold),
+            .foregroundColor: NSColor.white
+        ]
+        let glyphSize = glyph.size(withAttributes: attributes)
+        glyph.draw(
+            at: NSPoint(
+                x: badgeRect.midX - glyphSize.width / 2,
+                y: badgeRect.midY - glyphSize.height / 2
+            ),
+            withAttributes: attributes
+        )
+
+        image.unlockFocus()
+        image.isTemplate = false
+        return image
+    }
+
+    private func menuBarBaseIcon() -> NSImage? {
+        if let image = NSImage(named: "AppIcon") {
+            return image
+        }
+        if let url = Bundle.main.resourceURL?.appendingPathComponent("AppIcon.icns"),
+           let image = NSImage(contentsOf: url) {
+            return image
+        }
+        let localURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("Assets/AppIcon.png")
+        return NSImage(contentsOf: localURL)
+    }
+
+    private func badgeColor(for state: MenuBadgeState) -> NSColor {
+        switch state {
+        case .completed:
+            return .systemGreen
+        case .running:
+            return .systemBlue
+        case .queued:
+            return .systemPurple
+        case .issue:
+            return .systemRed
+        }
+    }
+
+    private func badgeGlyph(for state: MenuBadgeState) -> NSString {
+        switch state {
+        case .completed:
+            return "✓"
+        case .running:
+            return "•"
+        case .queued:
+            return "≡"
+        case .issue:
+            return "!"
+        }
     }
 
     private func buildWindow() {
@@ -2925,6 +3025,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             }
 
             queuedManualCommits.append(item.sha)
+            updateStatusItemIcon()
             refreshReviewHistory()
             statusField.stringValue = "Queued \(item.shortSha)"
             drainManualReviewQueue(config: config)
@@ -2939,6 +3040,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             let commit = queuedManualCommits.removeFirst()
             activeManualCommits.insert(commit)
             runningCommits.insert(commit)
+            updateStatusItemIcon()
             refreshReviewHistory()
             runManualReview(config: config, commit: commit)
         }
@@ -2947,6 +3049,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private func runManualReview(config: AppConfig, commit: String) {
         DispatchQueue.global(qos: .userInitiated).async {
             let result: String
+            let succeeded: Bool
             let short = String(commit.prefix(8))
             do {
                 if let reportURL = try rerunReviewCommit(config: config, commit: commit) {
@@ -2954,8 +3057,10 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 } else {
                     result = "Review did not produce a report for \(short)"
                 }
+                succeeded = true
             } catch {
                 result = "\(error)"
+                succeeded = false
             }
 
             DispatchQueue.main.async { [weak self] in
@@ -2964,11 +3069,13 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 }
                 self.activeManualCommits.remove(commit)
                 self.runningCommits.remove(commit)
+                self.hasStatusIssue = !succeeded
                 self.statusField.stringValue = result
                 self.refreshReviewHistory()
                 if let nextConfig = try? self.configFromFields() {
                     self.drainManualReviewQueue(config: nextConfig)
                 }
+                self.updateStatusItemIcon()
             }
         }
     }
@@ -3318,6 +3425,15 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
     private func applyWatcherUpdate(_ update: WatcherUpdate) {
         watcherRunning = update.isRunning
+        if update.lastError != nil || update.status.localizedCaseInsensitiveContains("failed") {
+            hasStatusIssue = true
+        } else if update.status.localizedCaseInsensitiveContains("completed") ||
+                    update.status.localizedCaseInsensitiveContains("Watching") ||
+                    update.status.localizedCaseInsensitiveContains("No pending") ||
+                    update.status.localizedCaseInsensitiveContains("Starting") {
+            hasStatusIssue = false
+        }
+
         if let lastHead = update.lastHead,
            update.status.localizedCaseInsensitiveContains("review") || update.status.localizedCaseInsensitiveContains("retry") {
             runningCommits.insert(lastHead)
@@ -3346,6 +3462,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         } else if activeSection == .logs {
             refreshLogs(scrollToBottom: false, preservePosition: true)
         }
+        updateStatusItemIcon()
         if !update.isRunning {
             watcherLock.unlock()
         }
@@ -3358,6 +3475,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         stopWatcherMenuItem?.isEnabled = watcherRunning
         watcherStatusMenuItem?.title = status
         statusItem?.button?.toolTip = status
+        updateStatusItemIcon()
     }
 
     private func runConfiguredOperation(_ label: String, operation: @escaping @Sendable (AppConfig) throws -> String) {
