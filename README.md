@@ -106,9 +106,11 @@ profile against that bundle.
 `codex-review.md` back to the configured reports path, and records the SHA in
 local state. Already reviewed SHAs are skipped.
 
-`watch` runs in the foreground and calls `review-once` when HEAD changes. It
-only reconciles the current HEAD at startup when `reviewCurrentHeadOnStartup` is
-enabled in config.
+`watch` runs in the foreground and reviews pending commits when HEAD changes.
+Pending commits are discovered by walking up to `sweepDepth` recent commits,
+skipping already reviewed SHAs, merge commits, and commit messages containing
+`[skip-review]` or `[no-review]`. Startup reconciliation only runs when
+`reviewCurrentHeadOnStartup` is enabled in config.
 
 ## Planned Runtime Locations
 
@@ -178,8 +180,9 @@ The settings UI currently covers:
 - Review profile path
 - state path
 - poll interval
+- sweep depth
 - max parallel reviews/profile agents
-- review current HEAD on watcher startup
+- review pending commits on watcher startup
 - watcher enabled/disabled and recent review state
 
 The repository picker should use a native macOS open panel so users explicitly

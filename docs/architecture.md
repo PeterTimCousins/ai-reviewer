@@ -54,6 +54,9 @@ Build a minimal app plus foreground CLI that:
 - Starts and stops an app-owned polling watcher from the settings window.
 - Runs a foreground `--watch` polling loop for CLI development. Startup HEAD
   reconciliation is controlled by `reviewCurrentHeadOnStartup`.
+- Reconciles pending commits by walking recent history up to `sweepDepth`,
+  skipping already reviewed SHAs, merge commits, and `[skip-review]` or
+  `[no-review]` commit messages.
 - Materializes HEAD into a local cache bundle.
 - Runs the configured review profile against a local bundle using the stripped
   environment and read-only sandbox. Profile agents run concurrently up to
@@ -62,8 +65,7 @@ Build a minimal app plus foreground CLI that:
 - Copies successful reports back through AI Reviewer and records reviewed or
   failed SHAs in local state.
 
-After that works, add recent-commit queueing, skip/bypass policy, and a
-menu-bar/login item wrapper.
+After that works, add failed-review retry policy and login-item support.
 
 ## Concrete Implementation Plan
 

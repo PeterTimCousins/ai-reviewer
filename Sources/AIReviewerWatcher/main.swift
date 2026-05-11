@@ -60,6 +60,7 @@ struct AppConfig: Codable, Sendable {
     var reviewProfilePath: String?
     var statePath: String?
     var reviewCurrentHeadOnStartup: Bool?
+    var sweepDepth: Int?
 
     var snapshotByteLimit: Int {
         max(1, maxSnapshotBytes ?? 200_000)
@@ -67,6 +68,10 @@ struct AppConfig: Codable, Sendable {
 
     var shouldReviewCurrentHeadOnStartup: Bool {
         reviewCurrentHeadOnStartup ?? false
+    }
+
+    var reviewSweepDepth: Int {
+        max(1, sweepDepth ?? 50)
     }
 }
 
@@ -82,7 +87,8 @@ func defaultConfig() -> AppConfig {
         codexModel: nil,
         reviewProfilePath: nil,
         statePath: nil,
-        reviewCurrentHeadOnStartup: false
+        reviewCurrentHeadOnStartup: false,
+        sweepDepth: 50
     )
 }
 
@@ -155,6 +161,7 @@ struct ReviewState: Codable {
     var lastSeenHead: String?
     var lastBundlePath: String?
     var lastReviewPath: String?
+    var skipped: [String: ReviewSkipRecord]?
     var reviewed: [String: ReviewRecord]
     var failed: [String: ReviewFailureRecord]
 
@@ -165,10 +172,18 @@ struct ReviewState: Codable {
             lastSeenHead: nil,
             lastBundlePath: nil,
             lastReviewPath: nil,
+            skipped: [:],
             reviewed: [:],
             failed: [:]
         )
     }
+}
+
+struct ReviewSkipRecord: Codable {
+    var sha: String
+    var shortSha: String
+    var skippedAt: String
+    var reason: String
 }
 
 enum Command: String {
@@ -258,6 +273,9 @@ func loadState(config: AppConfig) throws -> ReviewState {
 
 func saveState(_ state: ReviewState, config: AppConfig) throws {
     var nextState = state
+    if nextState.skipped == nil {
+        nextState.skipped = [:]
+    }
     nextState.updatedAt = isoNow()
 
     let encoder = JSONEncoder()
@@ -482,6 +500,7 @@ func validationSummary(config: AppConfig) throws -> String {
     maxParallelReviews: \(config.maxParallelReviews)
     pollIntervalSeconds: \(config.pollIntervalSeconds)
     reviewCurrentHeadOnStartup: \(config.shouldReviewCurrentHeadOnStartup)
+    sweepDepth: \(config.reviewSweepDepth)
     maxSnapshotBytes: \(config.snapshotByteLimit)
     """
 }
@@ -501,10 +520,12 @@ func watch(config: AppConfig) throws -> Never {
     print("initialHead: \(lastHead)")
     if config.shouldReviewCurrentHeadOnStartup {
         do {
-            _ = try reviewOnce(config: config)
+            _ = try reviewPendingCommits(config: config)
         } catch {
             fputs("watch startup warning: \(error)\n", stderr)
         }
+    } else {
+        try recordSeenHead(config: config, head: lastHead)
     }
 
     while true {
@@ -514,7 +535,7 @@ func watch(config: AppConfig) throws -> Never {
             let head = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
             if head != lastHead {
                 print("headChanged: \(lastHead) -> \(head)")
-                _ = try reviewOnce(config: config)
+                _ = try reviewPendingCommits(config: config)
                 lastHead = head
             }
         } catch {
@@ -611,28 +632,36 @@ func materializeSnapshot(repoPath: String, commit: String, path: String, snapsho
 
 func materializeHead(config: AppConfig) throws -> URL {
     let profile = try loadReviewProfile(config: config)
-    return try materializeHead(config: config, profile: profile)
+    let repoPath = repoURL(config: config).path
+    let commit = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
+    return try materializeCommit(config: config, profile: profile, commit: commit)
 }
 
 func materializeHead(config: AppConfig, profile: ReviewProfile) throws -> URL {
+    let repoPath = repoURL(config: config).path
+    let commit = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
+    return try materializeCommit(config: config, profile: profile, commit: commit)
+}
+
+func materializeCommit(config: AppConfig, profile: ReviewProfile, commit: String) throws -> URL {
     try validatePaths(config: config)
 
     let repoPath = repoURL(config: config).path
     let branch = try runGit(repoPath: repoPath, arguments: ["branch", "--show-current"])
-    let commit = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
-    let shortCommit = try runGit(repoPath: repoPath, arguments: ["rev-parse", "--short", "HEAD"])
+    let resolvedCommit = try runGit(repoPath: repoPath, arguments: ["rev-parse", commit])
+    let shortCommit = try runGit(repoPath: repoPath, arguments: ["rev-parse", "--short", resolvedCommit])
 
     let bundleURL = bundlesURL(config: config)
-        .appendingPathComponent(commit)
+        .appendingPathComponent(resolvedCommit)
     let snapshotsURL = bundleURL.appendingPathComponent("snapshots")
 
     try trashExistingItem(at: bundleURL)
     try FileManager.default.createDirectory(at: bundleURL, withIntermediateDirectories: true)
 
-    let commitText = try runGitData(repoPath: repoPath, arguments: ["show", "--no-patch", "--format=fuller", commit])
+    let commitText = try runGitData(repoPath: repoPath, arguments: ["show", "--no-patch", "--format=fuller", resolvedCommit])
     try writeData(commitText, to: bundleURL.appendingPathComponent("commit.txt"))
 
-    let diff = try reviewableDiffData(repoPath: repoPath, commit: commit, ignorePaths: profile.ignorePaths)
+    let diff = try reviewableDiffData(repoPath: repoPath, commit: resolvedCommit, ignorePaths: profile.ignorePaths)
     if let maxDiffBytes = profile.maxDiffBytes, maxDiffBytes > 0, diff.count > maxDiffBytes {
         throw AIReviewerError.invalidConfig("reviewable diff is \(diff.count) bytes, above profile limit \(maxDiffBytes)")
     }
@@ -642,14 +671,14 @@ func materializeHead(config: AppConfig, profile: ReviewProfile) throws -> URL {
     profileEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     try writeData(try profileEncoder.encode(profile), to: bundleURL.appendingPathComponent("review-profile.json"))
 
-    let changedFiles = try parseChangedFiles(repoPath: repoPath, commit: commit, ignorePaths: profile.ignorePaths).map { changed -> ChangedFile in
+    let changedFiles = try parseChangedFiles(repoPath: repoPath, commit: resolvedCommit, ignorePaths: profile.ignorePaths).map { changed -> ChangedFile in
         let snapshot: (relativePath: String, bytes: Int, capped: Bool)?
         if changed.status.hasPrefix("D") {
             snapshot = nil
         } else {
             snapshot = try materializeSnapshot(
                 repoPath: repoPath,
-                commit: commit,
+                commit: resolvedCommit,
                 path: changed.path,
                 snapshotsURL: snapshotsURL,
                 byteLimit: config.snapshotByteLimit
@@ -675,7 +704,7 @@ func materializeHead(config: AppConfig, profile: ReviewProfile) throws -> URL {
 
     let manifest = BundleManifest(
         schemaVersion: 1,
-        commit: commit,
+        commit: resolvedCommit,
         shortCommit: shortCommit,
         branch: branch.isEmpty ? "(detached)" : branch,
         createdAt: ISO8601DateFormatter().string(from: Date()),
@@ -1156,11 +1185,32 @@ func reviewOnce(config: AppConfig) throws -> URL? {
 
     let repoPath = repoURL(config: config).path
     let commit = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
-    let shortCommit = try runGit(repoPath: repoPath, arguments: ["rev-parse", "--short", "HEAD"])
-    var state = try loadState(config: config)
-    state.lastSeenHead = commit
+    return try reviewCommit(config: config, commit: commit)
+}
 
-    if let reviewed = state.reviewed[commit] {
+func reviewCommit(config: AppConfig, commit: String) throws -> URL? {
+    try validatePaths(config: config)
+
+    let repoPath = repoURL(config: config).path
+    let resolvedCommit = try runGit(repoPath: repoPath, arguments: ["rev-parse", commit])
+    let shortCommit = try runGit(repoPath: repoPath, arguments: ["rev-parse", "--short", resolvedCommit])
+    var state = try loadState(config: config)
+    state.lastSeenHead = resolvedCommit
+
+    if try shouldSkipCommit(repoPath: repoPath, commit: resolvedCommit) {
+        state.skipped = state.skipped ?? [:]
+        state.skipped?[resolvedCommit] = ReviewSkipRecord(
+            sha: resolvedCommit,
+            shortSha: shortCommit,
+            skippedAt: isoNow(),
+            reason: "commit message bypass marker"
+        )
+        try saveState(state, config: config)
+        print("skippedReview: \(shortCommit)")
+        return nil
+    }
+
+    if let reviewed = state.reviewed[resolvedCommit] {
         state.lastBundlePath = reviewed.bundlePath
         state.lastReviewPath = reviewed.localReviewPath
         try saveState(state, config: config)
@@ -1174,7 +1224,7 @@ func reviewOnce(config: AppConfig) throws -> URL? {
 
     do {
         let profile = try loadReviewProfile(config: config)
-        let materializedBundleURL = try materializeHead(config: config, profile: profile)
+        let materializedBundleURL = try materializeCommit(config: config, profile: profile, commit: resolvedCommit)
         bundleURL = materializedBundleURL
         state.lastBundlePath = materializedBundleURL.path
         try saveState(state, config: config)
@@ -1184,22 +1234,22 @@ func reviewOnce(config: AppConfig) throws -> URL? {
         state.lastReviewPath = localReviewURL.path
 
         let copiedReportURL = try copyReportBack(config: config, reviewURL: localReviewURL, shortCommit: shortCommit)
-        state.reviewed[commit] = ReviewRecord(
-            sha: commit,
+        state.reviewed[resolvedCommit] = ReviewRecord(
+            sha: resolvedCommit,
             shortSha: shortCommit,
             reviewedAt: isoNow(),
             bundlePath: materializedBundleURL.path,
             localReviewPath: localReviewURL.path,
             copiedReportPath: copiedReportURL.path
         )
-        state.failed.removeValue(forKey: commit)
+        state.failed.removeValue(forKey: resolvedCommit)
         try saveState(state, config: config)
 
         print("reviewed: \(shortCommit)")
         return copiedReportURL
     } catch {
-        state.failed[commit] = ReviewFailureRecord(
-            sha: commit,
+        state.failed[resolvedCommit] = ReviewFailureRecord(
+            sha: resolvedCommit,
             shortSha: shortCommit,
             failedAt: isoNow(),
             error: "\(error)",
@@ -1209,6 +1259,96 @@ func reviewOnce(config: AppConfig) throws -> URL? {
         try? saveState(state, config: config)
         throw error
     }
+}
+
+func shouldSkipCommit(repoPath: String, commit: String) throws -> Bool {
+    let message = try runGit(repoPath: repoPath, arguments: ["log", "-1", "--format=%B", commit])
+    return message.range(of: #"\[(skip-review|no-review)\]"#, options: .regularExpression) != nil
+}
+
+func recordSeenHead(config: AppConfig, head: String) throws {
+    var state = try loadState(config: config)
+    state.lastSeenHead = head
+    try saveState(state, config: config)
+}
+
+func pendingReviewCommits(config: AppConfig) throws -> [String] {
+    try validatePaths(config: config)
+
+    let repoPath = repoURL(config: config).path
+    var state = try loadState(config: config)
+    let head = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
+    let output: String
+    if let lastSeenHead = state.lastSeenHead,
+       !lastSeenHead.isEmpty,
+       (try? runGit(repoPath: repoPath, arguments: ["merge-base", "--is-ancestor", lastSeenHead, head])) != nil {
+        output = try runGit(repoPath: repoPath, arguments: ["rev-list", "--reverse", "--max-count=\(config.reviewSweepDepth)", "\(lastSeenHead)..\(head)"])
+    } else {
+        output = try runGit(repoPath: repoPath, arguments: ["rev-list", "--reverse", "--max-count=\(config.reviewSweepDepth)", "HEAD"])
+    }
+
+    let reviewed = Set(state.reviewed.keys)
+    let skipped = Set((state.skipped ?? [:]).keys)
+    var pending: [String] = []
+
+    for commit in output.split(separator: "\n").map(String.init) {
+        if reviewed.contains(commit) || skipped.contains(commit) {
+            continue
+        }
+
+        let parentCount = try runGit(repoPath: repoPath, arguments: ["log", "-1", "--format=%P", commit])
+            .split(separator: " ")
+            .count
+        if parentCount > 1 {
+            state.skipped = state.skipped ?? [:]
+            state.skipped?[commit] = ReviewSkipRecord(
+                sha: commit,
+                shortSha: try runGit(repoPath: repoPath, arguments: ["rev-parse", "--short", commit]),
+                skippedAt: isoNow(),
+                reason: "merge commit"
+            )
+            continue
+        }
+
+        if try shouldSkipCommit(repoPath: repoPath, commit: commit) {
+            state.skipped = state.skipped ?? [:]
+            state.skipped?[commit] = ReviewSkipRecord(
+                sha: commit,
+                shortSha: try runGit(repoPath: repoPath, arguments: ["rev-parse", "--short", commit]),
+                skippedAt: isoNow(),
+                reason: "commit message bypass marker"
+            )
+            continue
+        }
+
+        pending.append(commit)
+    }
+
+    if state.skipped != nil {
+        try saveState(state, config: config)
+    }
+
+    return pending
+}
+
+func reviewPendingCommits(config: AppConfig) throws -> [URL] {
+    let pending = try pendingReviewCommits(config: config)
+    var reports: [URL] = []
+
+    if pending.isEmpty {
+        let repoPath = repoURL(config: config).path
+        let head = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
+        try recordSeenHead(config: config, head: head)
+        return []
+    }
+
+    for commit in pending {
+        if let report = try reviewCommit(config: config, commit: commit) {
+            reports.append(report)
+        }
+    }
+
+    return reports
 }
 
 struct ParsedCommand {
@@ -1273,7 +1413,9 @@ final class AppWatcher: @unchecked Sendable {
                 self.send("Watching \(repoPath)", onUpdate: onUpdate)
 
                 if config.shouldReviewCurrentHeadOnStartup {
-                    self.reviewCurrentHead(config: config, reason: "Reviewing current HEAD on startup", onUpdate: onUpdate)
+                    self.reviewPending(config: config, reason: "Reviewing pending commits on startup", onUpdate: onUpdate)
+                } else {
+                    try recordSeenHead(config: config, head: self.lastHead ?? "")
                 }
 
                 let interval = max(1, config.pollIntervalSeconds)
@@ -1322,7 +1464,7 @@ final class AppWatcher: @unchecked Sendable {
 
             let previousHead = lastHead
             lastHead = head
-            reviewCurrentHead(
+            reviewPending(
                 config: config,
                 reason: "HEAD changed \(short(previousHead)) -> \(short(head))",
                 onUpdate: onUpdate
@@ -1333,7 +1475,7 @@ final class AppWatcher: @unchecked Sendable {
         }
     }
 
-    private func reviewCurrentHead(config: AppConfig, reason: String, onUpdate: @escaping @Sendable (WatcherUpdate) -> Void) {
+    private func reviewPending(config: AppConfig, reason: String, onUpdate: @escaping @Sendable (WatcherUpdate) -> Void) {
         guard isRunning else {
             return
         }
@@ -1343,11 +1485,12 @@ final class AppWatcher: @unchecked Sendable {
         send(reason, onUpdate: onUpdate)
 
         do {
-            if let reportURL = try reviewOnce(config: config) {
+            let reports = try reviewPendingCommits(config: config)
+            if let reportURL = reports.last {
                 lastReview = reportURL.path
-                send("Review completed", onUpdate: onUpdate)
+                send("Review completed (\(reports.count) commit\(reports.count == 1 ? "" : "s"))", onUpdate: onUpdate)
             } else {
-                send("HEAD already reviewed", onUpdate: onUpdate)
+                send("No pending commits", onUpdate: onUpdate)
             }
         } catch {
             lastError = "\(error)"
@@ -1422,9 +1565,10 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
     private let reviewProfileField = NSTextField()
     private let statePathField = NSTextField()
     private let pollIntervalField = NSTextField()
+    private let sweepDepthField = NSTextField()
     private let maxParallelField = NSTextField()
     private let maxSnapshotField = NSTextField()
-    private let reviewStartupCheckbox = NSButton(checkboxWithTitle: "Review current HEAD when watcher starts", target: nil, action: nil)
+    private let reviewStartupCheckbox = NSButton(checkboxWithTitle: "Review pending commits when watcher starts", target: nil, action: nil)
     private let statusField = NSTextField(labelWithString: "Idle")
     private let watcherField = NSTextField(labelWithString: "Watcher: stopped")
     private var startWatcherButton: NSButton?
@@ -1543,6 +1687,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         root.addArrangedSubview(row(label: "Review Profile", field: reviewProfileField, buttonTitle: "Choose", action: #selector(chooseReviewProfile)))
         root.addArrangedSubview(row(label: "State Path", field: statePathField))
         root.addArrangedSubview(row(label: "Poll Seconds", field: pollIntervalField))
+        root.addArrangedSubview(row(label: "Sweep Depth", field: sweepDepthField))
         root.addArrangedSubview(row(label: "Max Parallel", field: maxParallelField))
         root.addArrangedSubview(row(label: "Max Snapshot Bytes", field: maxSnapshotField))
         root.addArrangedSubview(checkboxRow(reviewStartupCheckbox))
@@ -1661,6 +1806,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         reviewProfileField.stringValue = config.reviewProfilePath ?? ""
         statePathField.stringValue = config.statePath ?? ""
         pollIntervalField.stringValue = "\(config.pollIntervalSeconds)"
+        sweepDepthField.stringValue = "\(config.reviewSweepDepth)"
         maxParallelField.stringValue = "\(config.maxParallelReviews)"
         maxSnapshotField.stringValue = "\(config.snapshotByteLimit)"
         reviewStartupCheckbox.state = config.shouldReviewCurrentHeadOnStartup ? .on : .off
@@ -1668,6 +1814,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
 
     private func configFromFields() throws -> AppConfig {
         guard let pollInterval = Int(pollIntervalField.stringValue),
+              let sweepDepth = Int(sweepDepthField.stringValue),
               let maxParallel = Int(maxParallelField.stringValue),
               let maxSnapshot = Int(maxSnapshotField.stringValue)
         else {
@@ -1685,7 +1832,8 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
             codexModel: codexModelField.stringValue.isEmpty ? nil : codexModelField.stringValue,
             reviewProfilePath: reviewProfileField.stringValue.isEmpty ? nil : reviewProfileField.stringValue,
             statePath: statePathField.stringValue.isEmpty ? nil : statePathField.stringValue,
-            reviewCurrentHeadOnStartup: reviewStartupCheckbox.state == .on
+            reviewCurrentHeadOnStartup: reviewStartupCheckbox.state == .on,
+            sweepDepth: max(1, sweepDepth)
         )
     }
 
