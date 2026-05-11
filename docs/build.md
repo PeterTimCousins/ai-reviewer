@@ -25,7 +25,7 @@ AI_REVIEWER_CODESIGN_IDENTITY="Developer ID Application: Example" scripts/build.
 
 `scripts/install.sh` copies the built bundle to `~/Applications/AI Reviewer.app`.
 Pass `--config <path>` to also copy a config to the app-support location used
-by the launch agent:
+by the installed app:
 
 ```bash
 scripts/install.sh --config config/local.json
@@ -56,26 +56,4 @@ Run the first complete one-shot workflow with state and report copy-back:
 
 ```bash
 build/AI\ Reviewer.app/Contents/MacOS/ai-reviewer-watcher review-once --config config/local.json
-```
-
-Install the background launchd watcher with:
-
-```bash
-scripts/install-launch-agent.sh
-```
-
-LaunchAgent support is experimental until the installed-app TCC flow is tested.
-Before loading it, open the installed app, choose the watched repository in the
-GUI, save settings, and validate from that app identity.
-
-Uninstall it with:
-
-```bash
-scripts/uninstall-launch-agent.sh
-```
-
-Validate the generated plist without loading the watcher:
-
-```bash
-scripts/install-launch-agent.sh --no-load
 ```

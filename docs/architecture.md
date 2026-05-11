@@ -25,7 +25,7 @@ bundle and runs with:
 
 ## Review Flow
 
-1. Run the AI Reviewer watcher under launchd or in the foreground.
+1. Run the AI Reviewer watcher from the app or foreground helper.
 2. Poll the configured repository HEAD from the AI Reviewer process.
 3. Walk recent commits and skip already reviewed, bypassed, merge, empty, and
    oversized commits.
@@ -74,12 +74,7 @@ menu-bar/login item wrapper.
    ephemeral execution, ignored user config, and ignored repo rules.
 7. Write Codex output to the local cache first as `codex-review.md`, then have
    AI Reviewer copy the final report back to the configured repo reports path.
-8. Install an experimental launchd user agent that starts the app executable
-   directly and keeps AI Reviewer running in `watch` mode. Do not use launchd
-   `WatchPaths` on the watched repository; the app/helper should remain the
-   repository reader. Treat this mode as unproven until the installed-app TCC
-   flow is tested end to end.
-9. Evolve the current settings window into a menu-bar app and login item after
+8. Evolve the current settings window into a menu-bar app and login item after
    the foreground watcher can run one review cycle end to end.
 
 ## Public App Roadmap
@@ -93,7 +88,7 @@ the CLI:
 - validate permissions and Git status
 - materialize HEAD and run a local-bundle Codex review
 - run the one-shot review workflow with copy-back and state recording
-- start and stop the watcher
+- start and stop the app-owned watcher
 - open cache and log locations
 - show last seen commit, last materialized bundle, and recent errors
 

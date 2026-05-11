@@ -107,28 +107,6 @@ Install the built app bundle with:
 scripts/install.sh
 ```
 
-Install a launchd user agent after installing the app and app-support config:
-
-```bash
-scripts/install.sh --config config/local.json
-scripts/install-launch-agent.sh
-```
-
-LaunchAgent support is experimental until the installed-app TCC flow is proven:
-open `AI Reviewer.app`, choose the watched repository in the GUI, save settings,
-and validate from that installed app identity before loading the agent.
-
-The launch agent keeps AI Reviewer running in `watch` mode. It does not use
-launchd `WatchPaths` on the watched repository; launchd starts the app
-executable directly, and AI Reviewer is the process that reads the configured
-repo.
-
-Uninstall the launch agent with:
-
-```bash
-scripts/uninstall-launch-agent.sh
-```
-
 ## Permission Policy
 
 AI Reviewer should be the only process that receives access to the watched
@@ -170,8 +148,8 @@ config, choosing a watched repository, validating settings, materializing HEAD,
 running a HEAD review, running the one-shot review workflow, and opening the
 cache folder.
 
-The intended product shape is a menu-bar app. The settings UI should continue
-to cover:
+The intended product shape is a menu-bar app that owns the watcher lifecycle.
+The settings UI should continue to cover:
 
 - watched repository
 - reports path inside that repository
