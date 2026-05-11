@@ -52,6 +52,7 @@ final class FileLock {
 final class PipeBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var data = Data()
+    private var exceededLimit = false
 
     func append(_ nextData: Data) {
         guard !nextData.isEmpty else {
@@ -61,6 +62,45 @@ final class PipeBuffer: @unchecked Sendable {
         lock.lock()
         data.append(nextData)
         lock.unlock()
+    }
+
+    func append(_ nextData: Data, maxBytes: Int) -> Bool {
+        guard !nextData.isEmpty else {
+            return true
+        }
+
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+
+        guard !exceededLimit else {
+            return false
+        }
+
+        let remaining = maxBytes - data.count
+        if remaining <= 0 {
+            exceededLimit = true
+            return false
+        }
+
+        if nextData.count > remaining {
+            data.append(nextData.prefix(remaining))
+            exceededLimit = true
+            return false
+        }
+
+        data.append(nextData)
+        return true
+    }
+
+    var didExceedLimit: Bool {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+
+        return exceededLimit
     }
 
     func snapshot() -> Data {
@@ -480,7 +520,7 @@ func timestampForFilename() -> String {
     return formatter.string(from: Date())
 }
 
-func runGitData(repoPath: String, arguments: [String]) throws -> Data {
+func runGitData(repoPath: String, arguments: [String], maxOutputBytes: Int? = nil, allowTruncatedOutput: Bool = false) throws -> Data {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
     process.arguments = ["-C", repoPath] + arguments
@@ -493,7 +533,12 @@ func runGitData(repoPath: String, arguments: [String]) throws -> Data {
     process.standardError = errorPipe
 
     outputPipe.fileHandleForReading.readabilityHandler = { handle in
-        outputBuffer.append(handle.availableData)
+        let data = handle.availableData
+        if let maxOutputBytes, !outputBuffer.append(data, maxBytes: maxOutputBytes) {
+            process.terminate()
+        } else if maxOutputBytes == nil {
+            outputBuffer.append(data)
+        }
     }
     errorPipe.fileHandleForReading.readabilityHandler = { handle in
         errorBuffer.append(handle.availableData)
@@ -504,11 +549,24 @@ func runGitData(repoPath: String, arguments: [String]) throws -> Data {
 
     outputPipe.fileHandleForReading.readabilityHandler = nil
     errorPipe.fileHandleForReading.readabilityHandler = nil
-    outputBuffer.append(outputPipe.fileHandleForReading.readDataToEndOfFile())
+    let remainingOutput = outputPipe.fileHandleForReading.readDataToEndOfFile()
+    if let maxOutputBytes {
+        _ = outputBuffer.append(remainingOutput, maxBytes: maxOutputBytes)
+    } else {
+        outputBuffer.append(remainingOutput)
+    }
     errorBuffer.append(errorPipe.fileHandleForReading.readDataToEndOfFile())
 
     let output = outputBuffer.snapshot()
     let errorOutput = String(data: errorBuffer.snapshot(), encoding: .utf8) ?? ""
+
+    if let maxOutputBytes, outputBuffer.didExceedLimit {
+        if allowTruncatedOutput {
+            return output
+        }
+
+        throw AIReviewerError.invalidConfig("git output exceeded \(maxOutputBytes) bytes for git \(arguments.joined(separator: " "))")
+    }
 
     guard process.terminationStatus == 0 else {
         let message = errorOutput.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -542,14 +600,17 @@ func bundlesURL(config: AppConfig) -> URL {
 
 func validatePaths(config: AppConfig) throws {
     let repoPath = repoURL(config: config).path
-    let reportsPath = reportsURL(config: config).path
-    let headLogPath = repoURL(config: config).appendingPathComponent(".git/logs/HEAD").path
-
-    for path in [repoPath, reportsPath, headLogPath] {
-        guard FileManager.default.fileExists(atPath: path) else {
-            throw AIReviewerError.missingPath(path)
-        }
+    guard FileManager.default.fileExists(atPath: repoPath) else {
+        throw AIReviewerError.missingPath(repoPath)
     }
+
+    let insideWorkTree = try runGit(repoPath: repoPath, arguments: ["rev-parse", "--is-inside-work-tree"])
+    guard insideWorkTree == "true" else {
+        throw AIReviewerError.invalidPath("\(repoPath) is not a Git worktree")
+    }
+
+    _ = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
+    try FileManager.default.createDirectory(at: reportsURL(config: config), withIntermediateDirectories: true)
 }
 
 func validationSummary(config: AppConfig) throws -> String {
@@ -615,6 +676,9 @@ func watch(config: AppConfig) throws -> Never {
                 print("headChanged: \(lastHead) -> \(head)")
                 _ = try reviewPendingCommits(config: config)
                 lastHead = head
+            } else if try hasRetryableFailedReviews(config: config) {
+                print("retryingFailedReviews")
+                _ = try reviewPendingCommits(config: config)
             }
         } catch {
             fputs("watch warning: \(error)\n", stderr)
@@ -627,7 +691,7 @@ func parseChangedFiles(repoPath: String, commit: String) throws -> [(status: Str
 }
 
 func parseChangedFiles(repoPath: String, commit: String, ignorePaths: [String]) throws -> [(status: String, path: String, oldPath: String?)] {
-    let output = try runGit(repoPath: repoPath, arguments: ["diff-tree", "--no-commit-id", "--name-status", "-r", "-M", commit] + gitPathspecArguments(ignorePaths: ignorePaths))
+    let output = try runGit(repoPath: repoPath, arguments: ["diff-tree", "--root", "--no-commit-id", "--name-status", "-r", "-M", commit] + gitPathspecArguments(ignorePaths: ignorePaths))
 
     return output
         .split(separator: "\n", omittingEmptySubsequences: true)
@@ -653,11 +717,18 @@ func gitPathspecArguments(ignorePaths: [String]) -> [String] {
     return ["--", "."] + ignorePaths.map { ":(exclude)\($0)" }
 }
 
-func reviewableDiffData(repoPath: String, commit: String, ignorePaths: [String]) throws -> Data {
-    try runGitData(
-        repoPath: repoPath,
-        arguments: ["show", "--format=", "--find-renames", "--patch", commit] + gitPathspecArguments(ignorePaths: ignorePaths)
-    )
+func reviewableDiffData(repoPath: String, commit: String, ignorePaths: [String], maxDiffBytes: Int?) throws -> Data {
+    let limit = maxDiffBytes.flatMap { $0 > 0 ? $0 + 1 : nil }
+
+    do {
+        return try runGitData(
+            repoPath: repoPath,
+            arguments: ["show", "--format=", "--find-renames", "--patch", commit] + gitPathspecArguments(ignorePaths: ignorePaths),
+            maxOutputBytes: limit
+        )
+    } catch AIReviewerError.invalidConfig(_) where limit != nil {
+        throw AIReviewerError.invalidConfig("reviewable diff is above profile limit \(maxDiffBytes ?? 0) bytes")
+    }
 }
 
 func safeRelativePath(_ path: String) throws -> String {
@@ -694,7 +765,12 @@ func materializeSnapshot(repoPath: String, commit: String, path: String, snapsho
     let data: Data
 
     do {
-        data = try runGitData(repoPath: repoPath, arguments: ["show", "\(commit):\(statusPath)"])
+        data = try runGitData(
+            repoPath: repoPath,
+            arguments: ["show", "\(commit):\(statusPath)"],
+            maxOutputBytes: byteLimit + 1,
+            allowTruncatedOutput: true
+        )
     } catch {
         return nil
     }
@@ -739,7 +815,12 @@ func materializeCommit(config: AppConfig, profile: ReviewProfile, commit: String
     let commitText = try runGitData(repoPath: repoPath, arguments: ["show", "--no-patch", "--format=fuller", resolvedCommit])
     try writeData(commitText, to: bundleURL.appendingPathComponent("commit.txt"))
 
-    let diff = try reviewableDiffData(repoPath: repoPath, commit: resolvedCommit, ignorePaths: profile.ignorePaths)
+    let diff = try reviewableDiffData(
+        repoPath: repoPath,
+        commit: resolvedCommit,
+        ignorePaths: profile.ignorePaths,
+        maxDiffBytes: profile.maxDiffBytes
+    )
     if let maxDiffBytes = profile.maxDiffBytes, maxDiffBytes > 0, diff.count > maxDiffBytes {
         throw AIReviewerError.invalidConfig("reviewable diff is \(diff.count) bytes, above profile limit \(maxDiffBytes)")
     }
@@ -2207,13 +2288,12 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func stopWatching() {
-        watcherRunning = false
         updateWatcherControls(status: "Watcher: stopping...")
         watcherField.stringValue = "Watcher: stopping..."
-        watcherLock.unlock()
         appWatcher.stop { [weak self] update in
             DispatchQueue.main.async {
                 self?.applyWatcherUpdate(update)
+                self?.watcherLock.unlock()
             }
         }
     }
@@ -2233,6 +2313,9 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         }
         watcherField.stringValue = lines.joined(separator: "\n")
         updateWatcherControls(status: lines[0])
+        if !update.isRunning {
+            watcherLock.unlock()
+        }
     }
 
     private func updateWatcherControls(status: String) {

@@ -49,7 +49,7 @@ Build a minimal app plus foreground CLI that:
 
 - Loads a supplied config path.
 - Validates repository and report paths.
-- Reads `HEAD` and `.git/logs/HEAD`.
+- Reads repository state through Git commands.
 - Prints the detected repo status.
 - Starts and stops an app-owned polling watcher from the settings window.
 - Registers and unregisters the app as a macOS login item from the settings
@@ -59,12 +59,15 @@ Build a minimal app plus foreground CLI that:
 - Hides the Dock icon if `hideDockIcon` is enabled, while keeping the status
   item available.
 - Runs a foreground `--watch` polling loop for CLI development. Startup HEAD
-  reconciliation is controlled by `reviewCurrentHeadOnStartup`.
+  reconciliation is controlled by `reviewCurrentHeadOnStartup`; failed-review
+  retries are also checked while HEAD is stable.
 - Reconciles pending commits by walking recent history up to `sweepDepth`,
   skipping already reviewed SHAs, merge commits, and `[skip-review]` or
   `[no-review]` commit messages. Failed SHAs are retried only after
   `retryFailedAfterSeconds`, including while HEAD is stable.
 - Materializes HEAD into a local cache bundle.
+- Binds diff and snapshot reads before buffering so configured size caps protect
+  watcher memory.
 - Runs the configured review profile against a local bundle using the stripped
   environment and read-only sandbox. Profile agents run concurrently up to
   `maxParallelReviews`, then findings are merged deterministically in profile
@@ -73,6 +76,8 @@ Build a minimal app plus foreground CLI that:
   passing snapshots to profile agents.
 - Copies successful reports back through AI Reviewer and records reviewed or
   failed SHAs in local state.
+- Validates repositories through Git so linked worktrees are accepted, and
+  creates the configured reports directory on first run.
 
 ## Concrete Implementation Plan
 

@@ -127,8 +127,13 @@ checks for due failed-review retries while HEAD is stable.
 
 Codex runs are terminated after `codexTimeoutSeconds`; the default is 30
 minutes. File snapshots are capped individually by `maxSnapshotBytes` during
-bundle materialization, and capped again in aggregate by
-`maxPromptSnapshotBytes` before being embedded in specialist prompts.
+bundle materialization, with Git output bounded before buffering. Diff output
+is also bounded before buffering when a profile sets `maxDiffBytes`. Snapshot
+content is capped again in aggregate by `maxPromptSnapshotBytes` before being
+embedded in specialist prompts.
+
+Validation accepts normal Git worktrees, including linked `git worktree`
+checkouts, and creates the configured reports directory if it does not exist.
 
 ## Planned Runtime Locations
 
