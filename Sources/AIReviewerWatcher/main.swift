@@ -2,6 +2,52 @@ import AppKit
 import Foundation
 import UniformTypeIdentifiers
 
+final class FileLock {
+    private let url: URL
+    private var descriptor: Int32 = -1
+
+    init(url: URL) {
+        self.url = url
+    }
+
+    deinit {
+        unlock()
+    }
+
+    func tryLock() throws -> Bool {
+        if descriptor >= 0 {
+            return true
+        }
+
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let fd = open(url.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        guard fd >= 0 else {
+            throw AIReviewerError.unableToWrite(url.path)
+        }
+
+        if flock(fd, LOCK_EX | LOCK_NB) == 0 {
+            descriptor = fd
+            let payload = "\(ProcessInfo.processInfo.processIdentifier)\n"
+            _ = ftruncate(fd, 0)
+            _ = write(fd, payload, payload.utf8.count)
+            return true
+        }
+
+        close(fd)
+        return false
+    }
+
+    func unlock() {
+        guard descriptor >= 0 else {
+            return
+        }
+
+        _ = flock(descriptor, LOCK_UN)
+        close(descriptor)
+        descriptor = -1
+    }
+}
+
 struct AppConfig: Codable, Sendable {
     var repoPath: String
     var reportsPath: String
@@ -232,6 +278,14 @@ func appSupportURL() -> URL {
     FileManager.default
         .homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/com.ai-reviewer")
+}
+
+func appInstanceLockURL() -> URL {
+    appSupportURL().appendingPathComponent("app.lock")
+}
+
+func watcherLockURL() -> URL {
+    appSupportURL().appendingPathComponent("watcher.lock")
 }
 
 func appLogsURL() -> URL {
@@ -1277,6 +1331,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
     private var statusItem: NSStatusItem?
     private let appWatcher = AppWatcher()
+    private let watcherLock = FileLock(url: watcherLockURL())
     private var watcherRunning = false
 
     private let repoField = NSTextField()
@@ -1320,6 +1375,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         appWatcher.stop { _ in }
+        watcherLock.unlock()
     }
 
     private func buildMenu() {
@@ -1624,6 +1680,13 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         do {
             let config = try configFromFields()
             try saveConfig(config, to: configURL)
+            guard try watcherLock.tryLock() else {
+                watcherRunning = false
+                updateWatcherControls(status: "Watcher: already running in another AI Reviewer instance")
+                watcherField.stringValue = "Watcher: already running in another AI Reviewer instance"
+                return
+            }
+
             watcherRunning = true
             updateWatcherControls(status: "Watcher: starting...")
             watcherField.stringValue = "Watcher: starting..."
@@ -1633,6 +1696,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         } catch {
+            watcherLock.unlock()
             watcherRunning = false
             updateWatcherControls(status: "Watcher: \(error)")
             watcherField.stringValue = "Watcher: \(error)"
@@ -1643,6 +1707,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         watcherRunning = false
         updateWatcherControls(status: "Watcher: stopping...")
         watcherField.stringValue = "Watcher: stopping..."
+        watcherLock.unlock()
         appWatcher.stop { [weak self] update in
             DispatchQueue.main.async {
                 self?.applyWatcherUpdate(update)
@@ -1723,9 +1788,21 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
 
 @MainActor
 func runSettingsApp() {
+    let appLock = FileLock(url: appInstanceLockURL())
+    do {
+        guard try appLock.tryLock() else {
+            fputs("AI Reviewer is already running.\n", stderr)
+            return
+        }
+    } catch {
+        fputs("Unable to acquire AI Reviewer app lock: \(error)\n", stderr)
+        return
+    }
+
     let app = NSApplication.shared
     let delegate = SettingsAppDelegate()
     app.delegate = delegate
+    objc_setAssociatedObject(app, "com.ai-reviewer.app-lock", appLock, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
     app.run()
 }
 

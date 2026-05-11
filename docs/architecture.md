@@ -6,6 +6,7 @@
 - Use one stable macOS permission identity for repository access.
 - Make review execution auditable, queue based, and bounded.
 - Avoid Full Disk Access for Codex and generic shell tools.
+- Prevent duplicate app instances and duplicate watcher loops.
 
 ## Process Boundary
 
@@ -73,6 +74,8 @@ menu-bar/login item wrapper.
    the app/helper once the menu-bar/login-item wrapper exists.
 4. Store state under `~/Library/Application Support/com.ai-reviewer/`, including
    reviewed SHAs, failed SHAs, last seen HEAD, and last output paths.
+   The same app-support directory stores lock files for single-instance and
+   watcher-loop ownership.
 5. Materialize bundles under `~/Library/Caches/com.ai-reviewer/bundles/<sha>/`
    containing only commit metadata, capped diffs, and capped changed-file
    snapshots. Do not include absolute watched-repo paths in bundles that Codex

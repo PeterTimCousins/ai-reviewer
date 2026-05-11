@@ -65,6 +65,10 @@ Use **Start Watching** and **Stop Watching** in the settings window to run the
 watcher inside the app process. Closing the settings window leaves an active
 watcher running; reopen the window from the app menu or Dock icon.
 
+AI Reviewer uses local lock files under
+`~/Library/Application Support/com.ai-reviewer/` to prevent accidental duplicate
+GUI app instances and duplicate watcher loops.
+
 ## Commands
 
 ```bash
@@ -112,6 +116,7 @@ enabled in config.
 - Config: `~/Library/Application Support/com.ai-reviewer/config.json`
 - Bundles/cache: `~/Library/Caches/com.ai-reviewer/`
 - State: `~/Library/Application Support/com.ai-reviewer/state.json`
+- Locks: `~/Library/Application Support/com.ai-reviewer/*.lock`
 - Logs: `~/Library/Logs/com.ai-reviewer/watcher.log`
 
 Install the built app bundle with:
