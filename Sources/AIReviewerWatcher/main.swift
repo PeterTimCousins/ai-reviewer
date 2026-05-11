@@ -2157,7 +2157,7 @@ final class AppWatcher: @unchecked Sendable {
 }
 
 @MainActor
-final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate {
+final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
     private enum MainSection: Int {
         case reviews = 0
         case logs = 1
@@ -2204,6 +2204,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
     private var rerunReviewButton: NSButton?
     private var openReviewButton: NSButton?
     private var openBundleButton: NSButton?
+    private var primaryActionButton: NSButton?
     private var startWatcherButton: NSButton?
     private var stopWatcherButton: NSButton?
     private var watcherStatusMenuItem: NSMenuItem?
@@ -2238,7 +2239,14 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
         return true
     }
 
+    func windowWillClose(_ notification: Notification) {
+        if activeSection == .settings {
+            persistSettingsFromFields(showStatus: false)
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        persistSettingsFromFields(showStatus: false)
         appWatcher.stop { _ in }
         watcherLock.unlock()
     }
@@ -2308,6 +2316,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
         window.title = "AI Reviewer"
         window.minSize = NSSize(width: 860, height: 620)
         window.isReleasedWhenClosed = false
+        window.delegate = self
 
         let root = NSStackView()
         root.orientation = .vertical
@@ -2341,13 +2350,15 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
 
         let startButton = button(title: "Start", action: #selector(startWatching))
         let stopButton = button(title: "Stop", action: #selector(stopWatching))
+        let primaryButton = button(title: "Refresh", action: #selector(refreshCurrentView))
         stopButton.isEnabled = false
         startWatcherButton = startButton
         stopWatcherButton = stopButton
+        primaryActionButton = primaryButton
 
         header.addArrangedSubview(titleStack)
         header.addArrangedSubview(spacer)
-        header.addArrangedSubview(button(title: "Refresh", action: #selector(refreshCurrentView)))
+        header.addArrangedSubview(primaryButton)
         header.addArrangedSubview(startButton)
         header.addArrangedSubview(stopButton)
         root.addArrangedSubview(header)
@@ -2401,8 +2412,13 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
     }
 
     private func showSection(_ section: MainSection) {
+        if activeSection == .settings, section != .settings {
+            persistSettingsFromFields(showStatus: true)
+        }
+
         activeSection = section
         segmentedControl.selectedSegment = section.rawValue
+        primaryActionButton?.title = section == .settings ? "Save" : "Refresh"
 
         switch section {
         case .reviews:
@@ -2427,13 +2443,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
         case .logs:
             refreshLogs(scrollToBottom: true)
         case .settings:
-            do {
-                let config = try configFromFields()
-                try saveConfig(config, to: configURL)
-                statusField.stringValue = "Saved \(configURL.path)"
-            } catch {
-                statusField.stringValue = "\(error)"
-            }
+            persistSettingsFromFields(showStatus: true)
         }
     }
 
@@ -2997,7 +3007,13 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
         return config
     }
 
+    private func commitFieldEditing() {
+        window?.makeFirstResponder(nil)
+    }
+
     private func configFromFields() throws -> AppConfig {
+        commitFieldEditing()
+
         guard let pollInterval = Int(pollIntervalField.stringValue),
               let sweepDepth = Int(sweepDepthField.stringValue),
               let retryFailedAfter = Int(retryFailedAfterField.stringValue),
@@ -3030,6 +3046,25 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
         )
     }
 
+    @discardableResult
+    private func persistSettingsFromFields(showStatus: Bool) -> AppConfig? {
+        do {
+            let config = try configFromFields()
+            try saveConfig(config, to: configURL)
+            applyActivationPolicy(config: config)
+            let loginItemStatus = try syncLoginItemSetting()
+            if showStatus {
+                statusField.stringValue = "Saved \(configURL.path)\nLogin item: \(loginItemStatus)"
+            }
+            return config
+        } catch {
+            if showStatus {
+                statusField.stringValue = "\(error)"
+            }
+            return nil
+        }
+    }
+
     @objc private func chooseRepository() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
@@ -3056,15 +3091,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
     }
 
     @objc private func saveSettings() {
-        do {
-            let config = try configFromFields()
-            try saveConfig(config, to: configURL)
-            applyActivationPolicy(config: config)
-            let loginItemStatus = try syncLoginItemSetting()
-            statusField.stringValue = "Saved \(configURL.path)\nLogin item: \(loginItemStatus)"
-        } catch {
-            statusField.stringValue = "\(error)"
-        }
+        persistSettingsFromFields(showStatus: true)
     }
 
     @objc private func validateSettings() {
