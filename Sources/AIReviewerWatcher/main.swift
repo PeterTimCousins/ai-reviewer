@@ -2800,25 +2800,16 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         buttonRow.addArrangedSubview(button(title: "Open Cache", action: #selector(openCache)))
         form.addArrangedSubview(buttonRow)
 
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.borderType = .noBorder
-
-        let document = NSView()
-        document.translatesAutoresizingMaskIntoConstraints = false
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
         form.translatesAutoresizingMaskIntoConstraints = false
-        document.addSubview(form)
+        container.addSubview(form)
         NSLayoutConstraint.activate([
-            form.leadingAnchor.constraint(equalTo: document.leadingAnchor),
-            form.trailingAnchor.constraint(lessThanOrEqualTo: document.trailingAnchor),
-            form.topAnchor.constraint(equalTo: document.topAnchor),
-            form.bottomAnchor.constraint(equalTo: document.bottomAnchor),
-            document.widthAnchor.constraint(greaterThanOrEqualToConstant: 850),
-            document.heightAnchor.constraint(greaterThanOrEqualToConstant: 660)
+            form.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            form.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor),
+            form.topAnchor.constraint(equalTo: container.topAnchor)
         ])
-        document.frame = NSRect(x: 0, y: 0, width: 940, height: 660)
-        scroll.documentView = document
-        return scroll
+        return container
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
