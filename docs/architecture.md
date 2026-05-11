@@ -56,6 +56,8 @@ Build a minimal app plus foreground CLI that:
   window.
 - Starts the watcher automatically when the app opens if
   `startWatcherOnLaunch` is enabled.
+- Hides the Dock icon if `hideDockIcon` is enabled, while keeping the status
+  item available.
 - Runs a foreground `--watch` polling loop for CLI development. Startup HEAD
   reconciliation is controlled by `reviewCurrentHeadOnStartup`.
 - Reconciles pending commits by walking recent history up to `sweepDepth`,
@@ -113,6 +115,7 @@ the CLI:
 - run the one-shot review workflow with copy-back and state recording
 - start and stop the app-owned watcher
 - register and unregister the app as a macOS login item
+- hide the Dock icon for menu-bar-only operation
 - keep a menu bar status item available after the settings window is closed
 - open cache and log locations
 - show last seen commit, last materialized bundle, and recent errors

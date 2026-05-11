@@ -24,7 +24,8 @@ This is early-stage software. The current app can:
 - validate a local JSON config
 - start and stop an app-owned repository HEAD watcher from the settings window
 - optionally register the app as a macOS login item
-- optionally start the watcher when the app opens
+- start the watcher when the app opens
+- optionally hide the Dock icon
 - watch a repository HEAD in the foreground from the CLI
 - materialize the current HEAD into a local cache bundle
 - run Codex against a local cache bundle with a stripped environment
@@ -65,13 +66,15 @@ open build/AI\ Reviewer.app
 
 Use **Start Watching** and **Stop Watching** in the settings window to run the
 watcher inside the app process. Closing the settings window leaves an active
-watcher running; reopen the window from the app menu or Dock icon.
+watcher running; reopen the window from the app menu, status item, or Dock icon
+when the Dock icon is enabled.
 
 Enable **Launch AI Reviewer at login** to register the app with macOS Login
-Items. Enable **Start watching when app opens** if the watcher should resume
-automatically when the app is opened manually or by macOS at login. When
-auto-watch is enabled, the app starts quietly in the menu bar; open Settings
-from the status item or Dock icon when you need the window.
+Items. **Start watching when app opens** is enabled by default so the watcher
+resumes automatically when the app is opened manually or by macOS at login.
+**Hide Dock icon** is also enabled by default so the app behaves like a menu-bar
+utility. If no repository is configured yet, the settings window opens instead
+of failing invisibly in the background.
 
 AI Reviewer uses local lock files under
 `~/Library/Application Support/com.ai-reviewer/` to prevent accidental duplicate
@@ -194,6 +197,7 @@ The settings UI currently covers:
 - retry failed seconds
 - max parallel reviews/profile agents
 - start watching when app opens
+- hide Dock icon
 - review pending commits on watcher startup
 - launch at login
 - watcher enabled/disabled and recent review state
