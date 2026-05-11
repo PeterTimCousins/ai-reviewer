@@ -52,6 +52,10 @@ Build a minimal app plus foreground CLI that:
 - Reads `HEAD` and `.git/logs/HEAD`.
 - Prints the detected repo status.
 - Starts and stops an app-owned polling watcher from the settings window.
+- Registers and unregisters the app as a macOS login item from the settings
+  window.
+- Starts the watcher automatically when the app opens if
+  `startWatcherOnLaunch` is enabled.
 - Runs a foreground `--watch` polling loop for CLI development. Startup HEAD
   reconciliation is controlled by `reviewCurrentHeadOnStartup`.
 - Reconciles pending commits by walking recent history up to `sweepDepth`,
@@ -66,8 +70,6 @@ Build a minimal app plus foreground CLI that:
 - Copies successful reports back through AI Reviewer and records reviewed or
   failed SHAs in local state.
 
-After that works, add login-item support.
-
 ## Concrete Implementation Plan
 
 1. Keep AI Reviewer as the only process that opens the watched repository on
@@ -76,7 +78,7 @@ After that works, add login-item support.
    with bundle identifier `com.ai-reviewer`; use a real signing identity before
    relying on persistent TCC permissions across rebuilds.
 3. Poll `.git/logs/HEAD` first, then replace or augment that with FSEvents from
-   the app/helper once the menu-bar/login-item wrapper exists.
+   the app/helper once the core app flow is stable.
 4. Store state under `~/Library/Application Support/com.ai-reviewer/`, including
    reviewed SHAs, failed SHAs, last seen HEAD, and last output paths.
    The same app-support directory stores lock files for single-instance and
@@ -92,8 +94,8 @@ After that works, add login-item support.
    AI Reviewer copy the final report back to the configured repo reports path.
 8. Define review behavior through JSON profiles with global instructions,
    specialist agents, model overrides, ignore paths, and size gates.
-9. Evolve the current settings window into a menu-bar app and login item after
-   the app-owned watcher can run one review cycle end to end.
+9. Keep the settings UI thin over the same app-owned operations used by the
+   CLI and menu-bar controls.
 10. Keep watcher lifecycle logs under `~/Library/Logs/com.ai-reviewer/` so
    validation does not require Accessibility, AppleScript, or UI automation.
 
@@ -110,6 +112,7 @@ the CLI:
 - materialize HEAD and run a local-bundle Codex review
 - run the one-shot review workflow with copy-back and state recording
 - start and stop the app-owned watcher
+- register and unregister the app as a macOS login item
 - keep a menu bar status item available after the settings window is closed
 - open cache and log locations
 - show last seen commit, last materialized bundle, and recent errors

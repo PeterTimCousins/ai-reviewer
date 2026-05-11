@@ -9,6 +9,7 @@
   "reviewCachePath": "~/Library/Caches/com.ai-reviewer",
   "statePath": null,
   "reviewCurrentHeadOnStartup": false,
+  "startWatcherOnLaunch": false,
   "sweepDepth": 50,
   "retryFailedAfterSeconds": 3600,
   "maxSnapshotBytes": 200000

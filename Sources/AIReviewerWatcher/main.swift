@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import ServiceManagement
 import UniformTypeIdentifiers
 
 final class FileLock {
@@ -60,6 +61,7 @@ struct AppConfig: Codable, Sendable {
     var reviewProfilePath: String?
     var statePath: String?
     var reviewCurrentHeadOnStartup: Bool?
+    var startWatcherOnLaunch: Bool?
     var sweepDepth: Int?
     var retryFailedAfterSeconds: Int?
 
@@ -69,6 +71,10 @@ struct AppConfig: Codable, Sendable {
 
     var shouldReviewCurrentHeadOnStartup: Bool {
         reviewCurrentHeadOnStartup ?? false
+    }
+
+    var shouldStartWatcherOnLaunch: Bool {
+        startWatcherOnLaunch ?? false
     }
 
     var reviewSweepDepth: Int {
@@ -93,6 +99,7 @@ func defaultConfig() -> AppConfig {
         reviewProfilePath: nil,
         statePath: nil,
         reviewCurrentHeadOnStartup: false,
+        startWatcherOnLaunch: false,
         sweepDepth: 50,
         retryFailedAfterSeconds: 3_600
     )
@@ -509,6 +516,7 @@ func validationSummary(config: AppConfig) throws -> String {
     branch: \(branch.isEmpty ? "(detached)" : branch)
     maxParallelReviews: \(config.maxParallelReviews)
     pollIntervalSeconds: \(config.pollIntervalSeconds)
+    startWatcherOnLaunch: \(config.shouldStartWatcherOnLaunch)
     reviewCurrentHeadOnStartup: \(config.shouldReviewCurrentHeadOnStartup)
     sweepDepth: \(config.reviewSweepDepth)
     retryFailedAfterSeconds: \(config.failedReviewRetrySeconds)
@@ -1603,7 +1611,9 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
     private let retryFailedAfterField = NSTextField()
     private let maxParallelField = NSTextField()
     private let maxSnapshotField = NSTextField()
+    private let startWatcherOnLaunchCheckbox = NSButton(checkboxWithTitle: "Start watching when app opens", target: nil, action: nil)
     private let reviewStartupCheckbox = NSButton(checkboxWithTitle: "Review pending commits when watcher starts", target: nil, action: nil)
+    private let launchAtLoginCheckbox = NSButton(checkboxWithTitle: "Launch AI Reviewer at login", target: nil, action: nil)
     private let statusField = NSTextField(labelWithString: "Idle")
     private let watcherField = NSTextField(labelWithString: "Watcher: stopped")
     private var startWatcherButton: NSButton?
@@ -1617,10 +1627,19 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
         buildStatusItem()
         buildWindow()
-        loadConfigIntoFields()
-        window?.center()
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        let config = loadConfigIntoFields()
+        refreshLoginItemCheckbox()
+
+        if config.shouldStartWatcherOnLaunch {
+            window?.center()
+            DispatchQueue.main.async { [weak self] in
+                self?.startWatching()
+            }
+        } else {
+            window?.center()
+            window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -1694,13 +1713,13 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildWindow() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 800, height: 660),
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 710),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "AI Reviewer"
-        window.minSize = NSSize(width: 680, height: 520)
+        window.minSize = NSSize(width: 680, height: 560)
         window.isReleasedWhenClosed = false
 
         let root = NSStackView()
@@ -1726,7 +1745,9 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         root.addArrangedSubview(row(label: "Retry Failed Secs", field: retryFailedAfterField))
         root.addArrangedSubview(row(label: "Max Parallel", field: maxParallelField))
         root.addArrangedSubview(row(label: "Max Snapshot Bytes", field: maxSnapshotField))
+        root.addArrangedSubview(checkboxRow(startWatcherOnLaunchCheckbox))
         root.addArrangedSubview(checkboxRow(reviewStartupCheckbox))
+        root.addArrangedSubview(checkboxRow(launchAtLoginCheckbox))
 
         let buttonRow = NSStackView()
         buttonRow.orientation = .horizontal
@@ -1823,7 +1844,44 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         return button
     }
 
-    private func loadConfigIntoFields() {
+    private func loginItemStatusText(_ status: SMAppService.Status) -> String {
+        switch status {
+        case .notRegistered:
+            return "not registered"
+        case .enabled:
+            return "enabled"
+        case .requiresApproval:
+            return "requires approval in System Settings"
+        case .notFound:
+            return "not found"
+        @unknown default:
+            return "unknown"
+        }
+    }
+
+    private func refreshLoginItemCheckbox() {
+        let status = SMAppService.mainApp.status
+        launchAtLoginCheckbox.state = (status == .enabled || status == .requiresApproval) ? .on : .off
+    }
+
+    private func syncLoginItemSetting() throws -> String {
+        let service = SMAppService.mainApp
+        let wantsLoginItem = launchAtLoginCheckbox.state == .on
+
+        if wantsLoginItem {
+            if service.status != .enabled && service.status != .requiresApproval {
+                try service.register()
+            }
+        } else if service.status == .enabled || service.status == .requiresApproval {
+            try service.unregister()
+        }
+
+        refreshLoginItemCheckbox()
+        return loginItemStatusText(service.status)
+    }
+
+    @discardableResult
+    private func loadConfigIntoFields() -> AppConfig {
         let config: AppConfig
         if FileManager.default.fileExists(atPath: configURL.path),
            let loaded = try? loadConfig(path: configURL.path) {
@@ -1846,7 +1904,9 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         retryFailedAfterField.stringValue = "\(config.failedReviewRetrySeconds)"
         maxParallelField.stringValue = "\(config.maxParallelReviews)"
         maxSnapshotField.stringValue = "\(config.snapshotByteLimit)"
+        startWatcherOnLaunchCheckbox.state = config.shouldStartWatcherOnLaunch ? .on : .off
         reviewStartupCheckbox.state = config.shouldReviewCurrentHeadOnStartup ? .on : .off
+        return config
     }
 
     private func configFromFields() throws -> AppConfig {
@@ -1871,6 +1931,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
             reviewProfilePath: reviewProfileField.stringValue.isEmpty ? nil : reviewProfileField.stringValue,
             statePath: statePathField.stringValue.isEmpty ? nil : statePathField.stringValue,
             reviewCurrentHeadOnStartup: reviewStartupCheckbox.state == .on,
+            startWatcherOnLaunch: startWatcherOnLaunchCheckbox.state == .on,
             sweepDepth: max(1, sweepDepth),
             retryFailedAfterSeconds: max(0, retryFailedAfter)
         )
@@ -1905,7 +1966,8 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         do {
             let config = try configFromFields()
             try saveConfig(config, to: configURL)
-            statusField.stringValue = "Saved \(configURL.path)"
+            let loginItemStatus = try syncLoginItemSetting()
+            statusField.stringValue = "Saved \(configURL.path)\nLogin item: \(loginItemStatus)"
         } catch {
             statusField.stringValue = "\(error)"
         }

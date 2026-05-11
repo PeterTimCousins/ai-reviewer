@@ -23,6 +23,8 @@ This is early-stage software. The current app can:
 - open a basic settings window when launched normally
 - validate a local JSON config
 - start and stop an app-owned repository HEAD watcher from the settings window
+- optionally register the app as a macOS login item
+- optionally start the watcher when the app opens
 - watch a repository HEAD in the foreground from the CLI
 - materialize the current HEAD into a local cache bundle
 - run Codex against a local cache bundle with a stripped environment
@@ -64,6 +66,12 @@ open build/AI\ Reviewer.app
 Use **Start Watching** and **Stop Watching** in the settings window to run the
 watcher inside the app process. Closing the settings window leaves an active
 watcher running; reopen the window from the app menu or Dock icon.
+
+Enable **Launch AI Reviewer at login** to register the app with macOS Login
+Items. Enable **Start watching when app opens** if the watcher should resume
+automatically when the app is opened manually or by macOS at login. When
+auto-watch is enabled, the app starts quietly in the menu bar; open Settings
+from the status item or Dock icon when you need the window.
 
 AI Reviewer uses local lock files under
 `~/Library/Application Support/com.ai-reviewer/` to prevent accidental duplicate
@@ -167,8 +175,9 @@ AI_REVIEWER_CODESIGN_IDENTITY="Developer ID Application: Example" scripts/build.
 The app currently includes a basic settings window for editing the app-support
 config, choosing a watched repository, validating settings, materializing HEAD,
 running a HEAD review, running the one-shot review workflow, starting and
-stopping the app-owned watcher, opening the cache and log folders, and staying
-available from the macOS menu bar when the settings window is closed.
+stopping the app-owned watcher, controlling login-item registration, opening
+the cache and log folders, and staying available from the macOS menu bar when
+the settings window is closed.
 
 The intended product shape is a menu-bar app that owns the watcher lifecycle.
 The settings UI currently covers:
@@ -184,11 +193,10 @@ The settings UI currently covers:
 - sweep depth
 - retry failed seconds
 - max parallel reviews/profile agents
+- start watching when app opens
 - review pending commits on watcher startup
+- launch at login
 - watcher enabled/disabled and recent review state
-
-The repository picker should use a native macOS open panel so users explicitly
-grant the app access to the watched repo.
 
 ## Review Profiles
 
