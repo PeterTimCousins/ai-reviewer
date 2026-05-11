@@ -2643,7 +2643,19 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSTableViewDat
         text.lineBreakMode = identifier == "subject" ? .byTruncatingTail : .byTruncatingMiddle
         text.maximumNumberOfLines = identifier == "subject" ? 2 : 1
         text.textColor = color(for: item.status)
-        return text
+        return centeredCell(text)
+    }
+
+    private func centeredCell(_ text: NSTextField) -> NSView {
+        let container = NSView()
+        text.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(text)
+        NSLayoutConstraint.activate([
+            text.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            text.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor),
+            text.centerYAnchor.constraint(equalTo: container.centerYAnchor)
+        ])
+        return container
     }
 
     private func statusCell(for status: ReviewHistoryStatus) -> NSView {
