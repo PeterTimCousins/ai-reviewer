@@ -32,7 +32,7 @@ bundle and runs with:
 4. Run Codex specialists against the bundle, not the live repo.
 5. Write the final report locally as `codex-review.md`.
 6. Copy the report back to `<repoPath>/<reportsPath>/`.
-7. Record the SHA in local state and, optionally, the repo review ledger.
+7. Record the SHA in local state.
 
 ## Current Implementation Milestone
 
@@ -42,13 +42,15 @@ Build a foreground CLI that:
 - Validates repository and report paths.
 - Reads `HEAD` and `.git/logs/HEAD`.
 - Prints the detected repo status.
-- Runs a simple `--watch` polling loop that reports HEAD changes.
+- Runs a foreground `--watch` polling loop that reviews changed HEADs.
 - Materializes HEAD into a local cache bundle.
 - Runs Codex against a local bundle using the stripped environment and read-only
   sandbox.
+- Copies successful reports back through AI Reviewer and records reviewed or
+  failed SHAs in local state.
 
-After that works, add report copying, state/ledger tracking, and a menu-bar/login
-item wrapper.
+After that works, add recent-commit queueing, skip/bypass policy, and a
+menu-bar/login item wrapper.
 
 ## Concrete Implementation Plan
 
@@ -60,7 +62,7 @@ item wrapper.
 3. Poll `.git/logs/HEAD` first, then replace or augment that with FSEvents from
    the app/helper once the menu-bar/login-item wrapper exists.
 4. Store state under `~/Library/Application Support/com.ai-reviewer/`, including
-   reviewed SHAs, bypassed SHAs, and in-flight jobs.
+   reviewed SHAs, failed SHAs, last seen HEAD, and last output paths.
 5. Materialize bundles under `~/Library/Caches/com.ai-reviewer/bundles/<sha>/`
    containing only commit metadata, capped diffs, and capped changed-file
    snapshots. Do not include absolute watched-repo paths in bundles that Codex
@@ -83,6 +85,7 @@ the CLI:
 - configure reports path, cache path, Codex home, poll interval, and parallelism
 - validate permissions and Git status
 - materialize HEAD and run a local-bundle Codex review
+- run the one-shot review workflow with copy-back and state recording
 - start and stop the watcher
 - open cache and log locations
 - show last seen commit, last materialized bundle, and recent errors

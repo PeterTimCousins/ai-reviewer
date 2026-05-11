@@ -45,3 +45,9 @@ Run the first local-bundle review with:
 ```bash
 build/AI\ Reviewer.app/Contents/MacOS/ai-reviewer-watcher review-head --config config/local.json
 ```
+
+Run the first complete one-shot workflow with state and report copy-back:
+
+```bash
+build/AI\ Reviewer.app/Contents/MacOS/ai-reviewer-watcher review-once --config config/local.json
+```

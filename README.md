@@ -24,8 +24,8 @@ This is early-stage software. The current app can:
 - watch a repository HEAD in the foreground
 - materialize the current HEAD into a local cache bundle
 - run Codex against a local cache bundle with a stripped environment
-
-Report copying is intentionally not wired in yet.
+- copy completed review reports back to the configured reports directory
+- track reviewed and failed SHAs in local state
 
 ## Quick Start
 
@@ -40,6 +40,7 @@ Edit `config/local.json`, then run:
 scripts/smoke.sh
 build/AI\ Reviewer.app/Contents/MacOS/ai-reviewer-watcher materialize-head --config config/local.json
 build/AI\ Reviewer.app/Contents/MacOS/ai-reviewer-watcher review-head --config config/local.json
+build/AI\ Reviewer.app/Contents/MacOS/ai-reviewer-watcher review-once --config config/local.json
 ```
 
 `config/local.json` is ignored by Git. `config/example.json` is safe for public
@@ -59,6 +60,7 @@ ai-reviewer-watcher watch --config <path>
 ai-reviewer-watcher materialize-head --config <path>
 ai-reviewer-watcher run-codex --config <path> --bundle <sha-or-path>
 ai-reviewer-watcher review-head --config <path>
+ai-reviewer-watcher review-once --config <path>
 ```
 
 `materialize-head` writes to:
@@ -83,11 +85,18 @@ The bundle contains:
 `review-head` materializes the current HEAD, then runs Codex against that
 bundle.
 
+`review-once` materializes HEAD, runs Codex, copies `codex-review.md` back to
+the configured reports path, and records the SHA in local state. Already
+reviewed SHAs are skipped.
+
+`watch` runs in the foreground and calls `review-once` when HEAD changes.
+
 ## Planned Runtime Locations
 
 - App: `~/Applications/AI Reviewer.app`
 - Config: `~/Library/Application Support/com.ai-reviewer/config.json`
 - Bundles/cache: `~/Library/Caches/com.ai-reviewer/`
+- State: `~/Library/Application Support/com.ai-reviewer/state.json`
 - Logs: `~/Library/Logs/com.ai-reviewer/`
 
 Install the built app bundle with:
@@ -134,7 +143,8 @@ AI_REVIEWER_CODESIGN_IDENTITY="Developer ID Application: Example" scripts/build.
 
 The app currently includes a basic settings window for editing the app-support
 config, choosing a watched repository, validating settings, materializing HEAD,
-running a HEAD review, and opening the cache folder.
+running a HEAD review, running the one-shot review workflow, and opening the
+cache folder.
 
 The intended product shape is a menu-bar app. The settings UI should continue
 to cover:
@@ -144,9 +154,10 @@ to cover:
 - cache path
 - Codex home path
 - Codex model
+- state path
 - poll interval
 - max parallel reviews
-- watcher enabled/disabled
+- watcher enabled/disabled and recent review state
 
 The repository picker should use a native macOS open panel so users explicitly
 grant the app access to the watched repo.

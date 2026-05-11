@@ -10,6 +10,7 @@ struct AppConfig: Codable {
     var reviewCachePath: String
     var maxSnapshotBytes: Int?
     var codexModel: String?
+    var statePath: String?
 
     var snapshotByteLimit: Int {
         max(1, maxSnapshotBytes ?? 200_000)
@@ -25,7 +26,8 @@ func defaultConfig() -> AppConfig {
         codexHome: "~/.codex",
         reviewCachePath: "~/Library/Caches/com.ai-reviewer",
         maxSnapshotBytes: 200_000,
-        codexModel: nil
+        codexModel: nil,
+        statePath: nil
     )
 }
 
@@ -47,12 +49,53 @@ struct BundleManifest: Codable {
     let changedFiles: [ChangedFile]
 }
 
+struct ReviewRecord: Codable {
+    var sha: String
+    var shortSha: String
+    var reviewedAt: String
+    var bundlePath: String
+    var localReviewPath: String
+    var copiedReportPath: String
+}
+
+struct ReviewFailureRecord: Codable {
+    var sha: String
+    var shortSha: String
+    var failedAt: String
+    var error: String
+    var bundlePath: String?
+    var localReviewPath: String?
+}
+
+struct ReviewState: Codable {
+    var schemaVersion: Int
+    var updatedAt: String?
+    var lastSeenHead: String?
+    var lastBundlePath: String?
+    var lastReviewPath: String?
+    var reviewed: [String: ReviewRecord]
+    var failed: [String: ReviewFailureRecord]
+
+    static func empty() -> ReviewState {
+        ReviewState(
+            schemaVersion: 1,
+            updatedAt: nil,
+            lastSeenHead: nil,
+            lastBundlePath: nil,
+            lastReviewPath: nil,
+            reviewed: [:],
+            failed: [:]
+        )
+    }
+}
+
 enum Command: String {
     case validate
     case watch
     case materializeHead = "materialize-head"
     case runCodex = "run-codex"
     case reviewHead = "review-head"
+    case reviewOnce = "review-once"
 }
 
 enum AIReviewerError: Error, CustomStringConvertible {
@@ -92,6 +135,7 @@ func usage() -> String {
       ai-reviewer-watcher materialize-head --config <path>
       ai-reviewer-watcher run-codex --config <path> --bundle <sha-or-path>
       ai-reviewer-watcher review-head --config <path>
+      ai-reviewer-watcher review-once --config <path>
     """
 }
 
@@ -120,10 +164,57 @@ func saveConfig(_ config: AppConfig, to url: URL) throws {
     try data.write(to: url, options: .atomic)
 }
 
+func loadState(config: AppConfig) throws -> ReviewState {
+    let url = stateURL(config: config)
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        return .empty()
+    }
+
+    let data = try Data(contentsOf: url)
+    return try JSONDecoder().decode(ReviewState.self, from: data)
+}
+
+func saveState(_ state: ReviewState, config: AppConfig) throws {
+    var nextState = state
+    nextState.updatedAt = isoNow()
+
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try encoder.encode(nextState)
+    let url = stateURL(config: config)
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try data.write(to: url, options: .atomic)
+}
+
 func defaultAppConfigURL() -> URL {
     FileManager.default
         .homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/com.ai-reviewer/config.json")
+}
+
+func appSupportURL() -> URL {
+    FileManager.default
+        .homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/com.ai-reviewer")
+}
+
+func stateURL(config: AppConfig) -> URL {
+    if let statePath = config.statePath, !statePath.isEmpty {
+        return URL(fileURLWithPath: expandedPath(statePath))
+    }
+
+    return appSupportURL().appendingPathComponent("state.json")
+}
+
+func isoNow() -> String {
+    ISO8601DateFormatter().string(from: Date())
+}
+
+func timestampForFilename() -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.dateFormat = "yyyyMMdd-HHmmss"
+    return formatter.string(from: Date())
 }
 
 func runGitData(repoPath: String, arguments: [String]) throws -> Data {
@@ -196,6 +287,7 @@ func validationSummary(config: AppConfig) throws -> String {
     repo: \(repoPath)
     reports: \(reportsURL(config: config).path)
     cache: \(cacheURL(config: config).path)
+    state: \(stateURL(config: config).path)
     codexHome: \(expandedPath(config.codexHome))
     head: \(head)
     branch: \(branch.isEmpty ? "(detached)" : branch)
@@ -226,6 +318,7 @@ func watch(config: AppConfig) throws -> Never {
             let head = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
             if head != lastHead {
                 print("headChanged: \(lastHead) -> \(head)")
+                _ = try reviewOnce(config: config)
                 lastHead = head
             }
         } catch {
@@ -512,6 +605,76 @@ func runCodex(config: AppConfig, bundleURL: URL) throws -> URL {
     return outputURL
 }
 
+func copyReportBack(config: AppConfig, reviewURL: URL, shortCommit: String) throws -> URL {
+    let reportData = try Data(contentsOf: reviewURL)
+    let reportsDirectory = reportsURL(config: config)
+    try FileManager.default.createDirectory(at: reportsDirectory, withIntermediateDirectories: true)
+
+    let reportURL = reportsDirectory.appendingPathComponent("\(shortCommit)-\(timestampForFilename()).md")
+    try writeData(reportData, to: reportURL)
+    print("copiedReport: \(reportURL.path)")
+    return reportURL
+}
+
+func reviewOnce(config: AppConfig) throws -> URL? {
+    try validatePaths(config: config)
+
+    let repoPath = repoURL(config: config).path
+    let commit = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
+    let shortCommit = try runGit(repoPath: repoPath, arguments: ["rev-parse", "--short", "HEAD"])
+    var state = try loadState(config: config)
+    state.lastSeenHead = commit
+
+    if let reviewed = state.reviewed[commit] {
+        state.lastBundlePath = reviewed.bundlePath
+        state.lastReviewPath = reviewed.localReviewPath
+        try saveState(state, config: config)
+        print("alreadyReviewed: \(shortCommit)")
+        print("copiedReport: \(reviewed.copiedReportPath)")
+        return nil
+    }
+
+    var bundleURL: URL?
+    var reviewURL: URL?
+
+    do {
+        let materializedBundleURL = try materializeHead(config: config)
+        bundleURL = materializedBundleURL
+        state.lastBundlePath = materializedBundleURL.path
+        try saveState(state, config: config)
+
+        let localReviewURL = try runCodex(config: config, bundleURL: materializedBundleURL)
+        reviewURL = localReviewURL
+        state.lastReviewPath = localReviewURL.path
+
+        let copiedReportURL = try copyReportBack(config: config, reviewURL: localReviewURL, shortCommit: shortCommit)
+        state.reviewed[commit] = ReviewRecord(
+            sha: commit,
+            shortSha: shortCommit,
+            reviewedAt: isoNow(),
+            bundlePath: materializedBundleURL.path,
+            localReviewPath: localReviewURL.path,
+            copiedReportPath: copiedReportURL.path
+        )
+        state.failed.removeValue(forKey: commit)
+        try saveState(state, config: config)
+
+        print("reviewed: \(shortCommit)")
+        return copiedReportURL
+    } catch {
+        state.failed[commit] = ReviewFailureRecord(
+            sha: commit,
+            shortSha: shortCommit,
+            failedAt: isoNow(),
+            error: "\(error)",
+            bundlePath: bundleURL?.path,
+            localReviewPath: reviewURL?.path
+        )
+        try? saveState(state, config: config)
+        throw error
+    }
+}
+
 struct ParsedCommand {
     let command: Command
     let configPath: String
@@ -527,7 +690,7 @@ func parseCommand(_ args: [String]) throws -> ParsedCommand {
     }
 
     switch command {
-    case .validate, .watch, .materializeHead, .reviewHead:
+    case .validate, .watch, .materializeHead, .reviewHead, .reviewOnce:
         guard args.count == 4 else {
             throw AIReviewerError.missingArgument(usage())
         }
@@ -550,6 +713,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
     private let cacheField = NSTextField()
     private let codexHomeField = NSTextField()
     private let codexModelField = NSTextField()
+    private let statePathField = NSTextField()
     private let pollIntervalField = NSTextField()
     private let maxParallelField = NSTextField()
     private let maxSnapshotField = NSTextField()
@@ -581,7 +745,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildWindow() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 470),
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 510),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -605,6 +769,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         root.addArrangedSubview(row(label: "Cache Path", field: cacheField))
         root.addArrangedSubview(row(label: "Codex Home", field: codexHomeField))
         root.addArrangedSubview(row(label: "Codex Model", field: codexModelField))
+        root.addArrangedSubview(row(label: "State Path", field: statePathField))
         root.addArrangedSubview(row(label: "Poll Seconds", field: pollIntervalField))
         root.addArrangedSubview(row(label: "Max Parallel", field: maxParallelField))
         root.addArrangedSubview(row(label: "Max Snapshot Bytes", field: maxSnapshotField))
@@ -616,11 +781,12 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         buttonRow.addArrangedSubview(button(title: "Validate", action: #selector(validateSettings)))
         buttonRow.addArrangedSubview(button(title: "Materialize HEAD", action: #selector(materializeHeadFromSettings)))
         buttonRow.addArrangedSubview(button(title: "Review HEAD", action: #selector(reviewHeadFromSettings)))
+        buttonRow.addArrangedSubview(button(title: "Review Once", action: #selector(reviewOnceFromSettings)))
         buttonRow.addArrangedSubview(button(title: "Open Cache", action: #selector(openCache)))
         root.addArrangedSubview(buttonRow)
 
         statusField.lineBreakMode = .byWordWrapping
-        statusField.maximumNumberOfLines = 5
+        statusField.maximumNumberOfLines = 12
         statusField.textColor = .secondaryLabelColor
         root.addArrangedSubview(statusField)
 
@@ -682,6 +848,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         cacheField.stringValue = config.reviewCachePath
         codexHomeField.stringValue = config.codexHome
         codexModelField.stringValue = config.codexModel ?? ""
+        statePathField.stringValue = config.statePath ?? ""
         pollIntervalField.stringValue = "\(config.pollIntervalSeconds)"
         maxParallelField.stringValue = "\(config.maxParallelReviews)"
         maxSnapshotField.stringValue = "\(config.snapshotByteLimit)"
@@ -703,7 +870,8 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
             codexHome: codexHomeField.stringValue,
             reviewCachePath: cacheField.stringValue,
             maxSnapshotBytes: max(1, maxSnapshot),
-            codexModel: codexModelField.stringValue.isEmpty ? nil : codexModelField.stringValue
+            codexModel: codexModelField.stringValue.isEmpty ? nil : codexModelField.stringValue,
+            statePath: statePathField.stringValue.isEmpty ? nil : statePathField.stringValue
         )
     }
 
@@ -761,6 +929,20 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func reviewOnceFromSettings() {
+        do {
+            let config = try configFromFields()
+            try saveConfig(config, to: configURL)
+            if let reportURL = try reviewOnce(config: config) {
+                statusField.stringValue = "Review copied to \(reportURL.path)"
+            } else {
+                statusField.stringValue = "HEAD already reviewed"
+            }
+        } catch {
+            statusField.stringValue = "\(error)"
+        }
+    }
+
     @objc private func openCache() {
         do {
             let config = try configFromFields()
@@ -804,6 +986,8 @@ if CommandLine.arguments.count == 1 {
         case .reviewHead:
             let bundleURL = try materializeHead(config: config)
             _ = try runCodex(config: config, bundleURL: bundleURL)
+        case .reviewOnce:
+            _ = try reviewOnce(config: config)
         }
     } catch {
         fputs("\(error)\n", stderr)

@@ -6,5 +6,6 @@
   "codexHome": "~/.codex",
   "codexModel": null,
   "reviewCachePath": "~/Library/Caches/com.ai-reviewer",
+  "statePath": null,
   "maxSnapshotBytes": 200000
 }
