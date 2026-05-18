@@ -155,6 +155,8 @@ struct AppConfig: Codable, Sendable {
     var retryFailedAfterSeconds: Int?
     var codexTimeoutSeconds: Int?
     var maxPromptSnapshotBytes: Int?
+    var maxCodexRunCacheEntries: Int?
+    var maxBundleCacheEntries: Int?
 
     var snapshotByteLimit: Int {
         max(1, maxSnapshotBytes ?? 200_000)
@@ -191,6 +193,14 @@ struct AppConfig: Codable, Sendable {
     var commitReviewConcurrency: Int {
         max(1, maxParallelCommitReviews ?? 1)
     }
+
+    var codexRunCacheEntryLimit: Int {
+        max(0, maxCodexRunCacheEntries ?? 0)
+    }
+
+    var bundleCacheEntryLimit: Int {
+        max(1, maxBundleCacheEntries ?? 200)
+    }
 }
 
 func defaultConfig() -> AppConfig {
@@ -212,7 +222,9 @@ func defaultConfig() -> AppConfig {
         sweepDepth: 50,
         retryFailedAfterSeconds: 3_600,
         codexTimeoutSeconds: 1_800,
-        maxPromptSnapshotBytes: 500_000
+        maxPromptSnapshotBytes: 500_000,
+        maxCodexRunCacheEntries: 0,
+        maxBundleCacheEntries: 200
     )
 }
 
@@ -704,6 +716,10 @@ func bundlesURL(config: AppConfig) -> URL {
     cacheURL(config: config).appendingPathComponent("bundles")
 }
 
+func codexRunsURL(config: AppConfig) -> URL {
+    cacheURL(config: config).appendingPathComponent("codex-runs")
+}
+
 func validatePaths(config: AppConfig) throws {
     let repoPath = repoURL(config: config).path
     guard FileManager.default.fileExists(atPath: repoPath) else {
@@ -748,6 +764,8 @@ func validationSummary(config: AppConfig) throws -> String {
     codexTimeoutSeconds: \(config.codexRunTimeoutSeconds)
     maxSnapshotBytes: \(config.snapshotByteLimit)
     maxPromptSnapshotBytes: \(config.promptSnapshotByteLimit)
+    maxCodexRunCacheEntries: \(config.codexRunCacheEntryLimit)
+    maxBundleCacheEntries: \(config.bundleCacheEntryLimit)
     """
 }
 
@@ -757,6 +775,7 @@ func validate(config: AppConfig) throws {
 
 func watch(config: AppConfig) throws -> Never {
     try validate(config: config)
+    scheduleReviewCacheCleanup(config: config)
     let lock = FileLock(url: watcherLockURL())
     guard try lock.tryLock() else {
         throw AIReviewerError.commandFailed("AI Reviewer watcher is already running.")
@@ -882,6 +901,98 @@ func trashExistingItem(at url: URL) throws {
 
     var trashedURL: NSURL?
     try FileManager.default.trashItem(at: url, resultingItemURL: &trashedURL)
+}
+
+func removeCacheItemDirectly(at url: URL, under root: URL) throws {
+    let item = url.resolvingSymlinksInPath().standardizedFileURL
+    let resolvedRoot = root.resolvingSymlinksInPath().standardizedFileURL
+    guard item.path.hasPrefix(resolvedRoot.path + "/") else {
+        throw AIReviewerError.invalidPath(item.path)
+    }
+
+    guard FileManager.default.fileExists(atPath: item.path) else {
+        return
+    }
+
+    try FileManager.default.removeItem(at: item)
+}
+
+func cacheDirectoryEntries(at root: URL) -> [(url: URL, date: Date)] {
+    guard let urls = try? FileManager.default.contentsOfDirectory(
+        at: root,
+        includingPropertiesForKeys: [.contentModificationDateKey, .creationDateKey, .isDirectoryKey],
+        options: [.skipsHiddenFiles]
+    ) else {
+        return []
+    }
+
+    return urls.compactMap { url in
+        guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .creationDateKey, .isDirectoryKey]),
+              values.isDirectory == true
+        else {
+            return nil
+        }
+
+        return (url: url, date: values.contentModificationDate ?? values.creationDate ?? .distantPast)
+    }
+}
+
+func trimCacheDirectory(_ root: URL, keepLatest: Int) throws {
+    guard FileManager.default.fileExists(atPath: root.path) else {
+        return
+    }
+
+    let entries = cacheDirectoryEntries(at: root)
+        .sorted { left, right in
+            if left.date == right.date {
+                return left.url.lastPathComponent > right.url.lastPathComponent
+            }
+            return left.date > right.date
+        }
+
+    for entry in entries.dropFirst(max(0, keepLatest)) {
+        try removeCacheItemDirectly(at: entry.url, under: root)
+    }
+}
+
+func cleanupReviewCache(config: AppConfig) throws {
+    try trimCacheDirectory(codexRunsURL(config: config), keepLatest: config.codexRunCacheEntryLimit)
+    try trimCacheDirectory(bundlesURL(config: config), keepLatest: config.bundleCacheEntryLimit)
+}
+
+final class CacheCleanupCoordinator: @unchecked Sendable {
+    static let shared = CacheCleanupCoordinator()
+
+    private let lock = NSLock()
+    private var isRunning = false
+
+    func schedule(config: AppConfig) {
+        lock.lock()
+        if isRunning {
+            lock.unlock()
+            return
+        }
+        isRunning = true
+        lock.unlock()
+
+        DispatchQueue.global(qos: .utility).async {
+            defer {
+                self.lock.lock()
+                self.isRunning = false
+                self.lock.unlock()
+            }
+
+            do {
+                try cleanupReviewCache(config: config)
+            } catch {
+                fputs("cache cleanup warning: \(error)\n", stderr)
+            }
+        }
+    }
+}
+
+func scheduleReviewCacheCleanup(config: AppConfig) {
+    CacheCleanupCoordinator.shared.schedule(config: config)
 }
 
 func materializeSnapshot(repoPath: String, commit: String, path: String, snapshotsURL: URL, byteLimit: Int) throws -> (relativePath: String, bytes: Int, capped: Bool)? {
@@ -1075,9 +1186,12 @@ func runCodexPrompt(bundleURL: URL) -> String {
 }
 
 func runCodex(config: AppConfig, bundleURL: URL) throws -> URL {
-    let runRoot = cacheURL(config: config).appendingPathComponent("codex-runs")
+    let runRoot = codexRunsURL(config: config)
     let runID = "\(bundleURL.lastPathComponent)-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString)"
     let runURL = runRoot.appendingPathComponent(runID)
+    defer {
+        try? removeCacheItemDirectly(at: runURL, under: runRoot)
+    }
     let homeURL = runURL.appendingPathComponent("home")
     let tmpURL = runURL.appendingPathComponent("tmp")
     let outputURL = bundleURL.appendingPathComponent("codex-review.md")
@@ -1386,9 +1500,12 @@ func snapshotPromptText(bundleURL: URL, byteLimit: Int) -> String {
 
 func runReviewProfile(config: AppConfig, bundleURL: URL, profile: ReviewProfile) throws -> URL {
     let outputURL = bundleURL.appendingPathComponent("codex-review.md")
-    let runRoot = cacheURL(config: config).appendingPathComponent("codex-runs")
+    let runRoot = codexRunsURL(config: config)
     let runID = "\(bundleURL.lastPathComponent)-profile-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString)"
     let runURL = runRoot.appendingPathComponent(runID)
+    defer {
+        try? removeCacheItemDirectly(at: runURL, under: runRoot)
+    }
     let diffText = (try? String(contentsOf: bundleURL.appendingPathComponent("diff.patch"), encoding: .utf8)) ?? ""
     let changedFiles = try loadBundleChangedFiles(bundleURL: bundleURL)
     let agents = runnableAgents(profile: profile, changedFiles: changedFiles, diffText: diffText)
@@ -1621,6 +1738,9 @@ func reviewOnce(config: AppConfig) throws -> URL? {
 
 func reviewCommit(config: AppConfig, commit: String) throws -> URL? {
     try validatePaths(config: config)
+    defer {
+        scheduleReviewCacheCleanup(config: config)
+    }
 
     let repoPath = repoURL(config: config).path
     let resolvedCommit = try runGit(repoPath: repoPath, arguments: ["rev-parse", commit])
@@ -2141,6 +2261,7 @@ final class AppWatcher: @unchecked Sendable {
 
             do {
                 try validatePaths(config: config)
+                scheduleReviewCacheCleanup(config: config)
                 let repoPath = repoURL(config: config).path
                 self.lastHead = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
                 self.send("Watching \(repoPath)", onUpdate: onUpdate)
@@ -2362,6 +2483,8 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private let sweepDepthField = NSTextField()
     private let retryFailedAfterField = NSTextField()
     private let codexTimeoutField = NSTextField()
+    private let maxCodexRunCacheEntriesField = NSTextField()
+    private let maxBundleCacheEntriesField = NSTextField()
     private let maxParallelCommitReviewsField = NSTextField()
     private let maxParallelField = NSTextField()
     private let maxSnapshotField = NSTextField()
@@ -2889,6 +3012,8 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             form.addArrangedSubview(row(label: "Codex Timeout Secs", field: codexTimeoutField))
             form.addArrangedSubview(row(label: "Snapshot Bytes", field: maxSnapshotField))
             form.addArrangedSubview(row(label: "Prompt Snapshot Bytes", field: maxPromptSnapshotField))
+            form.addArrangedSubview(row(label: "Scratch Runs to Keep", field: maxCodexRunCacheEntriesField))
+            form.addArrangedSubview(row(label: "Bundles to Keep", field: maxBundleCacheEntriesField))
             form.addArrangedSubview(checkboxRow(reviewStartupCheckbox))
 
             let advancedButtons = NSStackView()
@@ -3365,6 +3490,8 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         sweepDepthField.stringValue = "\(config.reviewSweepDepth)"
         retryFailedAfterField.stringValue = "\(config.failedReviewRetrySeconds)"
         codexTimeoutField.stringValue = "\(config.codexRunTimeoutSeconds)"
+        maxCodexRunCacheEntriesField.stringValue = "\(config.codexRunCacheEntryLimit)"
+        maxBundleCacheEntriesField.stringValue = "\(config.bundleCacheEntryLimit)"
         maxParallelCommitReviewsField.stringValue = "\(config.commitReviewConcurrency)"
         maxParallelField.stringValue = "\(config.maxParallelReviews)"
         maxSnapshotField.stringValue = "\(config.snapshotByteLimit)"
@@ -3389,7 +3516,9 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
               let maxConcurrentReviews = Int(maxParallelCommitReviewsField.stringValue),
               let maxParallel = Int(maxParallelField.stringValue),
               let maxSnapshot = Int(maxSnapshotField.stringValue),
-              let maxPromptSnapshot = Int(maxPromptSnapshotField.stringValue)
+              let maxPromptSnapshot = Int(maxPromptSnapshotField.stringValue),
+              let maxCodexRunCacheEntries = Int(maxCodexRunCacheEntriesField.stringValue),
+              let maxBundleCacheEntries = Int(maxBundleCacheEntriesField.stringValue)
         else {
             throw AIReviewerError.invalidConfig("numeric settings must be valid integers")
         }
@@ -3412,7 +3541,9 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             sweepDepth: max(1, sweepDepth),
             retryFailedAfterSeconds: max(0, retryFailedAfter),
             codexTimeoutSeconds: max(30, codexTimeout),
-            maxPromptSnapshotBytes: max(1, maxPromptSnapshot)
+            maxPromptSnapshotBytes: max(1, maxPromptSnapshot),
+            maxCodexRunCacheEntries: max(0, maxCodexRunCacheEntries),
+            maxBundleCacheEntries: max(1, maxBundleCacheEntries)
         )
     }
 

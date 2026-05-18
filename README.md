@@ -127,7 +127,9 @@ Pending commits are discovered by walking up to `sweepDepth` recent commits,
 skipping already reviewed SHAs, merge commits, and commit messages containing
 `[skip-review]` or `[no-review]`. Commits that deterministically exceed the
 profile diff limit are recorded as skipped instead of retried forever. Startup
-reconciliation only runs when `reviewCurrentHeadOnStartup` is enabled in config.
+always reconciles the current HEAD if it has no completed, failed, or skipped
+ledger entry. Full pending-commit catch-up on startup only runs when
+`reviewCurrentHeadOnStartup` is enabled in config.
 Failed reviews are retried after `retryFailedAfterSeconds`; the default is one
 hour. The watcher also checks for due failed-review retries while HEAD is
 stable.
@@ -138,6 +140,11 @@ bundle materialization, with Git output bounded before buffering. Diff output
 is also bounded before buffering when a profile sets `maxDiffBytes`. Snapshot
 content is capped again in aggregate by `maxPromptSnapshotBytes` before being
 embedded in specialist prompts.
+
+Codex scratch runs under `codex-runs` are transient and removed after each
+Codex process finishes. Startup/review cleanup also trims old scratch and bundle
+directories according to `maxCodexRunCacheEntries` and `maxBundleCacheEntries`.
+Defaults keep no scratch runs and the latest 200 bundles.
 
 Validation accepts normal Git worktrees, including linked `git worktree`
 checkouts, and creates the configured reports directory if it does not exist.
@@ -224,7 +231,7 @@ covers:
 - hide Dock icon
 - launch at login
 - cache path, Codex home, Codex model, state path, polling, history, retry,
-  timeout, and snapshot limits in Advanced
+  timeout, cache retention, and snapshot limits in Advanced
 - materialize/review bundle development actions in Advanced
 - watcher enabled/disabled and recent review state
 

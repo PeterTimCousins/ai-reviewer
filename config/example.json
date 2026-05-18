@@ -16,5 +16,7 @@
   "retryFailedAfterSeconds": 3600,
   "codexTimeoutSeconds": 1800,
   "maxSnapshotBytes": 200000,
-  "maxPromptSnapshotBytes": 500000
+  "maxPromptSnapshotBytes": 500000,
+  "maxCodexRunCacheEntries": 0,
+  "maxBundleCacheEntries": 200
 }
