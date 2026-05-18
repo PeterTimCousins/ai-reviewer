@@ -201,6 +201,10 @@ struct AppConfig: Codable, Sendable {
     var bundleCacheEntryLimit: Int {
         max(1, maxBundleCacheEntries ?? 200)
     }
+
+    var codexRunCacheMinimumAgeSeconds: TimeInterval {
+        3_600
+    }
 }
 
 func defaultConfig() -> AppConfig {
@@ -917,6 +921,15 @@ func removeCacheItemDirectly(at url: URL, under root: URL) throws {
     try FileManager.default.removeItem(at: item)
 }
 
+func activeRunMarkerURL(runURL: URL) -> URL {
+    runURL.appendingPathComponent(".ai-reviewer-active-run")
+}
+
+func createActiveRunMarker(runURL: URL) throws {
+    try FileManager.default.createDirectory(at: runURL, withIntermediateDirectories: true)
+    try Data(isoNow().utf8).write(to: activeRunMarkerURL(runURL: runURL), options: .atomic)
+}
+
 func cacheDirectoryEntries(at root: URL) -> [(url: URL, date: Date)] {
     guard let urls = try? FileManager.default.contentsOfDirectory(
         at: root,
@@ -937,11 +950,30 @@ func cacheDirectoryEntries(at root: URL) -> [(url: URL, date: Date)] {
     }
 }
 
-func trimCacheDirectory(_ root: URL, keepLatest: Int) throws {
+func hasRecentActiveRunMarker(at url: URL, now: Date, maxAgeSeconds: TimeInterval) -> Bool {
+    let markerURL = activeRunMarkerURL(runURL: url)
+    guard FileManager.default.fileExists(atPath: markerURL.path),
+          let values = try? markerURL.resourceValues(forKeys: [.contentModificationDateKey, .creationDateKey])
+    else {
+        return false
+    }
+
+    let markerDate = values.contentModificationDate ?? values.creationDate ?? .distantPast
+    return now.timeIntervalSince(markerDate) <= maxAgeSeconds
+}
+
+func trimCacheDirectory(
+    _ root: URL,
+    keepLatest: Int,
+    minimumAgeSeconds: TimeInterval? = nil,
+    skipRecentActiveRunMarkers: Bool = false
+) throws {
     guard FileManager.default.fileExists(atPath: root.path) else {
         return
     }
 
+    let now = Date()
+    let minimumDate = minimumAgeSeconds.map { now.addingTimeInterval(-$0) }
     let entries = cacheDirectoryEntries(at: root)
         .sorted { left, right in
             if left.date == right.date {
@@ -951,12 +983,24 @@ func trimCacheDirectory(_ root: URL, keepLatest: Int) throws {
         }
 
     for entry in entries.dropFirst(max(0, keepLatest)) {
+        if let minimumDate, entry.date > minimumDate {
+            continue
+        }
+        if skipRecentActiveRunMarkers,
+           hasRecentActiveRunMarker(at: entry.url, now: now, maxAgeSeconds: 86_400) {
+            continue
+        }
         try removeCacheItemDirectly(at: entry.url, under: root)
     }
 }
 
 func cleanupReviewCache(config: AppConfig) throws {
-    try trimCacheDirectory(codexRunsURL(config: config), keepLatest: config.codexRunCacheEntryLimit)
+    try trimCacheDirectory(
+        codexRunsURL(config: config),
+        keepLatest: config.codexRunCacheEntryLimit,
+        minimumAgeSeconds: config.codexRunCacheMinimumAgeSeconds,
+        skipRecentActiveRunMarkers: true
+    )
     try trimCacheDirectory(bundlesURL(config: config), keepLatest: config.bundleCacheEntryLimit)
 }
 
@@ -1189,6 +1233,7 @@ func runCodex(config: AppConfig, bundleURL: URL) throws -> URL {
     let runRoot = codexRunsURL(config: config)
     let runID = "\(bundleURL.lastPathComponent)-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString)"
     let runURL = runRoot.appendingPathComponent(runID)
+    try createActiveRunMarker(runURL: runURL)
     defer {
         try? removeCacheItemDirectly(at: runURL, under: runRoot)
     }
@@ -1503,6 +1548,7 @@ func runReviewProfile(config: AppConfig, bundleURL: URL, profile: ReviewProfile)
     let runRoot = codexRunsURL(config: config)
     let runID = "\(bundleURL.lastPathComponent)-profile-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString)"
     let runURL = runRoot.appendingPathComponent(runID)
+    try createActiveRunMarker(runURL: runURL)
     defer {
         try? removeCacheItemDirectly(at: runURL, under: runRoot)
     }
