@@ -136,6 +136,11 @@ final class PipeBuffer: @unchecked Sendable {
     }
 }
 
+enum AIProvider: String, Codable, Sendable {
+    case codex
+    case cursor
+}
+
 struct AppConfig: Codable, Sendable {
     var repoPath: String
     var reportsPath: String
@@ -146,6 +151,9 @@ struct AppConfig: Codable, Sendable {
     var reviewCachePath: String
     var maxSnapshotBytes: Int?
     var codexModel: String?
+    var aiProvider: String?
+    var cursorHome: String?
+    var cursorModel: String?
     var reviewProfilePath: String?
     var statePath: String?
     var reviewCurrentHeadOnStartup: Bool?
@@ -205,6 +213,22 @@ struct AppConfig: Codable, Sendable {
     var codexRunCacheMinimumAgeSeconds: TimeInterval {
         3_600
     }
+
+    var resolvedAIProvider: AIProvider {
+        if let aiProvider, let provider = AIProvider(rawValue: aiProvider) {
+            return provider
+        }
+
+        return .codex
+    }
+
+    var resolvedCursorHome: String {
+        cursorHome ?? "~/.cursor"
+    }
+
+    var resolvedCursorModel: String {
+        cursorModel ?? "composer-2.5"
+    }
 }
 
 func defaultConfig() -> AppConfig {
@@ -218,6 +242,9 @@ func defaultConfig() -> AppConfig {
         reviewCachePath: "~/Library/Caches/com.ai-reviewer",
         maxSnapshotBytes: 200_000,
         codexModel: nil,
+        aiProvider: AIProvider.codex.rawValue,
+        cursorHome: "~/.cursor",
+        cursorModel: "composer-2.5",
         reviewProfilePath: nil,
         statePath: nil,
         reviewCurrentHeadOnStartup: false,
@@ -560,7 +587,35 @@ func bundledProfileURL(name: String) -> URL? {
     return candidates.compactMap { $0 }.first { FileManager.default.fileExists(atPath: $0.path) }
 }
 
-func defaultReviewProfile() -> ReviewProfile {
+func defaultBundledProfileName(config: AppConfig) -> String {
+    switch config.resolvedAIProvider {
+    case .codex:
+        return "default-review.json"
+    case .cursor:
+        return "default-review-cursor.json"
+    }
+}
+
+func reviewAgentIdentity(config: AppConfig) -> String {
+    switch config.resolvedAIProvider {
+    case .codex:
+        return "Codex"
+    case .cursor:
+        return "Composer running in Cursor Agent"
+    }
+}
+
+func resolvedReviewModel(config: AppConfig, profile: ReviewProfile, agent: ReviewAgentProfile?) -> String? {
+    let agentModel = agent?.model
+    switch config.resolvedAIProvider {
+    case .codex:
+        return agentModel ?? config.codexModel ?? profile.defaultModel
+    case .cursor:
+        return agentModel ?? config.resolvedCursorModel ?? profile.defaultModel
+    }
+}
+
+func defaultReviewProfile(config: AppConfig) -> ReviewProfile {
     ReviewProfile(
         schemaVersion: 1,
         name: "Enterprise Default Review",
@@ -568,7 +623,7 @@ func defaultReviewProfile() -> ReviewProfile {
         maxDiffBytes: 200_000,
         ignorePaths: [],
         globalInstructions: """
-        You are Codex running a precise, read-only post-commit review for an enterprise software project.
+        You are \(reviewAgentIdentity(config: config)) running a precise, read-only post-commit review for an enterprise software project.
         Review only changes introduced by the commit represented in the bundle.
         Do not report pre-existing issues unless this diff clearly makes them worse.
         Report only concrete correctness, security, data integrity, authorization, API compatibility, migration, concurrency, resilience, observability, user-facing behavior, or test issues visible from the diff and included snapshots.
@@ -618,13 +673,13 @@ func loadReviewProfile(config: AppConfig) throws -> ReviewProfile {
         return try decoder.decode(ReviewProfile.self, from: data)
     }
 
-    if let url = bundledProfileURL(name: "default-review.json"),
+    if let url = bundledProfileURL(name: defaultBundledProfileName(config: config)),
        FileManager.default.fileExists(atPath: url.path) {
         let data = try Data(contentsOf: url)
         return try decoder.decode(ReviewProfile.self, from: data)
     }
 
-    return defaultReviewProfile()
+    return defaultReviewProfile(config: config)
 }
 
 func isoNow() -> String {
@@ -754,6 +809,9 @@ func validationSummary(config: AppConfig) throws -> String {
     cache: \(cacheURL(config: config).path)
     state: \(stateURL(config: config).path)
     codexHome: \(expandedPath(config.codexHome))
+    aiProvider: \(config.resolvedAIProvider.rawValue)
+    cursorHome: \(expandedPath(config.resolvedCursorHome))
+    cursorModel: \(config.resolvedCursorModel)
     reviewProfile: \(profile.name)
     head: \(head)
     branch: \(branch.isEmpty ? "(detached)" : branch)
@@ -1194,9 +1252,9 @@ func resolveBundleURL(config: AppConfig, bundle: String) throws -> URL {
     return resolvedCandidate
 }
 
-func runCodexPrompt(bundleURL: URL) -> String {
+func runCodexPrompt(config: AppConfig, bundleURL: URL) -> String {
     """
-    You are Codex running a read-only review against a local AI Reviewer bundle.
+    You are \(reviewAgentIdentity(config: config)) running a read-only review against a local AI Reviewer bundle.
 
     Security boundary:
     - Your working directory is the local bundle directory.
@@ -1241,9 +1299,9 @@ func runCodex(config: AppConfig, bundleURL: URL) throws -> URL {
     let tmpURL = runURL.appendingPathComponent("tmp")
     let outputURL = bundleURL.appendingPathComponent("codex-review.md")
     let logURL = bundleURL.appendingPathComponent("codex.log")
-    let prompt = runCodexPrompt(bundleURL: bundleURL)
+    let prompt = runCodexPrompt(config: config, bundleURL: bundleURL)
 
-    try runCodexExecution(
+    try runReviewExecution(
         config: config,
         bundleURL: bundleURL,
         prompt: prompt,
@@ -1289,10 +1347,34 @@ func copyCodexAuthMaterial(from sourcePath: String, to destinationURL: URL) thro
     }
 }
 
-func sandboxProfile(bundleURL: URL, runURL: URL, codexHomeURL: URL, outputURL: URL, logURL: URL) -> String {
+func copyCursorAuthMaterial(from sourcePath: String, to destinationURL: URL) throws {
+    let sourceURL = URL(fileURLWithPath: expandedPath(sourcePath))
+    try FileManager.default.createDirectory(at: destinationURL, withIntermediateDirectories: true)
+
+    for filename in ["auth.json", "cli-config.json", "config.json", "mcp.json", "settings.json"] {
+        let sourceFile = sourceURL.appendingPathComponent(filename)
+        guard FileManager.default.fileExists(atPath: sourceFile.path) else {
+            continue
+        }
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: sourceFile.path)
+        let fileSize = attributes[.size] as? NSNumber
+        guard fileSize?.intValue ?? 0 <= 5_000_000 else {
+            continue
+        }
+
+        let destinationFile = destinationURL.appendingPathComponent(filename)
+        if FileManager.default.fileExists(atPath: destinationFile.path) {
+            try FileManager.default.removeItem(at: destinationFile)
+        }
+        try FileManager.default.copyItem(at: sourceFile, to: destinationFile)
+    }
+}
+
+func sandboxProfile(bundleURL: URL, runURL: URL, authHomeURL: URL, outputURL: URL, logURL: URL) -> String {
     let bundlePath = sandboxString(bundleURL.resolvingSymlinksInPath().standardizedFileURL.path)
     let runPath = sandboxString(runURL.resolvingSymlinksInPath().standardizedFileURL.path)
-    let codexHomePath = sandboxString(codexHomeURL.resolvingSymlinksInPath().standardizedFileURL.path)
+    let authHomePath = sandboxString(authHomeURL.resolvingSymlinksInPath().standardizedFileURL.path)
     let outputPath = sandboxString(outputURL.resolvingSymlinksInPath().standardizedFileURL.path)
     let logPath = sandboxString(logURL.resolvingSymlinksInPath().standardizedFileURL.path)
 
@@ -1323,7 +1405,7 @@ func sandboxProfile(bundleURL: URL, runURL: URL, codexHomeURL: URL, outputURL: U
       (subpath "/private/var/db/timezone")
       (subpath "\(bundlePath)")
       (subpath "\(runPath)")
-      (subpath "\(codexHomePath)"))
+      (subpath "\(authHomePath)"))
     (allow file-write*
       (subpath "/dev")
       (subpath "/tmp")
@@ -1331,7 +1413,7 @@ func sandboxProfile(bundleURL: URL, runURL: URL, codexHomeURL: URL, outputURL: U
       (subpath "/private/var/folders")
       (subpath "\(bundlePath)")
       (subpath "\(runPath)")
-      (subpath "\(codexHomePath)")
+      (subpath "\(authHomePath)")
       (literal "\(outputPath)")
       (literal "\(logPath)"))
     """
@@ -1357,7 +1439,7 @@ func runCodexExecution(
     try copyCodexAuthMaterial(from: config.codexHome, to: runCodexHomeURL)
     let sandboxURL = runURL.appendingPathComponent("codex.sb")
     try writeData(
-        Data(sandboxProfile(bundleURL: bundleURL, runURL: runURL, codexHomeURL: runCodexHomeURL, outputURL: outputURL, logURL: logURL).utf8),
+        Data(sandboxProfile(bundleURL: bundleURL, runURL: runURL, authHomeURL: runCodexHomeURL, outputURL: outputURL, logURL: logURL).utf8),
         to: sandboxURL
     )
 
@@ -1441,7 +1523,141 @@ func runCodexExecution(
     }
 }
 
-func profileAgentPrompt(bundleURL: URL, profile: ReviewProfile, agent: ReviewAgentProfile, snapshotByteLimit: Int) throws -> String {
+func runCursorExecution(
+    config: AppConfig,
+    bundleURL: URL,
+    prompt: String,
+    model: String?,
+    outputURL: URL,
+    logURL: URL,
+    homeURL: URL,
+    tmpURL: URL
+) throws {
+    let reviewPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+    try FileManager.default.createDirectory(at: homeURL, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: tmpURL, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let runURL = homeURL.deletingLastPathComponent()
+    let runCursorHomeURL = runURL.appendingPathComponent("cursor-home", isDirectory: true)
+    try copyCursorAuthMaterial(from: config.resolvedCursorHome, to: runCursorHomeURL)
+    let sandboxURL = runURL.appendingPathComponent("cursor.sb")
+    try writeData(
+        Data(sandboxProfile(bundleURL: bundleURL, runURL: runURL, authHomeURL: runCursorHomeURL, outputURL: outputURL, logURL: logURL).utf8),
+        to: sandboxURL
+    )
+
+    FileManager.default.createFile(atPath: logURL.path, contents: nil)
+    let logHandle = try FileHandle(forWritingTo: logURL)
+    try logHandle.truncate(atOffset: 0)
+    defer {
+        try? logHandle.close()
+    }
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
+    process.currentDirectoryURL = bundleURL
+
+    var arguments = [
+        "-f",
+        sandboxURL.path,
+        "/usr/bin/env",
+        "-i",
+        "HOME=\(homeURL.path)",
+        "CURSOR_HOME=\(runCursorHomeURL.path)",
+        "TMPDIR=\(tmpURL.path)",
+        "PATH=\(reviewPath)",
+        "USER=\(NSUserName())",
+        "LOGNAME=\(NSUserName())",
+        "SHELL=/bin/bash",
+        "agent",
+        "-p",
+        "--mode", "ask",
+        "--sandbox", "enabled",
+        "--trust",
+        "--workspace", bundleURL.path,
+        "--output-format", "text"
+    ]
+
+    if let model, !model.isEmpty {
+        arguments += ["--model", model]
+    }
+
+    arguments += [prompt]
+    process.arguments = arguments
+
+    let outputPipe = Pipe()
+    process.standardOutput = outputPipe
+    process.standardError = logHandle
+    let termination = DispatchSemaphore(value: 0)
+    process.terminationHandler = { _ in
+        termination.signal()
+    }
+
+    try process.run()
+
+    if termination.wait(timeout: .now() + .seconds(config.codexRunTimeoutSeconds)) == .timedOut {
+        process.terminate()
+        if termination.wait(timeout: .now() + .seconds(5)) == .timedOut {
+            kill(process.processIdentifier, SIGKILL)
+            _ = termination.wait(timeout: .now() + .seconds(5))
+        }
+
+        throw AIReviewerError.commandFailed("cursor agent timed out after \(config.codexRunTimeoutSeconds) seconds")
+    }
+
+    let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+    try writeData(outputData, to: outputURL)
+
+    guard process.terminationStatus == 0 else {
+        let logData = (try? Data(contentsOf: logURL)) ?? Data()
+        let logText = String(data: logData, encoding: .utf8) ?? ""
+        let tail = logText.split(separator: "\n").suffix(40).joined(separator: "\n")
+        throw AIReviewerError.commandFailed("cursor agent exited with status \(process.terminationStatus)\n\(tail)")
+    }
+
+    guard FileManager.default.fileExists(atPath: outputURL.path) else {
+        throw AIReviewerError.missingPath(outputURL.path)
+    }
+}
+
+func runReviewExecution(
+    config: AppConfig,
+    bundleURL: URL,
+    prompt: String,
+    model: String?,
+    outputURL: URL,
+    logURL: URL,
+    homeURL: URL,
+    tmpURL: URL
+) throws {
+    switch config.resolvedAIProvider {
+    case .codex:
+        try runCodexExecution(
+            config: config,
+            bundleURL: bundleURL,
+            prompt: prompt,
+            model: model,
+            outputURL: outputURL,
+            logURL: logURL,
+            homeURL: homeURL,
+            tmpURL: tmpURL
+        )
+    case .cursor:
+        try runCursorExecution(
+            config: config,
+            bundleURL: bundleURL,
+            prompt: prompt,
+            model: model,
+            outputURL: outputURL,
+            logURL: logURL,
+            homeURL: homeURL,
+            tmpURL: tmpURL
+        )
+    }
+}
+
+func profileAgentPrompt(config: AppConfig, bundleURL: URL, profile: ReviewProfile, agent: ReviewAgentProfile, snapshotByteLimit: Int) throws -> String {
     let manifestData = try Data(contentsOf: bundleURL.appendingPathComponent("bundle.json"))
     let changedFilesData = try Data(contentsOf: bundleURL.appendingPathComponent("changed-files.json"))
     let commitText = try String(contentsOf: bundleURL.appendingPathComponent("commit.txt"), encoding: .utf8)
@@ -1451,7 +1667,7 @@ func profileAgentPrompt(bundleURL: URL, profile: ReviewProfile, agent: ReviewAge
     let snapshotsText = snapshotPromptText(bundleURL: bundleURL, byteLimit: snapshotByteLimit)
 
     return """
-    You are Codex running an isolated read-only specialist review against a local AI Reviewer bundle.
+    You are \(reviewAgentIdentity(config: config)) running an isolated read-only specialist review against a local AI Reviewer bundle.
 
     Security boundary:
     - Your working directory is the local bundle directory.
@@ -1620,16 +1836,17 @@ func runProfileAgents(
                 let output = bundleURL.appendingPathComponent("agent-\(safeAgentID).md")
                 let log = bundleURL.appendingPathComponent("agent-\(safeAgentID).log")
                 let prompt = try profileAgentPrompt(
+                    config: config,
                     bundleURL: bundleURL,
                     profile: profile,
                     agent: agent,
                     snapshotByteLimit: config.promptSnapshotByteLimit
                 )
-                try runCodexExecution(
+                try runReviewExecution(
                     config: config,
                     bundleURL: bundleURL,
                     prompt: prompt,
-                    model: agent.model ?? config.codexModel ?? profile.defaultModel,
+                    model: resolvedReviewModel(config: config, profile: profile, agent: agent),
                     outputURL: output,
                     logURL: log,
                     homeURL: agentURL.appendingPathComponent("home"),
@@ -2517,12 +2734,16 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var activeManualCommits = Set<String>()
     private var hasStatusIssue = false
     private var advancedSettingsVisible = false
+    private var configuredAIProvider: AIProvider = .codex
 
     private let repoField = NSTextField()
     private let reportsField = NSTextField()
     private let cacheField = NSTextField()
     private let codexHomeField = NSTextField()
     private let codexModelField = NSTextField()
+    private let aiProviderPopup = NSPopUpButton()
+    private let cursorHomeField = NSTextField()
+    private let cursorModelField = NSTextField()
     private let reviewProfileField = NSTextField()
     private let statePathField = NSTextField()
     private let pollIntervalField = NSTextField()
@@ -3033,6 +3254,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         form.addArrangedSubview(row(label: "Review Instructions", field: reviewProfileField, buttonTitle: "Choose", action: #selector(chooseReviewProfile)))
 
         form.addArrangedSubview(sectionHeader("Automation"))
+        form.addArrangedSubview(providerRow())
         form.addArrangedSubview(row(label: "Reviews at Once", field: maxParallelCommitReviewsField))
         form.addArrangedSubview(row(label: "Agents per Review", field: maxParallelField))
         form.addArrangedSubview(checkboxRow(startWatcherOnLaunchCheckbox))
@@ -3049,8 +3271,13 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         if advancedSettingsVisible {
             form.addArrangedSubview(sectionHeader("Advanced"))
             form.addArrangedSubview(row(label: "Cache Folder", field: cacheField))
-            form.addArrangedSubview(row(label: "Codex Home", field: codexHomeField))
-            form.addArrangedSubview(row(label: "Codex Model", field: codexModelField))
+            if selectedAIProvider() == .codex {
+                form.addArrangedSubview(row(label: "Codex Home", field: codexHomeField))
+                form.addArrangedSubview(row(label: "Codex Model", field: codexModelField))
+            } else {
+                form.addArrangedSubview(row(label: "Cursor Home", field: cursorHomeField))
+                form.addArrangedSubview(row(label: "Cursor Model", field: cursorModelField))
+            }
             form.addArrangedSubview(row(label: "State File", field: statePathField))
             form.addArrangedSubview(row(label: "Poll Seconds", field: pollIntervalField))
             form.addArrangedSubview(row(label: "History Depth", field: sweepDepthField))
@@ -3089,6 +3316,39 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         scroll.documentView = container
         container.frame = NSRect(x: 0, y: 0, width: 940, height: advancedSettingsVisible ? 780 : 360)
         return scroll
+    }
+
+    private func providerRow() -> NSView {
+        aiProviderPopup.removeAllItems()
+        aiProviderPopup.addItems(withTitles: ["Codex", "Cursor (Composer 2.5)"])
+        aiProviderPopup.selectItem(at: configuredAIProvider == .cursor ? 1 : 0)
+        aiProviderPopup.target = self
+        aiProviderPopup.action = #selector(aiProviderChanged)
+        aiProviderPopup.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        aiProviderPopup.translatesAutoresizingMaskIntoConstraints = false
+        aiProviderPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 430).isActive = true
+
+        let stack = NSStackView()
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 10
+
+        let labelView = NSTextField(labelWithString: "Review Engine")
+        labelView.alignment = .right
+        labelView.widthAnchor.constraint(equalToConstant: 140).isActive = true
+        stack.addArrangedSubview(labelView)
+        stack.addArrangedSubview(aiProviderPopup)
+        return stack
+    }
+
+    private func selectedAIProvider() -> AIProvider {
+        aiProviderPopup.indexOfSelectedItem == 1 ? .cursor : .codex
+    }
+
+    @objc private func aiProviderChanged() {
+        commitFieldEditing()
+        configuredAIProvider = selectedAIProvider()
+        replaceContent(with: buildSettingsView())
     }
 
     private func sectionHeader(_ title: String) -> NSTextField {
@@ -3530,6 +3790,9 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         cacheField.stringValue = config.reviewCachePath
         codexHomeField.stringValue = config.codexHome
         codexModelField.stringValue = config.codexModel ?? ""
+        configuredAIProvider = config.resolvedAIProvider
+        cursorHomeField.stringValue = config.resolvedCursorHome
+        cursorModelField.stringValue = config.resolvedCursorModel
         reviewProfileField.stringValue = config.reviewProfilePath ?? ""
         statePathField.stringValue = config.statePath ?? ""
         pollIntervalField.stringValue = "\(config.pollIntervalSeconds)"
@@ -3579,6 +3842,9 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             reviewCachePath: cacheField.stringValue,
             maxSnapshotBytes: max(1, maxSnapshot),
             codexModel: codexModelField.stringValue.isEmpty ? nil : codexModelField.stringValue,
+            aiProvider: selectedAIProvider().rawValue,
+            cursorHome: cursorHomeField.stringValue.isEmpty ? nil : cursorHomeField.stringValue,
+            cursorModel: cursorModelField.stringValue.isEmpty ? nil : cursorModelField.stringValue,
             reviewProfilePath: reviewProfileField.stringValue.isEmpty ? nil : reviewProfileField.stringValue,
             statePath: statePathField.stringValue.isEmpty ? nil : statePathField.stringValue,
             reviewCurrentHeadOnStartup: reviewStartupCheckbox.state == .on,

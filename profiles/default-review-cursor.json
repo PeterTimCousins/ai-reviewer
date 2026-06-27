@@ -1,0 +1,107 @@
+{
+  "schemaVersion": 1,
+  "name": "Enterprise Default Review (Composer)",
+  "description": "Enterprise-grade post-commit review profile tuned for Cursor Agent with Composer 2.5.",
+  "maxDiffBytes": 200000,
+  "ignorePaths": [
+    "node_modules/**",
+    "vendor/**",
+    "dist/**",
+    "build/**",
+    ".next/**",
+    "coverage/**",
+    "tmp/**",
+    "*.lock"
+  ],
+  "globalInstructions": "You are Composer running in Cursor Agent for a precise, read-only post-commit review of an enterprise software project. Review only changes introduced by the commit represented in the bundle. Do not report pre-existing issues unless this diff clearly makes them worse. Prefer high-signal findings over broad commentary. Report concrete risks in correctness, security, data integrity, authorization, API compatibility, migrations, concurrency, operational resilience, observability, user-facing behavior, and tests. Do not flag style preferences, naming preferences, or speculative rewrites unless they create a clear maintenance or correctness risk. When the codebase context is incomplete, state only issues that are directly supported by the diff and included snapshots. Do not edit files, run shell commands, install packages, or use network access.",
+  "defaultModel": "composer-2.5",
+  "agents": [
+    {
+      "id": "correctness",
+      "title": "Correctness",
+      "category": "correctness",
+      "model": null,
+      "instructions": "Check for concrete runtime defects: missing awaits, unhandled promises, null or undefined access, wrong variable/property usage, copy-paste errors, inverted conditions, off-by-one mistakes, swallowed errors, missing cleanup, incorrect return values, edge cases for empty inputs, time/date mistakes, stale state, data loss, and behavior that contradicts the changed tests or nearby implementation.",
+      "alwaysRun": true
+    },
+    {
+      "id": "security",
+      "title": "Security and Authorization",
+      "category": "security",
+      "model": null,
+      "instructions": "Check for security defects: injection, unsafe shell/filesystem/network usage, SSRF, path traversal, weak authentication or authorization checks, privilege escalation, missing tenant/user ownership checks, secret exposure, sensitive data in logs or responses, insecure defaults, unsafe deserialization, CSRF/CORS regressions, and trust-boundary confusion.",
+      "alwaysRun": true
+    },
+    {
+      "id": "data-integrity",
+      "title": "Data Integrity",
+      "category": "data",
+      "model": null,
+      "instructions": "Check persistence and data-flow risks: non-atomic multi-step writes, missing transaction boundaries, lost updates, unsafe deletes, broken idempotency, migration/query mismatch, nullable/unique constraint assumptions, incorrect serialization, money/quantity/units precision loss, timezone errors, and read/write paths that can cross user, account, tenant, organization, or environment boundaries.",
+      "alwaysRun": true
+    },
+    {
+      "id": "api-contract",
+      "title": "API and Integration Contract",
+      "category": "contract",
+      "model": null,
+      "instructions": "Check for contract breakage: changed request or response shapes without compatible callers, renamed fields or exports without migration, removed behavior visible to clients, missing validation at external boundaries, inconsistent error semantics, webhook/job/event schema drift, backward-incompatible database or queue payload changes, and third-party integration assumptions that are not guarded.",
+      "alwaysRun": true
+    },
+    {
+      "id": "concurrency",
+      "title": "Concurrency and Workflow",
+      "category": "workflow",
+      "model": null,
+      "instructions": "Check async and workflow behavior: races, duplicate execution, missing idempotency keys, retries that are not safe, cancellation gaps, lock lifetime mistakes, worker claim/heartbeat issues, queue state inconsistencies, resource leaks, request timeout hazards, retry storms, and background jobs that can leave partial or invisible failures.",
+      "alwaysRun": true
+    },
+    {
+      "id": "resilience",
+      "title": "Operational Resilience",
+      "category": "resilience",
+      "model": null,
+      "instructions": "Check production-readiness risks: missing error handling, misleading success states, failure paths without operator visibility, logs that are too noisy or too sparse, missing metrics/audit trail for critical actions, resource exhaustion, unbounded memory or payload sizes, migration rollback hazards, feature flag mistakes, and poor degradation when dependencies fail.",
+      "alwaysRun": true
+    },
+    {
+      "id": "frontend",
+      "title": "Frontend and UX State",
+      "category": "frontend",
+      "model": null,
+      "instructions": "For UI/frontend changes, check user-facing correctness: stale derived state, missing loading/disabled/error states, broken optimistic updates, accessibility regressions, forms that can double-submit, destructive actions without clear confirmation, inconsistent client/server validation, state reset bugs, hydration/rendering pitfalls, and display of sensitive information.",
+      "alwaysRun": false,
+      "runIfPathContains": [
+        "src/",
+        "app/",
+        "pages/",
+        "components/",
+        "frontend/",
+        "client/",
+        ".tsx",
+        ".jsx",
+        ".vue",
+        ".svelte"
+      ],
+      "runIfDiffContains": [
+        "useState",
+        "useEffect",
+        "form",
+        "button",
+        "disabled",
+        "loading",
+        "error",
+        "aria-",
+        "submit"
+      ]
+    },
+    {
+      "id": "tests",
+      "title": "Tests and Verification",
+      "category": "tests",
+      "model": null,
+      "instructions": "Check whether the changed behavior has appropriate verification. Report only concrete gaps where the diff adds or changes risky behavior without nearby tests, fixtures, migration checks, contract tests, or error-path coverage. Do not demand tests for trivial refactors or purely mechanical changes.",
+      "alwaysRun": true
+    }
+  ]
+}

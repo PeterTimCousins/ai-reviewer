@@ -10,7 +10,7 @@ The intended model is:
    removable volumes.
 3. For each commit, the app materializes a local review bundle containing only
    commit metadata, diffs, and capped changed-file snapshots.
-4. Codex runs only against that local bundle with a stripped environment,
+4. Codex or Cursor Agent runs only against that local bundle with a stripped environment,
    read-only sandboxing, non-interactive approvals, and the configured review
    profile instructions.
 5. The app copies the final review report back to the configured reports path.
@@ -32,7 +32,7 @@ This is early-stage software. The current app can:
 - manually queue a rerun for a selected commit
 - watch a repository HEAD in the foreground from the CLI
 - materialize the current HEAD into a local cache bundle
-- run Codex against a local cache bundle with a stripped environment
+- run Codex or Cursor Agent against a local cache bundle with a stripped environment
 - run profile-driven specialist reviews from bundled or user-selected JSON
   profiles
 - copy completed review reports back to the configured reports directory
@@ -58,9 +58,16 @@ build/AI\ Reviewer.app/Contents/MacOS/ai-reviewer-watcher review-once --config c
 use and contains placeholder paths only.
 
 Review profiles live under `profiles/`. A blank `reviewProfilePath` uses the
-bundled default profile. To use a specific profile, set `reviewProfilePath` to
-an absolute path or choose a JSON profile in the settings window. Private
-repo-specific profiles can live under ignored `profiles/local/`.
+bundled default profile for the selected review engine (`default-review.json` for
+Codex, `default-review-cursor.json` for Cursor/Composer 2.5). To use a specific
+profile, set `reviewProfilePath` to an absolute path or choose a JSON profile in
+the settings window. Private repo-specific profiles can live under ignored
+`profiles/local/`.
+
+Set `aiProvider` to `cursor` (or choose **Cursor (Composer 2.5)** in Settings)
+to run reviews through the Cursor Agent CLI instead of Codex. The app still
+materializes bundles and keeps the AI away from the live repository; only the
+executor and bundled instruction profile change.
 
 Open the manager window with:
 
@@ -225,12 +232,13 @@ covers:
 - watched repository
 - reports path inside that repository
 - Review profile path
+- review engine (Codex or Cursor/Composer 2.5)
 - max concurrent commit reviews
 - max agents per review
 - start watching when app opens
 - hide Dock icon
 - launch at login
-- cache path, Codex home, Codex model, state path, polling, history, retry,
+- cache path, Codex home, Codex model, Cursor home, Cursor model, state path, polling, history, retry,
   timeout, cache retention, and snapshot limits in Advanced
 - materialize/review bundle development actions in Advanced
 - watcher enabled/disabled and recent review state
@@ -253,4 +261,6 @@ Bundled profiles:
 
 - `profiles/default-review.json`: general-purpose enterprise review with
   correctness, security, data integrity, contract, workflow, resilience,
-  frontend, and test specialists
+  frontend, and test specialists (Codex)
+- `profiles/default-review-cursor.json`: same specialist layout tuned for Cursor
+  Agent with Composer 2.5
