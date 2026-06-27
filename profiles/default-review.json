@@ -2,6 +2,7 @@
   "schemaVersion": 1,
   "name": "Enterprise Default Review",
   "description": "Generic enterprise-grade post-commit review profile for teams that have not configured a project-specific profile yet.",
+  "provider": "codex",
   "maxDiffBytes": 200000,
   "ignorePaths": [
     "node_modules/**",

@@ -2,6 +2,7 @@
   "schemaVersion": 1,
   "name": "Enterprise Default Review (Composer)",
   "description": "Enterprise-grade post-commit review profile tuned for Cursor Agent with Composer 2.5.",
+  "provider": "cursor",
   "maxDiffBytes": 200000,
   "ignorePaths": [
     "node_modules/**",

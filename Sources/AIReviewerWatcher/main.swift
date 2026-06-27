@@ -141,6 +141,47 @@ enum AIProvider: String, Codable, Sendable {
     case cursor
 }
 
+let bundleReviewFilename = "review.md"
+let legacyBundleReviewFilename = "codex-review.md"
+let bundleReviewLogFilename = "ai.log"
+let legacyBundleReviewLogFilename = "codex.log"
+
+func bundleReviewURL(bundleURL: URL) -> URL {
+    bundleURL.appendingPathComponent(bundleReviewFilename)
+}
+
+func resolveBundleReviewURL(bundleURL: URL) -> URL? {
+    let current = bundleReviewURL(bundleURL: bundleURL)
+    if FileManager.default.fileExists(atPath: current.path) {
+        return current
+    }
+
+    let legacy = bundleURL.appendingPathComponent(legacyBundleReviewFilename)
+    if FileManager.default.fileExists(atPath: legacy.path) {
+        return legacy
+    }
+
+    return nil
+}
+
+func bundleReviewLogURL(bundleURL: URL) -> URL {
+    bundleURL.appendingPathComponent(bundleReviewLogFilename)
+}
+
+func resolveBundleReviewLogURL(bundleURL: URL) -> URL? {
+    let current = bundleReviewLogURL(bundleURL: bundleURL)
+    if FileManager.default.fileExists(atPath: current.path) {
+        return current
+    }
+
+    let legacy = bundleURL.appendingPathComponent(legacyBundleReviewLogFilename)
+    if FileManager.default.fileExists(atPath: legacy.path) {
+        return legacy
+    }
+
+    return nil
+}
+
 struct AppConfig: Codable, Sendable {
     var repoPath: String
     var reportsPath: String
@@ -282,11 +323,20 @@ struct ReviewProfile: Codable, Sendable {
     var schemaVersion: Int
     var name: String
     var description: String?
+    var provider: String?
     var maxDiffBytes: Int?
     var ignorePaths: [String]
     var globalInstructions: String
     var defaultModel: String?
     var agents: [ReviewAgentProfile]
+
+    var resolvedProvider: AIProvider? {
+        guard let provider, !provider.isEmpty else {
+            return nil
+        }
+
+        return AIProvider(rawValue: provider)
+    }
 }
 
 struct ReviewAgentProfile: Codable, Sendable {
@@ -620,6 +670,7 @@ func defaultReviewProfile(config: AppConfig) -> ReviewProfile {
         schemaVersion: 1,
         name: "Enterprise Default Review",
         description: "Generic enterprise-grade post-commit review profile.",
+        provider: config.resolvedAIProvider.rawValue,
         maxDiffBytes: 200_000,
         ignorePaths: [],
         globalInstructions: """
@@ -664,22 +715,36 @@ func defaultReviewProfile(config: AppConfig) -> ReviewProfile {
     )
 }
 
+func validateReviewProfile(_ profile: ReviewProfile, for config: AppConfig) throws {
+    guard let profileProvider = profile.resolvedProvider else {
+        return
+    }
+
+    guard profileProvider == config.resolvedAIProvider else {
+        throw AIReviewerError.invalidConfig(
+            "Review profile '\(profile.name)' is for \(profileProvider.rawValue), but the configured review engine is \(config.resolvedAIProvider.rawValue)"
+        )
+    }
+}
+
 func loadReviewProfile(config: AppConfig) throws -> ReviewProfile {
     let decoder = JSONDecoder()
+    let profile: ReviewProfile
 
     if let profilePath = config.reviewProfilePath, !profilePath.isEmpty {
         let url = URL(fileURLWithPath: expandedPath(profilePath))
         let data = try Data(contentsOf: url)
-        return try decoder.decode(ReviewProfile.self, from: data)
-    }
-
-    if let url = bundledProfileURL(name: defaultBundledProfileName(config: config)),
-       FileManager.default.fileExists(atPath: url.path) {
+        profile = try decoder.decode(ReviewProfile.self, from: data)
+    } else if let url = bundledProfileURL(name: defaultBundledProfileName(config: config)),
+              FileManager.default.fileExists(atPath: url.path) {
         let data = try Data(contentsOf: url)
-        return try decoder.decode(ReviewProfile.self, from: data)
+        profile = try decoder.decode(ReviewProfile.self, from: data)
+    } else {
+        profile = defaultReviewProfile(config: config)
     }
 
-    return defaultReviewProfile(config: config)
+    try validateReviewProfile(profile, for: config)
+    return profile
 }
 
 func isoNow() -> String {
@@ -775,7 +840,11 @@ func bundlesURL(config: AppConfig) -> URL {
     cacheURL(config: config).appendingPathComponent("bundles")
 }
 
-func codexRunsURL(config: AppConfig) -> URL {
+func aiRunsURL(config: AppConfig) -> URL {
+    cacheURL(config: config).appendingPathComponent("ai-runs")
+}
+
+func legacyCodexRunsURL(config: AppConfig) -> URL {
     cacheURL(config: config).appendingPathComponent("codex-runs")
 }
 
@@ -813,6 +882,7 @@ func validationSummary(config: AppConfig) throws -> String {
     cursorHome: \(expandedPath(config.resolvedCursorHome))
     cursorModel: \(config.resolvedCursorModel)
     reviewProfile: \(profile.name)
+    reviewProfileProvider: \(profile.resolvedProvider?.rawValue ?? "(unspecified)")
     head: \(head)
     branch: \(branch.isEmpty ? "(detached)" : branch)
     maxParallelAgentsPerReview: \(config.maxParallelReviews)
@@ -1053,12 +1123,14 @@ func trimCacheDirectory(
 }
 
 func cleanupReviewCache(config: AppConfig) throws {
-    try trimCacheDirectory(
-        codexRunsURL(config: config),
-        keepLatest: config.codexRunCacheEntryLimit,
-        minimumAgeSeconds: config.codexRunCacheMinimumAgeSeconds,
-        skipRecentActiveRunMarkers: true
-    )
+    for runsURL in [aiRunsURL(config: config), legacyCodexRunsURL(config: config)] {
+        try trimCacheDirectory(
+            runsURL,
+            keepLatest: config.codexRunCacheEntryLimit,
+            minimumAgeSeconds: config.codexRunCacheMinimumAgeSeconds,
+            skipRecentActiveRunMarkers: true
+        )
+    }
     try trimCacheDirectory(bundlesURL(config: config), keepLatest: config.bundleCacheEntryLimit)
 }
 
@@ -1288,7 +1360,7 @@ func runCodexPrompt(config: AppConfig, bundleURL: URL) -> String {
 }
 
 func runCodex(config: AppConfig, bundleURL: URL) throws -> URL {
-    let runRoot = codexRunsURL(config: config)
+    let runRoot = aiRunsURL(config: config)
     let runID = "\(bundleURL.lastPathComponent)-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString)"
     let runURL = runRoot.appendingPathComponent(runID)
     try createActiveRunMarker(runURL: runURL)
@@ -1297,8 +1369,8 @@ func runCodex(config: AppConfig, bundleURL: URL) throws -> URL {
     }
     let homeURL = runURL.appendingPathComponent("home")
     let tmpURL = runURL.appendingPathComponent("tmp")
-    let outputURL = bundleURL.appendingPathComponent("codex-review.md")
-    let logURL = bundleURL.appendingPathComponent("codex.log")
+    let outputURL = bundleReviewURL(bundleURL: bundleURL)
+    let logURL = bundleReviewLogURL(bundleURL: bundleURL)
     let prompt = runCodexPrompt(config: config, bundleURL: bundleURL)
 
     try runReviewExecution(
@@ -1312,8 +1384,8 @@ func runCodex(config: AppConfig, bundleURL: URL) throws -> URL {
         tmpURL: tmpURL
     )
 
-    print("codexReview: \(outputURL.path)")
-    print("codexLog: \(logURL.path)")
+    print("review: \(outputURL.path)")
+    print("reviewLog: \(logURL.path)")
     return outputURL
 }
 
@@ -1760,8 +1832,8 @@ func snapshotPromptText(bundleURL: URL, byteLimit: Int) -> String {
 }
 
 func runReviewProfile(config: AppConfig, bundleURL: URL, profile: ReviewProfile) throws -> URL {
-    let outputURL = bundleURL.appendingPathComponent("codex-review.md")
-    let runRoot = codexRunsURL(config: config)
+    let outputURL = bundleReviewURL(bundleURL: bundleURL)
+    let runRoot = aiRunsURL(config: config)
     let runID = "\(bundleURL.lastPathComponent)-profile-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString)"
     let runURL = runRoot.appendingPathComponent(runID)
     try createActiveRunMarker(runURL: runURL)
@@ -1789,7 +1861,7 @@ func runReviewProfile(config: AppConfig, bundleURL: URL, profile: ReviewProfile)
     let findings = requiredFindings(from: outputs)
     let manifest = try loadBundleManifest(bundleURL: bundleURL)
     try writeData(Data(profileReviewText(manifest: manifest, profile: profile, agents: agents, findings: findings).utf8), to: outputURL)
-    print("codexReview: \(outputURL.path)")
+    print("review: \(outputURL.path)")
     return outputURL
 }
 
@@ -2303,8 +2375,17 @@ func logPathForReviewPath(_ path: String?) -> String? {
     }
 
     let url = URL(fileURLWithPath: path)
-    let name = url.deletingPathExtension().lastPathComponent + ".log"
-    return url.deletingLastPathComponent().appendingPathComponent(name).path
+    let directory = url.deletingLastPathComponent()
+    if let bundleLog = resolveBundleReviewLogURL(bundleURL: directory)?.path {
+        return bundleLog
+    }
+
+    let derived = directory.appendingPathComponent(url.deletingPathExtension().lastPathComponent + ".log").path
+    if FileManager.default.fileExists(atPath: derived) {
+        return derived
+    }
+
+    return nil
 }
 
 func preferredReviewPath(_ record: ReviewRecord) -> String? {
@@ -2313,6 +2394,12 @@ func preferredReviewPath(_ record: ReviewRecord) -> String? {
     }
     if FileManager.default.fileExists(atPath: record.localReviewPath) {
         return record.localReviewPath
+    }
+    if !record.bundlePath.isEmpty {
+        let bundleURL = URL(fileURLWithPath: record.bundlePath, isDirectory: true)
+        if let resolved = resolveBundleReviewURL(bundleURL: bundleURL) {
+            return resolved.path
+        }
     }
     return record.copiedReportPath
 }

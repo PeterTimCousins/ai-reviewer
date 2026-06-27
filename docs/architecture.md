@@ -39,7 +39,7 @@ repo-local agent files or scripts from the watched repository.
 4. Materialize a bundle under `~/Library/Caches/com.ai-reviewer/bundles/<sha>/`.
 5. Copy the active review profile into the bundle as `review-profile.json`.
 6. Run Codex specialists from the profile against the bundle, not the live repo.
-7. Write the final report locally as `codex-review.md`.
+7. Write the final report locally as `review.md`.
 8. Copy the report back to `<repoPath>/<reportsPath>/`.
 9. Record the SHA in local state.
 
@@ -113,7 +113,7 @@ Build a minimal app plus foreground CLI that:
    scratch `HOME`, scratch `TMPDIR`, narrowed per-run `CODEX_HOME`, minimal
    `PATH`, read-only sandbox, ephemeral execution, ignored user config, and
    ignored repo rules.
-7. Write Codex output to the local cache first as `codex-review.md`, then have
+7. Write AI output to the local cache first as `review.md`, then have
    AI Reviewer copy the final report back to the configured repo reports path.
 8. Define review behavior through JSON profiles with global instructions,
    specialist agents, model overrides, ignore paths, and size gates.

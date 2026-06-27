@@ -119,14 +119,17 @@ The bundle contains:
 
 `run-codex` writes:
 
-- `codex-review.md`
-- `codex.log`
+- `review.md`
+- `ai.log`
+
+Legacy Codex bundles may still contain `codex-review.md` and `codex.log`; the app
+reads those when present.
 
 `review-head` materializes the current HEAD, then runs the configured review
 profile against that bundle.
 
 `review-once` materializes HEAD, runs the configured review profile, copies
-`codex-review.md` back to the configured reports path, and records the SHA in
+`review.md` back to the configured reports path, and records the SHA in
 local state. Already reviewed SHAs are skipped.
 
 `watch` runs in the foreground and reviews pending commits when HEAD changes.
@@ -148,8 +151,9 @@ is also bounded before buffering when a profile sets `maxDiffBytes`. Snapshot
 content is capped again in aggregate by `maxPromptSnapshotBytes` before being
 embedded in specialist prompts.
 
-Codex scratch runs under `codex-runs` are transient and removed after each
-Codex process finishes. Startup/review cleanup also trims old scratch and bundle
+AI scratch runs under `ai-runs` are transient and removed after each
+review subprocess finishes. Legacy `codex-runs` directories are trimmed too.
+Startup/review cleanup also trims old scratch and bundle
 directories according to `maxCodexRunCacheEntries` and `maxBundleCacheEntries`.
 Defaults keep no scratch runs and the latest 200 bundles.
 
@@ -250,12 +254,14 @@ A review profile is a JSON file that defines:
 - ignored paths, such as generated report folders
 - maximum reviewable diff bytes
 - global review instructions
+- optional `provider` (`codex` or `cursor`) to match the selected review engine
 - specialist agents, categories, optional model overrides, and conditional
   activation rules
 
 AI Reviewer copies the active profile into each local bundle as
-`review-profile.json`. Specialist Codex runs receive the profile instructions
-through prompts while their working directory remains the local bundle.
+`review-profile.json`. If a profile sets `provider`, it must match the configured
+review engine. Specialist runs receive the profile instructions through prompts
+while their working directory remains the local bundle.
 
 Bundled profiles:
 
