@@ -85,7 +85,8 @@ Build a minimal app plus foreground CLI that:
   `CODEX_HOME`, so prompt-controlled reads cannot traverse into the watched
   repository or the user's full Codex home.
 - Caps aggregate snapshot prompt content with `maxPromptSnapshotBytes` before
-  passing snapshots to profile agents.
+  passing snapshots to profile agents. The default is 150000 bytes to keep
+  specialist prompts below the failure-prone oversized range.
 - Copies successful reports back through AI Reviewer and records reviewed or
   failed SHAs in local state.
 - Validates repositories through Git so linked worktrees are accepted, and
@@ -129,8 +130,8 @@ over the same operations used by the CLI:
 
 - choose watched repository with `NSOpenPanel`
 - configure reports path, cache path, Codex home, poll interval, commit-review
-  concurrency, per-review agent concurrency, Codex timeout, and prompt snapshot
-  limits
+  concurrency, per-review agent concurrency, Codex timeout, max reviewable diff
+  bytes, and prompt snapshot limits
 - choose a review profile JSON file
 - validate permissions and Git status
 - materialize HEAD and run a local-bundle Codex review

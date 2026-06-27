@@ -147,14 +147,17 @@ stable.
 Codex runs are terminated after `codexTimeoutSeconds`; the default is 30
 minutes. File snapshots are capped individually by `maxSnapshotBytes` during
 bundle materialization, with Git output bounded before buffering. Diff output
-is also bounded before buffering when a profile sets `maxDiffBytes`. Snapshot
-content is capped again in aggregate by `maxPromptSnapshotBytes` before being
-embedded in specialist prompts.
+is also bounded before buffering by the active `maxDiffBytes` value: the app
+setting overrides the review profile default when present. Snapshot content is
+capped again in aggregate by `maxPromptSnapshotBytes` before being embedded in
+specialist prompts; the default is 150000 bytes.
 
 AI scratch runs under `ai-runs` are transient and removed after each
 review subprocess finishes. Legacy `codex-runs` directories are trimmed too.
 Startup/review cleanup also trims old scratch and bundle
-directories according to `maxCodexRunCacheEntries` and `maxBundleCacheEntries`.
+directories according to `maxCodexRunCacheEntries` and `maxBundleCacheEntries`,
+and abandoned active-run markers stop protecting scratch directories after the
+configured review timeout plus a short grace period.
 Defaults keep no scratch runs and the latest 200 bundles.
 
 Validation accepts normal Git worktrees, including linked `git worktree`
@@ -224,7 +227,8 @@ The selected commit can be manually rerun, which intentionally clears that
 commit's reviewed/failed/skipped ledger entries before running the review again.
 Manual reruns enter an in-app queue. `maxParallelCommitReviews` controls how
 many whole commit reviews may run at once; the default is `1`. `maxParallelReviews`
-controls specialist-agent concurrency inside one commit review.
+controls how many specialist agents may run at once inside one commit
+review.
 
 The **Logs** view tails the watcher log from
 `~/Library/Logs/com.ai-reviewer/watcher.log`.
@@ -243,7 +247,7 @@ covers:
 - hide Dock icon
 - launch at login
 - cache path, Codex home, Codex model, Cursor home, Cursor model, state path, polling, history, retry,
-  timeout, cache retention, and snapshot limits in Advanced
+  timeout, cache retention, max diff bytes, and snapshot limits in Advanced
 - materialize/review bundle development actions in Advanced
 - watcher enabled/disabled and recent review state
 
@@ -252,7 +256,8 @@ covers:
 A review profile is a JSON file that defines:
 
 - ignored paths, such as generated report folders
-- maximum reviewable diff bytes
+- default maximum reviewable diff bytes, overridden by the app-level
+  `maxDiffBytes` setting when present
 - global review instructions
 - optional `provider` (`codex` or `cursor`) to match the selected review engine
 - specialist agents, categories, optional model overrides, and conditional

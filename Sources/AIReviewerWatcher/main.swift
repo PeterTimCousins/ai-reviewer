@@ -72,6 +72,40 @@ final class FileLock {
     }
 }
 
+final class ReviewExecutionCoordinator: @unchecked Sendable {
+    static let shared = ReviewExecutionCoordinator()
+
+    private let condition = NSCondition()
+    private var activeReviewCount = 0
+
+    private init() {}
+
+    func withSlot<T>(limit: Int, _ work: () throws -> T) rethrows -> T {
+        acquire(limit: limit)
+        defer {
+            release()
+        }
+        return try work()
+    }
+
+    private func acquire(limit: Int) {
+        let slotLimit = max(1, limit)
+        condition.lock()
+        while activeReviewCount >= slotLimit {
+            condition.wait()
+        }
+        activeReviewCount += 1
+        condition.unlock()
+    }
+
+    private func release() {
+        condition.lock()
+        activeReviewCount = max(0, activeReviewCount - 1)
+        condition.signal()
+        condition.unlock()
+    }
+}
+
 final class PipeBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var data = Data()
@@ -196,6 +230,7 @@ struct AppConfig: Codable, Sendable {
     var cursorHome: String?
     var cursorModel: String?
     var reviewProfilePath: String?
+    var maxDiffBytes: Int?
     var statePath: String?
     var reviewCurrentHeadOnStartup: Bool?
     var startWatcherOnLaunch: Bool?
@@ -212,7 +247,14 @@ struct AppConfig: Codable, Sendable {
     }
 
     var promptSnapshotByteLimit: Int {
-        max(1, maxPromptSnapshotBytes ?? 500_000)
+        max(1, maxPromptSnapshotBytes ?? 150_000)
+    }
+
+    var reviewDiffByteLimit: Int? {
+        guard let maxDiffBytes, maxDiffBytes > 0 else {
+            return nil
+        }
+        return maxDiffBytes
     }
 
     var shouldReviewCurrentHeadOnStartup: Bool {
@@ -241,6 +283,10 @@ struct AppConfig: Codable, Sendable {
 
     var commitReviewConcurrency: Int {
         max(1, maxParallelCommitReviews ?? 1)
+    }
+
+    var agentReviewConcurrency: Int {
+        max(1, maxParallelReviews)
     }
 
     var codexRunCacheEntryLimit: Int {
@@ -287,6 +333,7 @@ func defaultConfig() -> AppConfig {
         cursorHome: "~/.cursor",
         cursorModel: "composer-2.5",
         reviewProfilePath: nil,
+        maxDiffBytes: nil,
         statePath: nil,
         reviewCurrentHeadOnStartup: false,
         startWatcherOnLaunch: true,
@@ -294,7 +341,7 @@ func defaultConfig() -> AppConfig {
         sweepDepth: 50,
         retryFailedAfterSeconds: 3_600,
         codexTimeoutSeconds: 1_800,
-        maxPromptSnapshotBytes: 500_000,
+        maxPromptSnapshotBytes: 150_000,
         maxCodexRunCacheEntries: 0,
         maxBundleCacheEntries: 200
     )
@@ -600,6 +647,46 @@ func reviewCommitLockURL(commit: String) -> URL {
         .appendingPathComponent("\(commit).lock")
 }
 
+func activeReviewLockDetails(for commits: [String]) -> [String: String] {
+    var details: [String: String] = [:]
+
+    for commit in commits {
+        let url = reviewCommitLockURL(commit: commit)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            continue
+        }
+
+        let fd = open(url.path, O_RDONLY)
+        guard fd >= 0 else {
+            continue
+        }
+
+        if flock(fd, LOCK_EX | LOCK_NB) == 0 {
+            _ = flock(fd, LOCK_UN)
+            close(fd)
+            continue
+        }
+
+        let lockErrno = errno
+        close(fd)
+
+        guard lockErrno == EWOULDBLOCK || lockErrno == EAGAIN else {
+            continue
+        }
+
+        let owner = (try? String(contentsOf: url, encoding: .utf8))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            ?? ""
+        if owner.isEmpty {
+            details[commit] = "Review is currently running in another AI Reviewer process."
+        } else {
+            details[commit] = "Review is currently running in process \(owner)."
+        }
+    }
+
+    return details
+}
+
 func appLogsURL() -> URL {
     FileManager.default
         .homeDirectoryForCurrentUser
@@ -727,11 +814,11 @@ func validateReviewProfile(_ profile: ReviewProfile, for config: AppConfig) thro
     }
 }
 
-func loadReviewProfile(config: AppConfig) throws -> ReviewProfile {
+func loadReviewProfile(path: String?, config: AppConfig) throws -> ReviewProfile {
     let decoder = JSONDecoder()
     let profile: ReviewProfile
 
-    if let profilePath = config.reviewProfilePath, !profilePath.isEmpty {
+    if let profilePath = path, !profilePath.isEmpty {
         let url = URL(fileURLWithPath: expandedPath(profilePath))
         let data = try Data(contentsOf: url)
         profile = try decoder.decode(ReviewProfile.self, from: data)
@@ -743,6 +830,14 @@ func loadReviewProfile(config: AppConfig) throws -> ReviewProfile {
         profile = defaultReviewProfile(config: config)
     }
 
+    return profile
+}
+
+func loadReviewProfile(config: AppConfig) throws -> ReviewProfile {
+    var profile = try loadReviewProfile(path: config.reviewProfilePath, config: config)
+    if let maxDiffBytes = config.reviewDiffByteLimit {
+        profile.maxDiffBytes = maxDiffBytes
+    }
     try validateReviewProfile(profile, for: config)
     return profile
 }
@@ -885,7 +980,7 @@ func validationSummary(config: AppConfig) throws -> String {
     reviewProfileProvider: \(profile.resolvedProvider?.rawValue ?? "(unspecified)")
     head: \(head)
     branch: \(branch.isEmpty ? "(detached)" : branch)
-    maxParallelAgentsPerReview: \(config.maxParallelReviews)
+    maxParallelAgentsPerReview: \(config.agentReviewConcurrency)
     maxParallelCommitReviews: \(config.commitReviewConcurrency)
     pollIntervalSeconds: \(config.pollIntervalSeconds)
     startWatcherOnLaunch: \(config.shouldStartWatcherOnLaunch)
@@ -894,6 +989,7 @@ func validationSummary(config: AppConfig) throws -> String {
     sweepDepth: \(config.reviewSweepDepth)
     retryFailedAfterSeconds: \(config.failedReviewRetrySeconds)
     codexTimeoutSeconds: \(config.codexRunTimeoutSeconds)
+    maxDiffBytes: \(profile.maxDiffBytes.map(String.init) ?? "unlimited")
     maxSnapshotBytes: \(config.snapshotByteLimit)
     maxPromptSnapshotBytes: \(config.promptSnapshotByteLimit)
     maxCodexRunCacheEntries: \(config.codexRunCacheEntryLimit)
@@ -1094,7 +1190,8 @@ func trimCacheDirectory(
     _ root: URL,
     keepLatest: Int,
     minimumAgeSeconds: TimeInterval? = nil,
-    skipRecentActiveRunMarkers: Bool = false
+    skipRecentActiveRunMarkers: Bool = false,
+    activeRunMarkerMaxAgeSeconds: TimeInterval = 86_400
 ) throws {
     guard FileManager.default.fileExists(atPath: root.path) else {
         return
@@ -1115,7 +1212,7 @@ func trimCacheDirectory(
             continue
         }
         if skipRecentActiveRunMarkers,
-           hasRecentActiveRunMarker(at: entry.url, now: now, maxAgeSeconds: 86_400) {
+           hasRecentActiveRunMarker(at: entry.url, now: now, maxAgeSeconds: activeRunMarkerMaxAgeSeconds) {
             continue
         }
         try removeCacheItemDirectly(at: entry.url, under: root)
@@ -1123,12 +1220,14 @@ func trimCacheDirectory(
 }
 
 func cleanupReviewCache(config: AppConfig) throws {
+    let activeRunMarkerMaxAgeSeconds = TimeInterval(config.codexRunTimeoutSeconds + 300)
     for runsURL in [aiRunsURL(config: config), legacyCodexRunsURL(config: config)] {
         try trimCacheDirectory(
             runsURL,
             keepLatest: config.codexRunCacheEntryLimit,
             minimumAgeSeconds: config.codexRunCacheMinimumAgeSeconds,
-            skipRecentActiveRunMarkers: true
+            skipRecentActiveRunMarkers: true,
+            activeRunMarkerMaxAgeSeconds: activeRunMarkerMaxAgeSeconds
         )
     }
     try trimCacheDirectory(bundlesURL(config: config), keepLatest: config.bundleCacheEntryLimit)
@@ -1491,6 +1590,44 @@ func sandboxProfile(bundleURL: URL, runURL: URL, authHomeURL: URL, outputURL: UR
     """
 }
 
+func codexFailureMessage(status: Int32, logURL: URL) -> String {
+    var message = "codex exited with status \(status)"
+    if status == SIGTERM {
+        message += " (terminated by SIGTERM)"
+    } else if status == SIGKILL {
+        message += " (terminated by SIGKILL)"
+    }
+
+    message += "\nlog: \(logURL.path)"
+
+    if let tail = sanitizedCodexLogTail(logURL: logURL), !tail.isEmpty {
+        message += "\n\(tail)"
+    }
+
+    return message
+}
+
+func sanitizedCodexLogTail(logURL: URL, maxLines: Int = 12) -> String? {
+    guard let logData = try? Data(contentsOf: logURL),
+          let logText = String(data: logData, encoding: .utf8)
+    else {
+        return nil
+    }
+
+    let lines = logText.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+    let recentLines = Array(lines.suffix(200))
+    guard let lastCodexMarker = recentLines.lastIndex(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines) == "codex" }) else {
+        return nil
+    }
+
+    let usefulTail = recentLines[(lastCodexMarker + 1)...]
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+        .suffix(maxLines)
+
+    return usefulTail.joined(separator: "\n")
+}
+
 func runCodexExecution(
     config: AppConfig,
     bundleURL: URL,
@@ -1584,10 +1721,7 @@ func runCodexExecution(
     }
 
     guard process.terminationStatus == 0 else {
-        let logData = (try? Data(contentsOf: logURL)) ?? Data()
-        let logText = String(data: logData, encoding: .utf8) ?? ""
-        let tail = logText.split(separator: "\n").suffix(40).joined(separator: "\n")
-        throw AIReviewerError.commandFailed("codex exited with status \(process.terminationStatus)\n\(tail)")
+        throw AIReviewerError.commandFailed(codexFailureMessage(status: process.terminationStatus, logURL: logURL))
     }
 
     guard FileManager.default.fileExists(atPath: outputURL.path) else {
@@ -1884,7 +2018,7 @@ func runProfileAgents(
     agents: [ReviewAgentProfile],
     runURL: URL
 ) throws -> [(agent: ReviewAgentProfile, output: String)] {
-    let parallelism = max(1, min(config.maxParallelReviews, agents.count))
+    let parallelism = max(1, min(config.agentReviewConcurrency, agents.count))
     let queue = DispatchQueue(label: "com.ai-reviewer.profile-agents", attributes: .concurrent)
     let group = DispatchGroup()
     let semaphore = DispatchSemaphore(value: parallelism)
@@ -1928,7 +2062,7 @@ func runProfileAgents(
 
                 results.set(index: index, agent: agent, output: outputText)
             } catch {
-                results.fail(error)
+                results.fail(index: index, agent: agent, error: error)
             }
         }
     }
@@ -1941,7 +2075,7 @@ func runProfileAgents(
 final class ProfileAgentResults: @unchecked Sendable {
     private let lock = NSLock()
     private var values: [(agent: ReviewAgentProfile, output: String)?]
-    private var firstError: Error?
+    private var failures: [(index: Int, agent: ReviewAgentProfile, error: Error)] = []
 
     init(count: Int) {
         values = Array(repeating: nil, count: count)
@@ -1953,11 +2087,9 @@ final class ProfileAgentResults: @unchecked Sendable {
         lock.unlock()
     }
 
-    func fail(_ error: Error) {
+    func fail(index: Int, agent: ReviewAgentProfile, error: Error) {
         lock.lock()
-        if firstError == nil {
-            firstError = error
-        }
+        failures.append((index: index, agent: agent, error: error))
         lock.unlock()
     }
 
@@ -1967,12 +2099,36 @@ final class ProfileAgentResults: @unchecked Sendable {
             lock.unlock()
         }
 
-        if let firstError {
-            throw firstError
+        let completed = values.compactMap { $0 }
+        if completed.isEmpty, let firstFailure = failures.first {
+            throw firstFailure.error
         }
 
-        return values.compactMap { $0 }
+        let warnings = failures
+            .sorted { $0.index < $1.index }
+            .map { failure -> (agent: ReviewAgentProfile, output: String) in
+                let message = conciseAgentFailureMessage(failure.error)
+                print("profileAgentFailed: \(failure.agent.id): \(message)")
+                return (
+                    agent: failure.agent,
+                    output: "[80|reviewer] \(failure.agent.id):1 - Specialist review did not finish: \(message)"
+                )
+            }
+
+        return completed + warnings
     }
+}
+
+func conciseAgentFailureMessage(_ error: Error) -> String {
+    let text = String(describing: error)
+        .replacingOccurrences(of: "\n", with: " ")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+
+    if text.count <= 240 {
+        return text
+    }
+
+    return "\(text.prefix(237))..."
 }
 
 func loadBundleManifest(bundleURL: URL) throws -> BundleManifest {
@@ -2120,33 +2276,35 @@ func reviewCommit(config: AppConfig, commit: String) throws -> URL? {
     var reviewURL: URL?
 
     do {
-        let profile = try loadReviewProfile(config: config)
-        let materializedBundleURL = try materializeCommit(config: config, profile: profile, commit: resolvedCommit)
-        bundleURL = materializedBundleURL
-        try mutateState(config: config) { state in
-            state.lastBundlePath = materializedBundleURL.path
+        return try ReviewExecutionCoordinator.shared.withSlot(limit: config.commitReviewConcurrency) {
+            let profile = try loadReviewProfile(config: config)
+            let materializedBundleURL = try materializeCommit(config: config, profile: profile, commit: resolvedCommit)
+            bundleURL = materializedBundleURL
+            try mutateState(config: config) { state in
+                state.lastBundlePath = materializedBundleURL.path
+            }
+
+            let localReviewURL = try runReviewProfile(config: config, bundleURL: materializedBundleURL, profile: profile)
+            reviewURL = localReviewURL
+
+            let copiedReportURL = try copyReportBack(config: config, reviewURL: localReviewURL, shortCommit: shortCommit)
+            try mutateState(config: config) { state in
+                state.lastReviewPath = localReviewURL.path
+                state.reviewed[resolvedCommit] = ReviewRecord(
+                    sha: resolvedCommit,
+                    shortSha: shortCommit,
+                    reviewedAt: isoNow(),
+                    bundlePath: materializedBundleURL.path,
+                    localReviewPath: localReviewURL.path,
+                    copiedReportPath: copiedReportURL.path
+                )
+                state.failed.removeValue(forKey: resolvedCommit)
+                state.skipped?.removeValue(forKey: resolvedCommit)
+            }
+
+            print("reviewed: \(shortCommit)")
+            return copiedReportURL
         }
-
-        let localReviewURL = try runReviewProfile(config: config, bundleURL: materializedBundleURL, profile: profile)
-        reviewURL = localReviewURL
-
-        let copiedReportURL = try copyReportBack(config: config, reviewURL: localReviewURL, shortCommit: shortCommit)
-        try mutateState(config: config) { state in
-            state.lastReviewPath = localReviewURL.path
-            state.reviewed[resolvedCommit] = ReviewRecord(
-                sha: resolvedCommit,
-                shortSha: shortCommit,
-                reviewedAt: isoNow(),
-                bundlePath: materializedBundleURL.path,
-                localReviewPath: localReviewURL.path,
-                copiedReportPath: copiedReportURL.path
-            )
-            state.failed.removeValue(forKey: resolvedCommit)
-            state.skipped?.removeValue(forKey: resolvedCommit)
-        }
-
-        print("reviewed: \(shortCommit)")
-        return copiedReportURL
     } catch AIReviewerError.permanentReviewSkip(let reason) {
         _ = try? mutateState(config: config) { state in
             state.skipped = state.skipped ?? [:]
@@ -2419,8 +2577,13 @@ func loadReviewHistory(config: AppConfig, runningCommits: Set<String> = [], queu
         ]
     )
 
-    return output
-        .split(separator: "\n", omittingEmptySubsequences: true)
+    let historyLines = output.split(separator: "\n", omittingEmptySubsequences: true)
+    let historyCommits = historyLines.compactMap { line -> String? in
+        line.split(separator: "\u{1f}", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init)
+    }
+    let activeLockDetails = activeReviewLockDetails(for: historyCommits)
+
+    let rows = historyLines
         .compactMap { line -> ReviewHistoryItem? in
             let parts = line.split(separator: "\u{1f}", maxSplits: 3, omittingEmptySubsequences: false).map(String.init)
             guard parts.count == 4 else {
@@ -2432,14 +2595,14 @@ func loadReviewHistory(config: AppConfig, runningCommits: Set<String> = [], queu
             let date = parts[2]
             let subject = parts[3]
 
-            if runningCommits.contains(sha) {
+            if runningCommits.contains(sha) || activeLockDetails[sha] != nil {
                 return ReviewHistoryItem(
                     sha: sha,
                     shortSha: shortSha,
                     date: date,
                     subject: subject,
                     status: .running,
-                    detail: "Review is currently running.",
+                    detail: activeLockDetails[sha] ?? "Review is currently running.",
                     reviewPath: nil,
                     localReviewPath: nil,
                     bundlePath: nil,
@@ -2521,6 +2684,8 @@ func loadReviewHistory(config: AppConfig, runningCommits: Set<String> = [], queu
                 logPath: nil
             )
         }
+
+    return rows
 }
 
 func rerunReviewCommit(config: AppConfig, commit: String) throws -> URL? {
@@ -2673,6 +2838,7 @@ final class AppWatcher: @unchecked Sendable {
                     return
                 }
 
+                lastError = nil
                 send("Watching for commits", onUpdate: onUpdate)
                 return
             }
@@ -2705,6 +2871,7 @@ final class AppWatcher: @unchecked Sendable {
                 lastReview = reportURL.path
                 send("Review completed (\(reports.count) commit\(reports.count == 1 ? "" : "s"))", onUpdate: onUpdate)
             } else {
+                lastError = nil
                 send("No pending commits", onUpdate: onUpdate)
             }
         } catch {
@@ -2730,6 +2897,7 @@ final class AppWatcher: @unchecked Sendable {
                 lastReview = reportURL.path
                 send("Review completed (\(reports.count) commit\(reports.count == 1 ? "" : "s"))", onUpdate: onUpdate)
             } else {
+                lastError = nil
                 send("No pending commits", onUpdate: onUpdate)
             }
         } catch {
@@ -2822,6 +2990,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var hasStatusIssue = false
     private var advancedSettingsVisible = false
     private var configuredAIProvider: AIProvider = .codex
+    private var didFinishSetup = false
 
     private let repoField = NSTextField()
     private let reportsField = NSTextField()
@@ -2841,6 +3010,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private let maxBundleCacheEntriesField = NSTextField()
     private let maxParallelCommitReviewsField = NSTextField()
     private let maxParallelField = NSTextField()
+    private let maxDiffBytesField = NSTextField()
     private let maxSnapshotField = NSTextField()
     private let maxPromptSnapshotField = NSTextField()
     private let startWatcherOnLaunchCheckbox = NSButton(checkboxWithTitle: "Start watching when app opens", target: nil, action: nil)
@@ -2866,6 +3036,11 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var stopWatcherMenuItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        guard !didFinishSetup else {
+            return
+        }
+        didFinishSetup = true
+
         buildMenu()
         buildStatusItem()
         buildWindow()
@@ -2876,9 +3051,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         window?.center()
 
         if config.shouldStartWatcherOnLaunch && !config.repoPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            DispatchQueue.main.async { [weak self] in
-                self?.beginWatching(showSettingsWindowOnFailure: true)
-            }
+            beginWatching(showSettingsWindowOnFailure: true)
         } else {
             showSettingsWindow()
         }
@@ -3370,6 +3543,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             form.addArrangedSubview(row(label: "History Depth", field: sweepDepthField))
             form.addArrangedSubview(row(label: "Retry Failed Secs", field: retryFailedAfterField))
             form.addArrangedSubview(row(label: "Codex Timeout Secs", field: codexTimeoutField))
+            form.addArrangedSubview(row(label: "Max Diff Bytes", field: maxDiffBytesField))
             form.addArrangedSubview(row(label: "Snapshot Bytes", field: maxSnapshotField))
             form.addArrangedSubview(row(label: "Prompt Snapshot Bytes", field: maxPromptSnapshotField))
             form.addArrangedSubview(row(label: "Scratch Runs to Keep", field: maxCodexRunCacheEntriesField))
@@ -3677,7 +3851,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
     private func drainManualReviewQueue(config: AppConfig) {
         let limit = config.commitReviewConcurrency
-        while activeManualCommits.count < limit, !queuedManualCommits.isEmpty {
+        while runningCommits.union(activeManualCommits).count < limit, !queuedManualCommits.isEmpty {
             let commit = queuedManualCommits.removeFirst()
             activeManualCommits.insert(commit)
             runningCommits.insert(commit)
@@ -3890,6 +4064,8 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         maxBundleCacheEntriesField.stringValue = "\(config.bundleCacheEntryLimit)"
         maxParallelCommitReviewsField.stringValue = "\(config.commitReviewConcurrency)"
         maxParallelField.stringValue = "\(config.maxParallelReviews)"
+        let profileMaxDiffBytes = (try? loadReviewProfile(config: config).maxDiffBytes) ?? config.reviewDiffByteLimit ?? 200_000
+        maxDiffBytesField.stringValue = "\(profileMaxDiffBytes)"
         maxSnapshotField.stringValue = "\(config.snapshotByteLimit)"
         maxPromptSnapshotField.stringValue = "\(config.promptSnapshotByteLimit)"
         startWatcherOnLaunchCheckbox.state = config.shouldStartWatcherOnLaunch ? .on : .off
@@ -3911,6 +4087,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
               let codexTimeout = Int(codexTimeoutField.stringValue),
               let maxConcurrentReviews = Int(maxParallelCommitReviewsField.stringValue),
               let maxParallel = Int(maxParallelField.stringValue),
+              let maxDiffBytes = Int(maxDiffBytesField.stringValue),
               let maxSnapshot = Int(maxSnapshotField.stringValue),
               let maxPromptSnapshot = Int(maxPromptSnapshotField.stringValue),
               let maxCodexRunCacheEntries = Int(maxCodexRunCacheEntriesField.stringValue),
@@ -3933,6 +4110,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             cursorHome: cursorHomeField.stringValue.isEmpty ? nil : cursorHomeField.stringValue,
             cursorModel: cursorModelField.stringValue.isEmpty ? nil : cursorModelField.stringValue,
             reviewProfilePath: reviewProfileField.stringValue.isEmpty ? nil : reviewProfileField.stringValue,
+            maxDiffBytes: max(1, maxDiffBytes),
             statePath: statePathField.stringValue.isEmpty ? nil : statePathField.stringValue,
             reviewCurrentHeadOnStartup: reviewStartupCheckbox.state == .on,
             startWatcherOnLaunch: startWatcherOnLaunchCheckbox.state == .on,
@@ -4015,6 +4193,10 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
         if panel.runModal() == .OK, let url = panel.url {
             reviewProfileField.stringValue = url.path
+            if let config = try? configFromFields(),
+               let profile = try? loadReviewProfile(path: url.path, config: config) {
+                maxDiffBytesField.stringValue = "\(profile.maxDiffBytes ?? 200_000)"
+            }
         }
     }
 
@@ -4106,8 +4288,12 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private func applyWatcherUpdate(_ update: WatcherUpdate) {
         watcherRunning = update.isRunning
         let status = update.status.lowercased()
+        let errorText = update.lastError?.lowercased() ?? ""
+        let alreadyRunningElsewhere = errorText.contains("already running")
 
-        if update.lastError != nil || status.contains("failed") {
+        if alreadyRunningElsewhere {
+            hasStatusIssue = false
+        } else if update.lastError != nil || status.contains("failed") {
             hasStatusIssue = true
         } else if status.contains("completed") ||
                     status.contains("watching") ||
@@ -4117,7 +4303,9 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         }
 
         if let lastHead = update.lastHead {
-            if status.contains("completed") ||
+            if alreadyRunningElsewhere {
+                runningCommits.insert(lastHead)
+            } else if status.contains("completed") ||
                 status.contains("failed") ||
                 status.contains("no pending") ||
                 status.contains("watching") {
@@ -4148,6 +4336,9 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             refreshLogs(scrollToBottom: false, preservePosition: true)
         }
         updateStatusItemIcon()
+        if !queuedManualCommits.isEmpty, let config = try? configFromFields() {
+            drainManualReviewQueue(config: config)
+        }
         if !update.isRunning {
             watcherLock.unlock()
         }
@@ -4225,6 +4416,7 @@ func runSettingsApp() {
     let delegate = SettingsAppDelegate()
     app.delegate = delegate
     objc_setAssociatedObject(app, "com.ai-reviewer.app-lock", appLock, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+    delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
     app.run()
 }
 
