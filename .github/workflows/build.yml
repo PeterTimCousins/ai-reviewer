@@ -8,6 +8,6 @@ jobs:
   macos:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Verify release build and app bundle
         run: scripts/check.sh
