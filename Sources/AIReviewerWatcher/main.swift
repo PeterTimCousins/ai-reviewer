@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import ServiceManagement
 import UniformTypeIdentifiers
@@ -69,6 +70,20 @@ final class FileLock {
 
         close(fd)
         throw AIReviewerError.unableToWrite(url.path)
+    }
+}
+
+final class ReviewsSplitView: NSSplitView {
+    override var dividerThickness: CGFloat {
+        8
+    }
+
+    override var isOpaque: Bool {
+        false
+    }
+
+    override func drawDivider(in dirtyRect: NSRect) {
+        // Leave the divider transparent so the window material shows through.
     }
 }
 
@@ -170,15 +185,41 @@ final class PipeBuffer: @unchecked Sendable {
     }
 }
 
-enum AIProvider: String, Codable, Sendable {
+let gitExecutionLock = NSLock()
+
+final class URLSessionResultBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+    private var response: URLResponse?
+    private var error: Error?
+
+    func store(data: Data?, response: URLResponse?, error: Error?) {
+        lock.lock()
+        self.data = data ?? Data()
+        self.response = response
+        self.error = error
+        lock.unlock()
+    }
+
+    func snapshot() -> (Data, URLResponse?, Error?) {
+        lock.lock()
+        let result = (data, response, error)
+        lock.unlock()
+        return result
+    }
+}
+
+enum AIProvider: String, Codable, Sendable, CaseIterable {
     case codex
     case cursor
+    case openrouter
 }
 
 let bundleReviewFilename = "review.md"
 let legacyBundleReviewFilename = "codex-review.md"
 let bundleReviewLogFilename = "ai.log"
 let legacyBundleReviewLogFilename = "codex.log"
+let appCLICommandNotification = Notification.Name("com.ai-reviewer.cli-command")
 
 func bundleReviewURL(bundleURL: URL) -> URL {
     bundleURL.appendingPathComponent(bundleReviewFilename)
@@ -229,11 +270,16 @@ struct AppConfig: Codable, Sendable {
     var aiProvider: String?
     var cursorHome: String?
     var cursorModel: String?
+    var cursorAPIKey: String?
+    var openRouterModel: String?
+    var openRouterAPIKey: String?
     var reviewProfilePath: String?
+    var instructionSet: InstructionSet?
     var maxDiffBytes: Int?
     var statePath: String?
     var reviewCurrentHeadOnStartup: Bool?
     var startWatcherOnLaunch: Bool?
+    var watchAllWorktrees: Bool?
     var hideDockIcon: Bool?
     var sweepDepth: Int?
     var retryFailedAfterSeconds: Int?
@@ -263,6 +309,10 @@ struct AppConfig: Codable, Sendable {
 
     var shouldStartWatcherOnLaunch: Bool {
         startWatcherOnLaunch ?? true
+    }
+
+    var shouldWatchAllWorktrees: Bool {
+        watchAllWorktrees ?? false
     }
 
     var shouldHideDockIcon: Bool {
@@ -316,6 +366,11 @@ struct AppConfig: Codable, Sendable {
     var resolvedCursorModel: String {
         cursorModel ?? "composer-2.5"
     }
+
+    var resolvedOpenRouterModel: String {
+        let model = openRouterModel?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return model?.isEmpty == false ? model! : "deepseek/deepseek-v4-pro"
+    }
 }
 
 func defaultConfig() -> AppConfig {
@@ -332,11 +387,16 @@ func defaultConfig() -> AppConfig {
         aiProvider: AIProvider.codex.rawValue,
         cursorHome: "~/.cursor",
         cursorModel: "composer-2.5",
+        cursorAPIKey: nil,
+        openRouterModel: "deepseek/deepseek-v4-pro",
+        openRouterAPIKey: nil,
         reviewProfilePath: nil,
+        instructionSet: nil,
         maxDiffBytes: nil,
         statePath: nil,
         reviewCurrentHeadOnStartup: false,
         startWatcherOnLaunch: true,
+        watchAllWorktrees: false,
         hideDockIcon: true,
         sweepDepth: 50,
         retryFailedAfterSeconds: 3_600,
@@ -361,6 +421,9 @@ struct BundleManifest: Codable {
     let commit: String
     let shortCommit: String
     let branch: String
+    let worktreeID: String?
+    let worktreePath: String?
+    let worktreeBranch: String?
     let createdAt: String
     let reviewProfile: String
     let changedFiles: [ChangedFile]
@@ -386,6 +449,526 @@ struct ReviewProfile: Codable, Sendable {
     }
 }
 
+struct CodexModelsCache: Codable {
+    let models: [CodexModelsCacheModel]?
+}
+
+struct CodexModelsCacheModel: Codable {
+    let slug: String?
+    let supportedInAPI: Bool?
+    let visibility: String?
+    let defaultReasoningLevel: String?
+    let supportedReasoningLevels: [CodexModelsCacheReasoningLevel]?
+
+    enum CodingKeys: String, CodingKey {
+        case slug
+        case supportedInAPI = "supported_in_api"
+        case visibility
+        case defaultReasoningLevel = "default_reasoning_level"
+        case supportedReasoningLevels = "supported_reasoning_levels"
+    }
+}
+
+struct CodexModelsCacheReasoningLevel: Codable {
+    let effort: String?
+}
+
+struct CodexReasoningEffortOptions {
+    let supported: [String]
+    let defaultEffort: String?
+}
+
+func codexReasoningEffortOptions(config: AppConfig, model: String?) -> CodexReasoningEffortOptions {
+    guard let model = model?.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty else {
+        return CodexReasoningEffortOptions(supported: [], defaultEffort: nil)
+    }
+
+    let cacheURL = URL(fileURLWithPath: expandedPath(config.codexHome))
+        .appendingPathComponent("models_cache.json")
+    if let data = try? Data(contentsOf: cacheURL),
+       let cache = try? JSONDecoder().decode(CodexModelsCache.self, from: data),
+       let cachedModel = cache.models?.first(where: {
+           $0.slug?.trimmingCharacters(in: .whitespacesAndNewlines) == model
+       }) {
+        let supported = cachedModel.supportedReasoningLevels?
+            .compactMap { $0.effort?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && $0 != "ultra" } ?? []
+        let defaultEffort = cachedModel.defaultReasoningLevel?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return CodexReasoningEffortOptions(
+            supported: supported,
+            defaultEffort: supported.contains(defaultEffort ?? "") ? defaultEffort : supported.first
+        )
+    }
+
+    let supported: [String]
+    switch model {
+    case "gpt-5.6-sol", "gpt-5.6-terra":
+        supported = ["low", "medium", "high", "xhigh", "max"]
+    case "gpt-5.6-luna":
+        supported = ["low", "medium", "high", "xhigh", "max"]
+    case "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark", "codex-auto-review":
+        supported = ["low", "medium", "high", "xhigh"]
+    default:
+        supported = []
+    }
+    let defaultEffort = model == "gpt-5.3-codex-spark" ? "high" : (supported.contains("medium") ? "medium" : supported.first)
+    return CodexReasoningEffortOptions(supported: supported, defaultEffort: defaultEffort)
+}
+
+func resolvedCodexReasoningEffort(config: AppConfig, model: String?, requested: String?) -> String? {
+    let options = codexReasoningEffortOptions(config: config, model: model)
+    guard !options.supported.isEmpty else {
+        return nil
+    }
+
+    if let requested = requested?.trimmingCharacters(in: .whitespacesAndNewlines),
+       options.supported.contains(requested) {
+        return requested
+    }
+    return options.defaultEffort
+}
+
+func availableCodexModels(config: AppConfig) -> [String] {
+    let cacheURL = URL(fileURLWithPath: expandedPath(config.codexHome))
+        .appendingPathComponent("models_cache.json")
+    guard FileManager.default.fileExists(atPath: cacheURL.path),
+          let data = try? Data(contentsOf: cacheURL) else {
+        return fallbackCodexModelChoices()
+    }
+
+    let decoder = JSONDecoder()
+    guard let cache = try? decoder.decode(CodexModelsCache.self, from: data),
+          let models = cache.models else {
+        return fallbackCodexModelChoices()
+    }
+
+    let normalized = models.compactMap { model -> String? in
+        guard let slug = model.slug else {
+            return nil
+        }
+        let trimmed = slug.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+        if let supported = model.supportedInAPI, !supported {
+            return nil
+        }
+        guard model.visibility == nil || model.visibility == "list" else {
+            return nil
+        }
+        return trimmed
+    }
+
+    var seen = Set<String>()
+    let unique = normalized.compactMap { (slug: String) -> String? in
+        if seen.contains(slug) {
+            return nil
+        }
+        seen.insert(slug)
+        return slug
+    }
+
+    return unique.isEmpty ? fallbackCodexModelChoices() : unique
+}
+
+func fallbackCodexModelChoices() -> [String] {
+    [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.3-codex-spark",
+        "codex-auto-review",
+        "gpt-4.1",
+        "gpt-4.1-mini",
+        "gpt-4o",
+        "gpt-4o-mini"
+    ]
+}
+
+func availableModels(for provider: AIProvider, config: AppConfig) -> [String] {
+    switch provider {
+    case .codex:
+        return availableCodexModels(config: config)
+    case .cursor:
+        return ["composer-2.5"]
+    case .openrouter:
+        return availableOpenRouterModels()
+    }
+}
+
+func availableOpenRouterModels() -> [String] {
+    [
+        "deepseek/deepseek-v4-pro",
+        "minimax/minimax-m2.5",
+        "deepseek/deepseek-v3.2",
+        "z-ai/glm-5.2",
+        "z-ai/glm-4.5",
+        "google/gemini-2.5-pro",
+        "anthropic/claude-sonnet-4.5"
+    ]
+}
+
+struct InstructionSetEngineModelSelection: Codable, Sendable {
+    var defaultModel: String?
+    var agents: [String: String]?
+    var defaultReasoningEffort: String?
+    var agentReasoningEfforts: [String: String]?
+}
+
+struct InstructionSet: Codable, Sendable {
+    var defaultModel: String?
+    var globalInstructions: String?
+    var agents: [String: InstructionSetAgentConfig]?
+    var engineModels: [String: InstructionSetEngineModelSelection]?
+
+    func normalizedText(_ value: String?) -> String? {
+        guard let value else {
+            return nil
+        }
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    func providerDefaultModel(for provider: AIProvider) -> String? {
+        guard let providerSelection = engineModels?[provider.rawValue] else {
+            return nil
+        }
+
+        return normalizedText(providerSelection.defaultModel)
+    }
+
+    func providerModel(for provider: AIProvider, agentID: String) -> String? {
+        guard let providerSelection = engineModels?[provider.rawValue],
+              let model = providerSelection.agents?[agentID] else {
+            return nil
+        }
+
+        return normalizedText(model)
+    }
+
+    func providerDefaultReasoningEffort(for provider: AIProvider) -> String? {
+        normalizedText(engineModels?[provider.rawValue]?.defaultReasoningEffort)
+    }
+
+    func providerReasoningEffort(for provider: AIProvider, agentID: String) -> String? {
+        normalizedText(engineModels?[provider.rawValue]?.agentReasoningEfforts?[agentID])
+    }
+
+    func hasEngineSelection(for provider: AIProvider) -> Bool {
+        engineModels?[provider.rawValue] != nil
+    }
+
+    func resolvedProviderDefaultModel(for provider: AIProvider) -> String? {
+        providerDefaultModel(for: provider) ?? normalizedText(defaultModel)
+    }
+
+    func resolvedAgentModel(for provider: AIProvider, agentID: String) -> String? {
+        if let model = providerModel(for: provider, agentID: agentID) {
+            return model
+        }
+
+        if let model = agents?[agentID]?.providerModel(for: provider) {
+            return model
+        }
+
+        if hasEngineSelection(for: provider) {
+            return resolvedProviderDefaultModel(for: provider)
+        }
+
+        return agents?[agentID].flatMap { normalizedText($0.model) }
+    }
+}
+
+func instructionSetTemplate(from profile: ReviewProfile, for provider: AIProvider) -> InstructionSet {
+    let normalizedGlobalInstructions = profile.globalInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    var agentConfigs: [String: InstructionSetAgentConfig] = [:]
+    var providerAgentModels: [String: String] = [:]
+
+    for agent in profile.agents {
+        var agentConfig = InstructionSetAgentConfig(model: nil, instructions: nil, providerModels: nil)
+        let normalizedInstructions = agent.instructions.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !normalizedInstructions.isEmpty {
+            agentConfig.instructions = normalizedInstructions
+        }
+
+        if let rawModel = agent.model?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rawModel.isEmpty {
+            agentConfig.providerModels = [provider.rawValue: rawModel]
+            providerAgentModels[agent.id] = rawModel
+        }
+
+        if let instructions = agentConfig.instructions,
+           !instructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+           agentConfig.providerModels != nil {
+            agentConfigs[agent.id] = agentConfig
+        }
+    }
+
+    let providerDefaultModel = profile.defaultModel?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let hasProviderModels = !providerAgentModels.isEmpty || (providerDefaultModel?.isEmpty == false)
+    let engineModels = hasProviderModels
+        ? [
+            provider.rawValue: InstructionSetEngineModelSelection(
+                defaultModel: providerDefaultModel,
+                agents: providerAgentModels.isEmpty ? nil : providerAgentModels,
+                defaultReasoningEffort: nil,
+                agentReasoningEfforts: nil
+            )
+        ]
+        : nil
+
+    return InstructionSet(
+        defaultModel: nil,
+        globalInstructions: normalizedGlobalInstructions.isEmpty ? nil : normalizedGlobalInstructions,
+        agents: agentConfigs.isEmpty ? nil : agentConfigs,
+        engineModels: engineModels
+    )
+}
+
+func mergedInstructionSet(
+    base: InstructionSet,
+    overrides: InstructionSet
+) -> InstructionSet {
+    var merged = base
+
+    if let providerDefaultModel = base.normalizedText(base.defaultModel) {
+        merged.defaultModel = providerDefaultModel
+    }
+    if let globalInstructions = overrides.normalizedText(overrides.globalInstructions) {
+        merged.globalInstructions = globalInstructions
+    } else if let globalInstructions = base.globalInstructions {
+        merged.globalInstructions = base.normalizedText(globalInstructions)
+    }
+
+    if let overriddenDefaultModel = overrides.normalizedText(overrides.defaultModel) {
+        merged.defaultModel = overriddenDefaultModel
+    }
+
+    if let baseModelOverrides = base.engineModels {
+        merged.engineModels = merged.engineModels ?? [:]
+        for (providerRawValue, baseSelection) in baseModelOverrides {
+            var mergedSelection = merged.engineModels?[providerRawValue] ?? InstructionSetEngineModelSelection(
+                defaultModel: nil,
+                agents: nil,
+                defaultReasoningEffort: nil,
+                agentReasoningEfforts: nil
+            )
+
+            if let baseDefault = base.normalizedText(baseSelection.defaultModel) {
+                mergedSelection.defaultModel = baseDefault
+            }
+            mergedSelection.agents = mergedSelection.agents ?? [:]
+            if let baseAgentModels = baseSelection.agents {
+                for (agentID, model) in baseAgentModels {
+                    if let modelText = base.normalizedText(model) {
+                        mergedSelection.agents?[agentID] = modelText
+                    }
+                }
+            }
+            if let baseEffort = base.normalizedText(baseSelection.defaultReasoningEffort) {
+                mergedSelection.defaultReasoningEffort = baseEffort
+            }
+            mergedSelection.agentReasoningEfforts = mergedSelection.agentReasoningEfforts ?? [:]
+            if let baseAgentEfforts = baseSelection.agentReasoningEfforts {
+                for (agentID, effort) in baseAgentEfforts {
+                    if let effortText = base.normalizedText(effort) {
+                        mergedSelection.agentReasoningEfforts?[agentID] = effortText
+                    }
+                }
+            }
+
+            merged.engineModels?[providerRawValue] = mergedSelection
+        }
+    }
+
+    if let overrideModelOverrides = overrides.engineModels {
+        merged.engineModels = merged.engineModels ?? [:]
+        for (providerRawValue, overrideSelection) in overrideModelOverrides {
+            var mergedSelection = merged.engineModels?[providerRawValue] ?? InstructionSetEngineModelSelection(
+                defaultModel: nil,
+                agents: nil,
+                defaultReasoningEffort: nil,
+                agentReasoningEfforts: nil
+            )
+
+            if let overrideDefault = overrides.normalizedText(overrideSelection.defaultModel) {
+                mergedSelection.defaultModel = overrideDefault
+            }
+            mergedSelection.agents = mergedSelection.agents ?? [:]
+            if let overrideAgents = overrideSelection.agents {
+                for (agentID, model) in overrideAgents {
+                    if let modelText = overrides.normalizedText(model) {
+                        mergedSelection.agents?[agentID] = modelText
+                    } else {
+                        mergedSelection.agents?.removeValue(forKey: agentID)
+                    }
+                }
+            }
+            if let overrideEffort = overrides.normalizedText(overrideSelection.defaultReasoningEffort) {
+                mergedSelection.defaultReasoningEffort = overrideEffort
+            }
+            mergedSelection.agentReasoningEfforts = mergedSelection.agentReasoningEfforts ?? [:]
+            if let overrideAgentEfforts = overrideSelection.agentReasoningEfforts {
+                for (agentID, effort) in overrideAgentEfforts {
+                    if let effortText = overrides.normalizedText(effort) {
+                        mergedSelection.agentReasoningEfforts?[agentID] = effortText
+                    } else {
+                        mergedSelection.agentReasoningEfforts?.removeValue(forKey: agentID)
+                    }
+                }
+            }
+
+            if mergedSelection.agents?.isEmpty == true {
+                mergedSelection.agents = nil
+            }
+            if mergedSelection.agentReasoningEfforts?.isEmpty == true {
+                mergedSelection.agentReasoningEfforts = nil
+            }
+            if mergedSelection.defaultModel == nil && mergedSelection.agents == nil &&
+                mergedSelection.defaultReasoningEffort == nil && mergedSelection.agentReasoningEfforts == nil {
+                merged.engineModels?.removeValue(forKey: providerRawValue)
+            } else {
+                merged.engineModels?[providerRawValue] = mergedSelection
+            }
+        }
+    }
+
+    if let baseAgents = base.agents {
+        merged.agents = merged.agents ?? [:]
+        for (agentID, baseConfig) in baseAgents {
+            var mergedAgentConfig = merged.agents?[agentID] ?? InstructionSetAgentConfig(
+                model: nil,
+                instructions: nil,
+                providerModels: nil
+            )
+            if let instructions = base.normalizedText(baseConfig.instructions) {
+                mergedAgentConfig.instructions = instructions
+            }
+            if let model = base.normalizedText(baseConfig.model) {
+                mergedAgentConfig.model = model
+            }
+            mergedAgentConfig.providerModels = mergedAgentConfig.providerModels ?? [:]
+            if let providerModels = baseConfig.providerModels {
+                for (providerRawValue, model) in providerModels {
+                    if let modelText = base.normalizedText(model) {
+                        mergedAgentConfig.providerModels?[providerRawValue] = modelText
+                    }
+                }
+            }
+            merged.agents?[agentID] = mergedAgentConfig
+        }
+    }
+
+    if let overrideAgents = overrides.agents {
+        merged.agents = merged.agents ?? [:]
+        for (agentID, overrideConfig) in overrideAgents {
+            var mergedAgentConfig = merged.agents?[agentID] ?? InstructionSetAgentConfig(
+                model: nil,
+                instructions: nil,
+                providerModels: nil
+            )
+
+            if let instructions = overrides.normalizedText(overrideConfig.instructions) {
+                mergedAgentConfig.instructions = instructions
+            }
+            if let model = overrides.normalizedText(overrideConfig.model) {
+                mergedAgentConfig.model = model
+            }
+            if let overrideProviderModels = overrideConfig.providerModels {
+                mergedAgentConfig.providerModels = mergedAgentConfig.providerModels ?? [:]
+                for (providerRawValue, model) in overrideProviderModels {
+                    if let modelText = overrides.normalizedText(model) {
+                        mergedAgentConfig.providerModels?[providerRawValue] = modelText
+                    } else {
+                        mergedAgentConfig.providerModels?.removeValue(forKey: providerRawValue)
+                    }
+                }
+                if mergedAgentConfig.providerModels?.isEmpty == true {
+                    mergedAgentConfig.providerModels = nil
+                }
+            }
+
+            if mergedAgentConfig.instructions == nil && mergedAgentConfig.model == nil && mergedAgentConfig.providerModels == nil {
+                merged.agents?.removeValue(forKey: agentID)
+            } else {
+                merged.agents?[agentID] = mergedAgentConfig
+            }
+        }
+    }
+
+    if merged.agents?.isEmpty == true {
+        merged.agents = nil
+    }
+    if merged.engineModels?.isEmpty == true {
+        merged.engineModels = nil
+    }
+
+    return merged
+}
+
+func migrateInstructionSet(_ instructionSet: InstructionSet, for provider: AIProvider) -> InstructionSet {
+    var migrated = instructionSet
+
+    if let legacyDefaultModel = instructionSet.defaultModel,
+       !legacyDefaultModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        var selections = migrated.engineModels ?? [:]
+        var providerSelection = selections[provider.rawValue] ?? InstructionSetEngineModelSelection(
+            defaultModel: nil,
+            agents: nil,
+            defaultReasoningEffort: nil,
+            agentReasoningEfforts: nil
+        )
+
+        let normalizedDefault = legacyDefaultModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        if providerSelection.defaultModel == nil || providerSelection.defaultModel?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
+            providerSelection.defaultModel = normalizedDefault
+        }
+
+        selections[provider.rawValue] = providerSelection
+        migrated.engineModels = selections
+        migrated.defaultModel = nil
+    }
+
+    if let agents = migrated.agents {
+        var updatedAgents = agents
+        for (agentID, var agentConfig) in agents {
+            if let legacyModel = agentConfig.model,
+               !legacyModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                var providerModels = agentConfig.providerModels ?? [:]
+                if providerModels[provider.rawValue] == nil {
+                    providerModels[provider.rawValue] = legacyModel.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                agentConfig.providerModels = providerModels.isEmpty ? nil : providerModels
+                agentConfig.model = nil
+                updatedAgents[agentID] = agentConfig
+            }
+        }
+        migrated.agents = updatedAgents
+    }
+
+    return migrated
+}
+
+struct InstructionSetAgentConfig: Codable, Sendable {
+    var model: String?
+    var instructions: String?
+    var providerModels: [String: String]?
+
+    func providerModel(for provider: AIProvider) -> String? {
+        guard let model = providerModels?[provider.rawValue] else {
+            return nil
+        }
+
+        let normalized = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? nil : normalized
+    }
+}
+
 struct ReviewAgentProfile: Codable, Sendable {
     var id: String
     var title: String
@@ -404,6 +987,9 @@ struct ReviewAgentProfile: Codable, Sendable {
 struct ReviewRecord: Codable {
     var sha: String
     var shortSha: String
+    var worktreeID: String?
+    var worktreePath: String?
+    var worktreeBranch: String?
     var reviewedAt: String
     var bundlePath: String
     var localReviewPath: String
@@ -413,6 +999,9 @@ struct ReviewRecord: Codable {
 struct ReviewFailureRecord: Codable {
     var sha: String
     var shortSha: String
+    var worktreeID: String?
+    var worktreePath: String?
+    var worktreeBranch: String?
     var failedAt: String
     var error: String
     var bundlePath: String?
@@ -423,6 +1012,7 @@ struct ReviewState: Codable {
     var schemaVersion: Int
     var updatedAt: String?
     var lastSeenHead: String?
+    var worktreeHeads: [String: String]?
     var lastBundlePath: String?
     var lastReviewPath: String?
     var skipped: [String: ReviewSkipRecord]?
@@ -433,6 +1023,7 @@ struct ReviewState: Codable {
         schemaVersion: Int,
         updatedAt: String?,
         lastSeenHead: String?,
+        worktreeHeads: [String: String]?,
         lastBundlePath: String?,
         lastReviewPath: String?,
         skipped: [String: ReviewSkipRecord]?,
@@ -442,6 +1033,7 @@ struct ReviewState: Codable {
         self.schemaVersion = schemaVersion
         self.updatedAt = updatedAt
         self.lastSeenHead = lastSeenHead
+        self.worktreeHeads = worktreeHeads
         self.lastBundlePath = lastBundlePath
         self.lastReviewPath = lastReviewPath
         self.skipped = skipped
@@ -454,6 +1046,7 @@ struct ReviewState: Codable {
         schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
         updatedAt = try container.decodeIfPresent(String.self, forKey: .updatedAt)
         lastSeenHead = try container.decodeIfPresent(String.self, forKey: .lastSeenHead)
+        worktreeHeads = try container.decodeIfPresent([String: String].self, forKey: .worktreeHeads) ?? [:]
         lastBundlePath = try container.decodeIfPresent(String.self, forKey: .lastBundlePath)
         lastReviewPath = try container.decodeIfPresent(String.self, forKey: .lastReviewPath)
         skipped = try container.decodeIfPresent([String: ReviewSkipRecord].self, forKey: .skipped) ?? [:]
@@ -466,6 +1059,7 @@ struct ReviewState: Codable {
             schemaVersion: 1,
             updatedAt: nil,
             lastSeenHead: nil,
+            worktreeHeads: [:],
             lastBundlePath: nil,
             lastReviewPath: nil,
             skipped: [:],
@@ -478,6 +1072,9 @@ struct ReviewState: Codable {
 struct ReviewSkipRecord: Codable {
     var sha: String
     var shortSha: String
+    var worktreeID: String?
+    var worktreePath: String?
+    var worktreeBranch: String?
     var skippedAt: String
     var reason: String
 }
@@ -494,6 +1091,10 @@ enum ReviewHistoryStatus: String {
 struct ReviewHistoryItem {
     let sha: String
     let shortSha: String
+    let worktreeID: String
+    let worktreePath: String
+    let worktreeBranch: String?
+    let ledgerKey: String
     let date: String
     let subject: String
     let status: ReviewHistoryStatus
@@ -504,8 +1105,63 @@ struct ReviewHistoryItem {
     let logPath: String?
 }
 
+struct ReviewHistoryLine {
+    let worktreeID: String
+    let worktreePath: String
+    let worktreeBranch: String?
+    let line: String
+}
+
+struct ManualReviewRequest {
+    let sha: String
+    let shortSha: String
+    let worktreePath: String
+    let ledgerKey: String
+}
+
+struct PendingReviewTask {
+    let config: AppConfig
+    let commit: String
+}
+
+final class PendingReviewTaskResults: @unchecked Sendable {
+    private let lock = NSLock()
+    private var reports: [URL] = []
+    private var errors: [Error] = []
+
+    func append(report: URL?) {
+        lock.lock()
+        if let report {
+            reports.append(report)
+        }
+        lock.unlock()
+    }
+
+    func append(error: Error) {
+        lock.lock()
+        errors.append(error)
+        lock.unlock()
+    }
+
+    func snapshot() -> (reports: [URL], errors: [Error]) {
+        lock.lock()
+        let result = (reports, errors)
+        lock.unlock()
+        return result
+    }
+}
+
 enum Command: String {
     case validate
+    case status
+    case logs
+    case app
+    case watcher
+    case reviews
+    case config
+    case instructionSet = "instruction-set"
+    case engine
+    case models
     case watch
     case materializeHead = "materialize-head"
     case runCodex = "run-codex"
@@ -522,6 +1178,10 @@ enum AIReviewerError: Error, CustomStringConvertible {
     case permanentReviewSkip(String)
     case commandFailed(String)
     case unableToWrite(String)
+    case reviewNotFound(String)
+    case ambiguousReview(String)
+    case invalidReviewFilter(String)
+    case invalidReviewOption(String)
 
     var description: String {
         switch self {
@@ -541,6 +1201,14 @@ enum AIReviewerError: Error, CustomStringConvertible {
             return message
         case .unableToWrite(let path):
             return "Unable to write: \(path)"
+        case .reviewNotFound(let query):
+            return "No review found for '\(query)'"
+        case .ambiguousReview(let query):
+            return "Review query '\(query)' matches multiple commits or worktrees"
+        case .invalidReviewFilter(let filter):
+            return "Invalid review status filter '\(filter)'. Expected all, completed, failed, skipped, queued, running, or pending."
+        case .invalidReviewOption(let message):
+            return "Invalid review query option: \(message)"
         }
     }
 }
@@ -549,6 +1217,27 @@ func usage() -> String {
     """
     Usage:
       ai-reviewer-watcher validate --config <path>
+      ai-reviewer-watcher status --config <path> [--json]
+      ai-reviewer-watcher logs --config <path>
+      ai-reviewer-watcher app --config <path> <show|refresh|quit>
+      ai-reviewer-watcher app --config <path> tab <reviews|logs|settings|instruction-set>
+      ai-reviewer-watcher watcher --config <path> <start|stop>
+      ai-reviewer-watcher reviews --config <path> list [all|completed|failed|skipped|queued|running|pending] [--json] [--limit <count>] [--offset <count>]
+      ai-reviewer-watcher reviews --config <path> list [status] --json --details --limit <count <= 100>
+      ai-reviewer-watcher reviews --config <path> show <sha> [--json]
+      ai-reviewer-watcher reviews --config <path> rerun <sha>
+      ai-reviewer-watcher reviews --config <path> queue-pending
+      ai-reviewer-watcher reviews --config <path> reconcile
+      ai-reviewer-watcher config --config <path> show [--show-secrets]
+      ai-reviewer-watcher config --config <path> get <dot.path> [--show-secrets]
+      ai-reviewer-watcher config --config <path> set <dot.path> <json-or-string-value>
+      ai-reviewer-watcher config --config <path> unset <dot.path>
+      ai-reviewer-watcher config --config <path> restore-backup
+      ai-reviewer-watcher instruction-set --config <path> <show|clear>
+      ai-reviewer-watcher instruction-set --config <path> <export|import> <path>
+      ai-reviewer-watcher engine --config <path> <show|set> [codex|cursor|openrouter]
+      ai-reviewer-watcher models --config <path> list [codex|cursor|openrouter]
+      ai-reviewer-watcher models --config <path> set <model> [--provider <provider>] [--effort <effort>] [--agent <id>]
       ai-reviewer-watcher watch --config <path>
       ai-reviewer-watcher materialize-head --config <path>
       ai-reviewer-watcher run-codex --config <path> --bundle <sha-or-path>
@@ -582,6 +1271,53 @@ func saveConfig(_ config: AppConfig, to url: URL) throws {
     try data.write(to: url, options: .atomic)
 }
 
+func validateCLIConfigMutation(_ config: AppConfig) throws {
+    if let configuredProvider = config.aiProvider, AIProvider(rawValue: configuredProvider) == nil {
+        throw AIReviewerError.invalidConfig("Unsupported provider '\(configuredProvider)'")
+    }
+    guard config.maxParallelReviews > 0 else {
+        throw AIReviewerError.invalidConfig("maxParallelReviews must be greater than zero")
+    }
+    if let maxParallelCommitReviews = config.maxParallelCommitReviews, maxParallelCommitReviews <= 0 {
+        throw AIReviewerError.invalidConfig("maxParallelCommitReviews must be greater than zero")
+    }
+    guard config.pollIntervalSeconds > 0 else {
+        throw AIReviewerError.invalidConfig("pollIntervalSeconds must be greater than zero")
+    }
+
+    guard let codexSelection = config.instructionSet?.engineModels?[AIProvider.codex.rawValue] else {
+        return
+    }
+    if let effort = codexSelection.defaultReasoningEffort {
+        guard let model = codexSelection.defaultModel else {
+            throw AIReviewerError.invalidConfig("Codex defaultReasoningEffort requires defaultModel")
+        }
+        let options = codexReasoningEffortOptions(config: config, model: model)
+        guard options.supported.contains(effort) else {
+            throw AIReviewerError.invalidConfig("Effort '\(effort)' is not supported by \(model)")
+        }
+    }
+    for (agentID, effort) in codexSelection.agentReasoningEfforts ?? [:] {
+        guard let model = codexSelection.agents?[agentID] ?? codexSelection.defaultModel else {
+            throw AIReviewerError.invalidConfig("Codex effort for agent '\(agentID)' requires a model")
+        }
+        let options = codexReasoningEffortOptions(config: config, model: model)
+        guard options.supported.contains(effort) else {
+            throw AIReviewerError.invalidConfig("Effort '\(effort)' is not supported by \(model) for agent '\(agentID)'")
+        }
+    }
+}
+
+func saveCLIConfig(_ config: AppConfig, to path: String) throws {
+    try validateCLIConfigMutation(config)
+    let url = URL(fileURLWithPath: expandedPath(path))
+    if FileManager.default.fileExists(atPath: url.path), let existing = try? Data(contentsOf: url) {
+        try existing.write(to: url.appendingPathExtension("cli-backup"), options: .atomic)
+    }
+    try saveConfig(config, to: url)
+    try postAppCommand(action: "reload-config", launchIfNeeded: false)
+}
+
 func loadState(config: AppConfig) throws -> ReviewState {
     let url = stateURL(config: config)
     guard FileManager.default.fileExists(atPath: url.path) else {
@@ -596,6 +1332,9 @@ func saveState(_ state: ReviewState, config: AppConfig) throws {
     var nextState = state
     if nextState.skipped == nil {
         nextState.skipped = [:]
+    }
+    if nextState.worktreeHeads == nil {
+        nextState.worktreeHeads = [:]
     }
     nextState.updatedAt = isoNow()
 
@@ -697,6 +1436,42 @@ func watcherLogURL() -> URL {
     appLogsURL().appendingPathComponent("watcher.log")
 }
 
+func installedAppURL() -> URL {
+    FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Applications/AI Reviewer.app", isDirectory: true)
+}
+
+func postAppCommand(action: String, value: String? = nil, launchIfNeeded: Bool = true) throws {
+    let bundleIdentifier = "com.ai-reviewer"
+    if launchIfNeeded && NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier).isEmpty {
+        let appURL = installedAppURL()
+        guard FileManager.default.fileExists(atPath: appURL.path) else {
+            throw AIReviewerError.missingPath(appURL.path)
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = [appURL.path]
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw AIReviewerError.commandFailed("Unable to open AI Reviewer")
+        }
+        usleep(500_000)
+    }
+
+    var userInfo: [String: String] = ["action": action]
+    if let value {
+        userInfo["value"] = value
+    }
+    DistributedNotificationCenter.default().postNotificationName(
+        appCLICommandNotification,
+        object: nil,
+        userInfo: userInfo,
+        deliverImmediately: true
+    )
+}
+
 func stateURL(config: AppConfig) -> URL {
     if let statePath = config.statePath, !statePath.isEmpty {
         return URL(fileURLWithPath: expandedPath(statePath))
@@ -725,12 +1500,15 @@ func bundledProfileURL(name: String) -> URL? {
 }
 
 func defaultBundledProfileName(config: AppConfig) -> String {
-    switch config.resolvedAIProvider {
-    case .codex:
-        return "default-review.json"
-    case .cursor:
-        return "default-review-cursor.json"
+    return "default-review.json"
+}
+
+func resolvedReviewProfilePath(for path: String?, config: AppConfig) -> String? {
+    guard let path, !path.isEmpty else {
+        return nil
     }
+
+    return expandedPath(path)
 }
 
 func reviewAgentIdentity(config: AppConfig) -> String {
@@ -739,17 +1517,60 @@ func reviewAgentIdentity(config: AppConfig) -> String {
         return "Codex"
     case .cursor:
         return "Composer running in Cursor Agent"
+    case .openrouter:
+        return "OpenRouter"
     }
 }
 
 func resolvedReviewModel(config: AppConfig, profile: ReviewProfile, agent: ReviewAgentProfile?) -> String? {
-    let agentModel = agent?.model
-    switch config.resolvedAIProvider {
-    case .codex:
-        return agentModel ?? config.codexModel ?? profile.defaultModel
-    case .cursor:
-        return agentModel ?? config.resolvedCursorModel ?? profile.defaultModel
+    let provider = config.resolvedAIProvider
+
+    if let instructionSet = config.instructionSet,
+       let agentID = agent?.id,
+       instructionSet.hasEngineSelection(for: provider),
+       let model = instructionSet.resolvedAgentModel(for: provider, agentID: agentID) {
+        return model
     }
+
+    if let model = agent?.model?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !model.isEmpty {
+        return model
+    }
+
+    if let model = profile.defaultModel?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !model.isEmpty {
+        return model
+    }
+
+    switch provider {
+    case .codex:
+        return config.codexModel
+    case .cursor:
+        return config.resolvedCursorModel
+    case .openrouter:
+        return config.resolvedOpenRouterModel
+    }
+}
+
+func resolvedReviewReasoningEffort(
+    config: AppConfig,
+    profile: ReviewProfile,
+    agent: ReviewAgentProfile?,
+    model: String?
+) -> String? {
+    guard config.resolvedAIProvider == .codex else {
+        return nil
+    }
+
+    let requested: String?
+    if let agentID = agent?.id,
+       let agentEffort = config.instructionSet?.providerReasoningEffort(for: .codex, agentID: agentID) {
+        requested = agentEffort
+    } else {
+        requested = config.instructionSet?.providerDefaultReasoningEffort(for: .codex)
+    }
+
+    return resolvedCodexReasoningEffort(config: config, model: model, requested: requested)
 }
 
 func defaultReviewProfile(config: AppConfig) -> ReviewProfile {
@@ -757,7 +1578,7 @@ func defaultReviewProfile(config: AppConfig) -> ReviewProfile {
         schemaVersion: 1,
         name: "Enterprise Default Review",
         description: "Generic enterprise-grade post-commit review profile.",
-        provider: config.resolvedAIProvider.rawValue,
+        provider: nil,
         maxDiffBytes: 200_000,
         ignorePaths: [],
         globalInstructions: """
@@ -803,23 +1624,67 @@ func defaultReviewProfile(config: AppConfig) -> ReviewProfile {
 }
 
 func validateReviewProfile(_ profile: ReviewProfile, for config: AppConfig) throws {
-    guard let profileProvider = profile.resolvedProvider else {
+    guard let provider = profile.provider, !provider.isEmpty else {
         return
     }
 
-    guard profileProvider == config.resolvedAIProvider else {
+    guard AIProvider(rawValue: provider) != nil else {
         throw AIReviewerError.invalidConfig(
-            "Review profile '\(profile.name)' is for \(profileProvider.rawValue), but the configured review engine is \(config.resolvedAIProvider.rawValue)"
+            "Review profile '\(profile.name)' uses unsupported provider '\(provider)'"
         )
     }
+}
+
+func mergedReviewProfile(
+    _ profile: ReviewProfile,
+    with instructionSet: InstructionSet?,
+    for provider: AIProvider
+) -> ReviewProfile {
+    guard let instructionSet else {
+        return profile
+    }
+
+    var mergedProfile = profile
+    if let globalInstructions = instructionSet.normalizedText(instructionSet.globalInstructions) {
+        mergedProfile.globalInstructions = globalInstructions
+    }
+    if let defaultModel = instructionSet.resolvedProviderDefaultModel(for: provider) {
+        mergedProfile.defaultModel = defaultModel
+    }
+
+    for (index, agent) in mergedProfile.agents.enumerated() {
+        if let override = instructionSet.agents?[agent.id],
+           let instructions = instructionSet.normalizedText(override.instructions) {
+            mergedProfile.agents[index].instructions = instructions
+        }
+
+        if instructionSet.hasEngineSelection(for: provider) {
+            mergedProfile.agents[index].model = instructionSet.resolvedAgentModel(for: provider, agentID: agent.id)
+            continue
+        }
+
+        guard let override = instructionSet.agents?[agent.id] else {
+            continue
+        }
+
+        let providerModel = instructionSet.providerModel(for: provider, agentID: agent.id)
+            ?? instructionSet.normalizedText(override.model)
+            ?? override.providerModel(for: provider)
+        if let model = providerModel {
+            mergedProfile.agents[index].model = model
+        }
+    }
+
+    return mergedProfile
 }
 
 func loadReviewProfile(path: String?, config: AppConfig) throws -> ReviewProfile {
     let decoder = JSONDecoder()
     let profile: ReviewProfile
+    let profilePath = resolvedReviewProfilePath(for: path, config: config)
 
-    if let profilePath = path, !profilePath.isEmpty {
-        let url = URL(fileURLWithPath: expandedPath(profilePath))
+    if let profilePath, !profilePath.isEmpty {
+        let url = URL(fileURLWithPath: profilePath)
         let data = try Data(contentsOf: url)
         profile = try decoder.decode(ReviewProfile.self, from: data)
     } else if let url = bundledProfileURL(name: defaultBundledProfileName(config: config)),
@@ -830,7 +1695,11 @@ func loadReviewProfile(path: String?, config: AppConfig) throws -> ReviewProfile
         profile = defaultReviewProfile(config: config)
     }
 
-    return profile
+    return mergedReviewProfile(
+        profile,
+        with: config.instructionSet,
+        for: config.resolvedAIProvider
+    )
 }
 
 func loadReviewProfile(config: AppConfig) throws -> ReviewProfile {
@@ -857,42 +1726,206 @@ func timestampForFilename() -> String {
     return formatter.string(from: Date())
 }
 
+func sanitizedReportFilenameComponent(_ value: String) -> String {
+    let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+    var result = ""
+    var previousWasSeparator = false
+
+    for scalar in value.trimmingCharacters(in: .whitespacesAndNewlines).unicodeScalars {
+        if allowed.contains(scalar) {
+            result.unicodeScalars.append(scalar)
+            previousWasSeparator = false
+        } else if !previousWasSeparator {
+            result.append("-")
+            previousWasSeparator = true
+        }
+    }
+
+    let trimmed = result.trimmingCharacters(in: CharacterSet(charactersIn: "-._"))
+    return trimmed.isEmpty ? "worktree" : String(trimmed.prefix(64))
+}
+
+func codexWorktreeID(from path: String) -> String? {
+    let components = URL(fileURLWithPath: path).standardizedFileURL.pathComponents
+    guard let codexIndex = components.lastIndex(of: ".codex"),
+          codexIndex + 2 < components.count,
+          components[codexIndex + 1] == "worktrees" else {
+        return nil
+    }
+
+    let identifier = components[codexIndex + 2]
+    return identifier.isEmpty ? nil : identifier
+}
+
+func reportWorktreeID(config: AppConfig) -> String {
+    let repoPath = standardizedWorktreePath(repoURL(config: config).path)
+    if let codexID = codexWorktreeID(from: repoPath) {
+        return sanitizedReportFilenameComponent(codexID)
+    }
+    if standardizedWorktreePath(primaryWorktreePath(config: config)) == repoPath {
+        return "main"
+    }
+    if let branch = try? runGit(repoPath: repoPath, arguments: ["branch", "--show-current"]),
+       !branch.isEmpty {
+        return sanitizedReportFilenameComponent(branch)
+    }
+
+    let fallback = URL(fileURLWithPath: repoPath).lastPathComponent
+    return sanitizedReportFilenameComponent(fallback)
+}
+
+func reportWorktreeBranch(config: AppConfig) -> String? {
+    let repoPath = standardizedWorktreePath(repoURL(config: config).path)
+    guard let branch = try? runGit(repoPath: repoPath, arguments: ["branch", "--show-current"]),
+          !branch.isEmpty else {
+        return nil
+    }
+    return branch
+}
+
+func reviewLedgerKey(config: AppConfig, commit: String) -> String {
+    "\(reportWorktreeID(config: config)):\(commit)"
+}
+
+func reviewBundleKey(config: AppConfig, commit: String) -> String {
+    "\(reportWorktreeID(config: config))-\(commit)"
+}
+
+func primaryWorktreePath(config: AppConfig) -> String {
+    let repoPath = standardizedWorktreePath(repoURL(config: config).path)
+    guard let output = try? runGit(repoPath: repoPath, arguments: ["worktree", "list", "--porcelain"]),
+          let first = parseWorktreeList(output).first?.path else {
+        return repoPath
+    }
+    return standardizedWorktreePath(first)
+}
+
+func copiedReportsURL(config: AppConfig) -> URL {
+    URL(fileURLWithPath: primaryWorktreePath(config: config)).appendingPathComponent(config.reportsPath)
+}
+
+func gitExecutableURL() -> URL {
+    let candidates = [
+        ProcessInfo.processInfo.environment["AI_REVIEWER_GIT"],
+        expandedPath("~/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/git"),
+        "/opt/homebrew/bin/git",
+        "/usr/local/bin/git",
+        "/usr/bin/git"
+    ].compactMap { $0 }
+
+    for candidate in candidates {
+        if FileManager.default.isExecutableFile(atPath: candidate) {
+            return URL(fileURLWithPath: candidate)
+        }
+    }
+
+    return URL(fileURLWithPath: "/usr/bin/git")
+}
+
+func gitInvocationPrefix(repoPath: String) -> [String] {
+    let workTree = standardizedWorktreePath(repoPath)
+    let dotGitURL = URL(fileURLWithPath: workTree).appendingPathComponent(".git")
+    var isDirectory: ObjCBool = false
+
+    if FileManager.default.fileExists(atPath: dotGitURL.path, isDirectory: &isDirectory) {
+        if isDirectory.boolValue {
+            return ["--git-dir", dotGitURL.path, "--work-tree", workTree]
+        }
+
+        if let data = try? Data(contentsOf: dotGitURL),
+           let text = String(data: data, encoding: .utf8) {
+            let line = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.lowercased().hasPrefix("gitdir:") {
+                let rawPath = String(line.dropFirst("gitdir:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                let gitDir: String
+                if rawPath.hasPrefix("/") {
+                    gitDir = rawPath
+                } else {
+                    gitDir = URL(fileURLWithPath: workTree)
+                        .appendingPathComponent(rawPath)
+                        .standardizedFileURL
+                        .path
+                }
+                return ["--git-dir", gitDir, "--work-tree", workTree]
+            }
+        }
+    }
+
+    return ["-C", workTree]
+}
+
 func runGitData(repoPath: String, arguments: [String], maxOutputBytes: Int? = nil, allowTruncatedOutput: Bool = false) throws -> Data {
+    gitExecutionLock.lock()
+    defer { gitExecutionLock.unlock() }
+
     let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-    process.arguments = ["-C", repoPath] + arguments
+    process.executableURL = gitExecutableURL()
+    process.arguments = gitInvocationPrefix(repoPath: repoPath) + arguments
 
     let outputPipe = Pipe()
     let errorPipe = Pipe()
     let outputBuffer = PipeBuffer()
     let errorBuffer = PipeBuffer()
+    defer {
+        outputPipe.fileHandleForReading.closeFile()
+        outputPipe.fileHandleForWriting.closeFile()
+        errorPipe.fileHandleForReading.closeFile()
+        errorPipe.fileHandleForWriting.closeFile()
+    }
     process.standardOutput = outputPipe
     process.standardError = errorPipe
 
-    outputPipe.fileHandleForReading.readabilityHandler = { handle in
-        let data = handle.availableData
-        if let maxOutputBytes, !outputBuffer.append(data, maxBytes: maxOutputBytes) {
-            process.terminate()
-        } else if maxOutputBytes == nil {
-            outputBuffer.append(data)
+    let readerGroup = DispatchGroup()
+    readerGroup.enter()
+    DispatchQueue.global(qos: .utility).async {
+        defer { readerGroup.leave() }
+        while true {
+            let data = outputPipe.fileHandleForReading.readData(ofLength: 64 * 1024)
+            guard !data.isEmpty else {
+                return
+            }
+            if let maxOutputBytes, !outputBuffer.append(data, maxBytes: maxOutputBytes) {
+                process.terminate()
+                return
+            }
+            if maxOutputBytes == nil {
+                outputBuffer.append(data)
+            }
         }
     }
-    errorPipe.fileHandleForReading.readabilityHandler = { handle in
-        errorBuffer.append(handle.availableData)
+    readerGroup.enter()
+    DispatchQueue.global(qos: .utility).async {
+        defer { readerGroup.leave() }
+        while true {
+            let data = errorPipe.fileHandleForReading.readData(ofLength: 64 * 1024)
+            guard !data.isEmpty else {
+                return
+            }
+            errorBuffer.append(data)
+        }
+    }
+
+    let finished = DispatchSemaphore(value: 0)
+    process.terminationHandler = { _ in
+        finished.signal()
     }
 
     try process.run()
-    process.waitUntilExit()
+    outputPipe.fileHandleForWriting.closeFile()
+    errorPipe.fileHandleForWriting.closeFile()
 
-    outputPipe.fileHandleForReading.readabilityHandler = nil
-    errorPipe.fileHandleForReading.readabilityHandler = nil
-    let remainingOutput = outputPipe.fileHandleForReading.readDataToEndOfFile()
-    if let maxOutputBytes {
-        _ = outputBuffer.append(remainingOutput, maxBytes: maxOutputBytes)
-    } else {
-        outputBuffer.append(remainingOutput)
+    let timeoutSeconds = maxOutputBytes == nil ? 30 : 120
+    if finished.wait(timeout: .now() + .seconds(timeoutSeconds)) == .timedOut {
+        process.terminate()
+        if finished.wait(timeout: .now() + .seconds(2)) == .timedOut {
+            kill(process.processIdentifier, SIGKILL)
+            _ = finished.wait(timeout: .now() + .seconds(2))
+        }
+        readerGroup.wait()
+        throw AIReviewerError.commandFailed("git timed out after \(timeoutSeconds)s: git \(arguments.joined(separator: " "))")
     }
-    errorBuffer.append(errorPipe.fileHandleForReading.readDataToEndOfFile())
+
+    readerGroup.wait()
 
     let output = outputBuffer.snapshot()
     let errorOutput = String(data: errorBuffer.snapshot(), encoding: .utf8) ?? ""
@@ -923,6 +1956,20 @@ func repoURL(config: AppConfig) -> URL {
     URL(fileURLWithPath: expandedPath(config.repoPath))
 }
 
+struct WorktreeTarget {
+    let path: String
+    let head: String
+    let branch: String?
+
+    var displayName: String {
+        let name = URL(fileURLWithPath: path).lastPathComponent
+        if let branch, !branch.isEmpty {
+            return "\(name) (\(branch))"
+        }
+        return name
+    }
+}
+
 func reportsURL(config: AppConfig) -> URL {
     repoURL(config: config).appendingPathComponent(config.reportsPath)
 }
@@ -943,40 +1990,263 @@ func legacyCodexRunsURL(config: AppConfig) -> URL {
     cacheURL(config: config).appendingPathComponent("codex-runs")
 }
 
+func standardizedWorktreePath(_ path: String) -> String {
+    URL(fileURLWithPath: expandedPath(path)).standardizedFileURL.path
+}
+
+func gitDirURL(forWorktreePath path: String) -> URL? {
+    let worktreeURL = URL(fileURLWithPath: standardizedWorktreePath(path), isDirectory: true)
+    let dotGitURL = worktreeURL.appendingPathComponent(".git")
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: dotGitURL.path, isDirectory: &isDirectory) else {
+        return nil
+    }
+    if isDirectory.boolValue {
+        return dotGitURL
+    }
+    guard let data = try? Data(contentsOf: dotGitURL),
+          let text = String(data: data, encoding: .utf8) else {
+        return nil
+    }
+    let line = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard line.lowercased().hasPrefix("gitdir:") else {
+        return nil
+    }
+    let rawPath = String(line.dropFirst("gitdir:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+    if rawPath.hasPrefix("/") {
+        return URL(fileURLWithPath: rawPath).standardizedFileURL
+    }
+    return worktreeURL.appendingPathComponent(rawPath).standardizedFileURL
+}
+
+func commonGitDirURL(for gitDirURL: URL) -> URL {
+    let commonDirURL = gitDirURL.appendingPathComponent("commondir")
+    guard let data = try? Data(contentsOf: commonDirURL),
+          let text = String(data: data, encoding: .utf8) else {
+        return gitDirURL
+    }
+    let rawPath = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    if rawPath.hasPrefix("/") {
+        return URL(fileURLWithPath: rawPath).standardizedFileURL
+    }
+    return gitDirURL.appendingPathComponent(rawPath).standardizedFileURL
+}
+
+func packedRef(in commonGitDirURL: URL, ref: String) -> String? {
+    let packedRefsURL = commonGitDirURL.appendingPathComponent("packed-refs")
+    guard let data = try? Data(contentsOf: packedRefsURL),
+          let text = String(data: data, encoding: .utf8) else {
+        return nil
+    }
+    for line in text.split(separator: "\n").map(String.init) {
+        if line.hasPrefix("#") || line.hasPrefix("^") {
+            continue
+        }
+        let parts = line.split(separator: " ", maxSplits: 1).map(String.init)
+        if parts.count == 2, parts[1] == ref {
+            return parts[0]
+        }
+    }
+    return nil
+}
+
+func resolveGitHead(worktreePath: String) -> (head: String, branch: String?)? {
+    guard let gitDirURL = gitDirURL(forWorktreePath: worktreePath),
+          let headData = try? Data(contentsOf: gitDirURL.appendingPathComponent("HEAD")),
+          let headText = String(data: headData, encoding: .utf8) else {
+        return nil
+    }
+    let headLine = headText.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard headLine.hasPrefix("ref: ") else {
+        return headLine.isEmpty ? nil : (headLine, nil)
+    }
+    let ref = String(headLine.dropFirst("ref: ".count))
+    let commonDirURL = commonGitDirURL(for: gitDirURL)
+    let refURL = commonDirURL.appendingPathComponent(ref)
+    let resolved = (try? String(contentsOf: refURL, encoding: .utf8))?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        ?? packedRef(in: commonDirURL, ref: ref)
+    guard let resolved, !resolved.isEmpty else {
+        return nil
+    }
+    let branch = ref.hasPrefix("refs/heads/") ? String(ref.dropFirst("refs/heads/".count)) : ref
+    return (resolved, branch)
+}
+
+func worktreeStateKey(config: AppConfig) -> String {
+    standardizedWorktreePath(repoURL(config: config).path)
+}
+
+func configForWorktree(_ config: AppConfig, path: String) -> AppConfig {
+    var next = config
+    next.repoPath = path
+    return next
+}
+
+func currentWorktreeTarget(config: AppConfig) throws -> WorktreeTarget {
+    let repoPath = standardizedWorktreePath(repoURL(config: config).path)
+    guard let resolved = resolveGitHead(worktreePath: repoPath) else {
+        throw AIReviewerError.invalidPath("\(repoPath) is not a Git worktree")
+    }
+    return WorktreeTarget(path: repoPath, head: resolved.head, branch: resolved.branch)
+}
+
+func parseWorktreeList(_ output: String) -> [(path: String, head: String?, branch: String?)] {
+    var entries: [(path: String, head: String?, branch: String?)] = []
+    var currentPath: String?
+    var currentHead: String?
+    var currentBranch: String?
+
+    func flushCurrent() {
+        guard let currentPath else {
+            return
+        }
+        entries.append((path: currentPath, head: currentHead, branch: currentBranch))
+    }
+
+    for line in output.split(separator: "\n", omittingEmptySubsequences: false).map(String.init) {
+        if line.hasPrefix("worktree ") {
+            flushCurrent()
+            currentPath = String(line.dropFirst("worktree ".count))
+            currentHead = nil
+            currentBranch = nil
+        } else if line.hasPrefix("HEAD ") {
+            currentHead = String(line.dropFirst("HEAD ".count))
+        } else if line.hasPrefix("branch ") {
+            let ref = String(line.dropFirst("branch ".count))
+            currentBranch = ref.hasPrefix("refs/heads/") ? String(ref.dropFirst("refs/heads/".count)) : ref
+        }
+    }
+
+    flushCurrent()
+    return entries
+}
+
+func discoveredWorktreeTargets(config: AppConfig) throws -> [WorktreeTarget] {
+    let basePath = standardizedWorktreePath(repoURL(config: config).path)
+    guard let baseGitDirURL = gitDirURL(forWorktreePath: basePath) else {
+        return [try currentWorktreeTarget(config: config)]
+    }
+    let commonDirURL = commonGitDirURL(for: baseGitDirURL)
+    var paths = [basePath]
+    let worktreesURL = commonDirURL.appendingPathComponent("worktrees", isDirectory: true)
+    if let entries = try? FileManager.default.contentsOfDirectory(at: worktreesURL, includingPropertiesForKeys: nil) {
+        for entry in entries {
+            let gitdirURL = entry.appendingPathComponent("gitdir")
+            guard let data = try? Data(contentsOf: gitdirURL),
+                  let text = String(data: data, encoding: .utf8) else {
+                continue
+            }
+            let dotGitPath = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !dotGitPath.isEmpty else {
+                continue
+            }
+            let worktreePath = URL(fileURLWithPath: dotGitPath)
+                .deletingLastPathComponent()
+                .standardizedFileURL
+                .path
+            paths.append(worktreePath)
+        }
+    }
+
+    var seen = Set<String>()
+    let targets = paths.compactMap { rawPath -> WorktreeTarget? in
+        let path = standardizedWorktreePath(rawPath)
+        guard seen.insert(path).inserted,
+              FileManager.default.fileExists(atPath: path),
+              let resolved = resolveGitHead(worktreePath: path) else {
+            return nil
+        }
+        return WorktreeTarget(path: path, head: resolved.head, branch: resolved.branch)
+    }
+
+    if targets.isEmpty {
+        return [try currentWorktreeTarget(config: config)]
+    }
+
+    return targets
+}
+
+func configuredWorktreeTargets(config: AppConfig) throws -> [WorktreeTarget] {
+    if config.shouldWatchAllWorktrees {
+        return try discoveredWorktreeTargets(config: config)
+    }
+
+    return [try currentWorktreeTarget(config: config)]
+}
+
+func configuredWorktreeConfigs(config: AppConfig) throws -> [AppConfig] {
+    try configuredWorktreeTargets(config: config).map { target in
+        configForWorktree(config, path: target.path)
+    }
+}
+
 func validatePaths(config: AppConfig) throws {
     let repoPath = repoURL(config: config).path
     guard FileManager.default.fileExists(atPath: repoPath) else {
         throw AIReviewerError.missingPath(repoPath)
     }
 
-    let insideWorkTree = try runGit(repoPath: repoPath, arguments: ["rev-parse", "--is-inside-work-tree"])
-    guard insideWorkTree == "true" else {
+    guard resolveGitHead(worktreePath: repoPath) != nil else {
         throw AIReviewerError.invalidPath("\(repoPath) is not a Git worktree")
     }
+    try FileManager.default.createDirectory(at: copiedReportsURL(config: config), withIntermediateDirectories: true)
+}
 
-    _ = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
-    try FileManager.default.createDirectory(at: reportsURL(config: config), withIntermediateDirectories: true)
+func validateProviderRuntime(config: AppConfig) throws {
+    switch config.resolvedAIProvider {
+    case .codex:
+        _ = try resolveCodexExecutable()
+        let authURL = URL(fileURLWithPath: expandedPath(config.codexHome)).appendingPathComponent("auth.json")
+        guard FileManager.default.fileExists(atPath: authURL.path) else {
+            throw AIReviewerError.invalidConfig(
+                "Codex is not authenticated. Run `codex login` before starting AI Reviewer."
+            )
+        }
+    case .cursor:
+        _ = try resolveCursorAgentExecutable()
+        guard resolvedCursorAPIKey(config: config) != nil || cursorAuthMaterialExists(at: config.resolvedCursorHome) else {
+            throw AIReviewerError.invalidConfig(
+                "Cursor is not authenticated. Run `agent login`, set CURSOR_API_KEY, or save a Cursor API key in Settings."
+            )
+        }
+    case .openrouter:
+        guard resolvedOpenRouterAPIKey(config: config) != nil else {
+            throw AIReviewerError.invalidConfig(
+                "OpenRouter is not authenticated. Set OPENROUTER_API_KEY or save an API key in Settings."
+            )
+        }
+    }
 }
 
 func validationSummary(config: AppConfig) throws -> String {
     try validatePaths(config: config)
+    try validateProviderRuntime(config: config)
 
     let repoPath = repoURL(config: config).path
     let head = try runGit(repoPath: repoPath, arguments: ["rev-parse", "--short", "HEAD"])
     let branch = try runGit(repoPath: repoPath, arguments: ["branch", "--show-current"])
+    let worktrees = try configuredWorktreeTargets(config: config)
     let profile = try loadReviewProfile(config: config)
 
     return """
     AI Reviewer
     repo: \(repoPath)
-    reports: \(reportsURL(config: config).path)
+    reports: \(copiedReportsURL(config: config).path)
     cache: \(cacheURL(config: config).path)
     state: \(stateURL(config: config).path)
     codexHome: \(expandedPath(config.codexHome))
     aiProvider: \(config.resolvedAIProvider.rawValue)
+    providerRuntime: ready
     cursorHome: \(expandedPath(config.resolvedCursorHome))
     cursorModel: \(config.resolvedCursorModel)
+    cursorAPIKey: \(resolvedCursorAPIKey(config: config) == nil ? "(not configured)" : "(configured)")
+    openRouterModel: \(config.resolvedOpenRouterModel)
+    openRouterAPIKey: \(resolvedOpenRouterAPIKey(config: config) == nil ? "(not configured)" : "(configured)")
     reviewProfile: \(profile.name)
+    instructionSetModelOverride: \(config.instructionSet?.defaultModel ?? "(none)")
+    instructionSetCodexDefaultEffort: \(config.instructionSet?.providerDefaultReasoningEffort(for: .codex) ?? "(model default)")
+    instructionSetAgentsOverride: \(config.instructionSet?.agents?.count ?? 0)
     reviewProfileProvider: \(profile.resolvedProvider?.rawValue ?? "(unspecified)")
     head: \(head)
     branch: \(branch.isEmpty ? "(detached)" : branch)
@@ -984,6 +2254,8 @@ func validationSummary(config: AppConfig) throws -> String {
     maxParallelCommitReviews: \(config.commitReviewConcurrency)
     pollIntervalSeconds: \(config.pollIntervalSeconds)
     startWatcherOnLaunch: \(config.shouldStartWatcherOnLaunch)
+    watchAllWorktrees: \(config.shouldWatchAllWorktrees)
+    watchedWorktrees: \(worktrees.count)
     hideDockIcon: \(config.shouldHideDockIcon)
     reviewCurrentHeadOnStartup: \(config.shouldReviewCurrentHeadOnStartup)
     sweepDepth: \(config.reviewSweepDepth)
@@ -1001,6 +2273,912 @@ func validate(config: AppConfig) throws {
     print(try validationSummary(config: config))
 }
 
+func statusSummary(config: AppConfig) throws -> String {
+    let state = try loadState(config: config)
+    let profile = try loadReviewProfile(config: config)
+    let provider = config.resolvedAIProvider
+    let providerSelection = config.instructionSet?.engineModels?[provider.rawValue]
+    let logURL = watcherLogURL()
+    let logAttributes = try? FileManager.default.attributesOfItem(atPath: logURL.path)
+    let logBytes = (logAttributes?[.size] as? NSNumber)?.intValue ?? 0
+    let appRunning = !NSRunningApplication.runningApplications(withBundleIdentifier: "com.ai-reviewer").isEmpty
+    let latestWatcherLine = readLogText(lineLimit: 1).trimmingCharacters(in: .whitespacesAndNewlines)
+
+    return """
+    AI Reviewer Status
+    appRunning: \(appRunning)
+    provider: \(provider.rawValue)
+    profile: \(profile.name)
+    defaultModel: \(providerSelection?.defaultModel ?? profile.defaultModel ?? "(engine default)")
+    defaultReasoningEffort: \(providerSelection?.defaultReasoningEffort ?? "(model default)")
+    configuredAgents: \(providerSelection?.agents?.count ?? profile.agents.count)
+    reviewed: \(state.reviewed.count)
+    failed: \(state.failed.count)
+    skipped: \(state.skipped?.count ?? 0)
+    lastSeenHead: \(state.lastSeenHead ?? "(none)")
+    trackedWorktreeHeads: \(state.worktreeHeads?.count ?? 0)
+    stateUpdatedAt: \(state.updatedAt ?? "(unknown)")
+    statePath: \(stateURL(config: config).path)
+    watcherLogPath: \(logURL.path)
+    watcherLogBytes: \(logBytes)
+    latestWatcherStatus: \(latestWatcherLine)
+    """
+}
+
+func jsonNullable(_ value: String?) -> Any {
+    value ?? NSNull()
+}
+
+func statusJSONObject(config: AppConfig) throws -> [String: Any] {
+    let state = try loadState(config: config)
+    let profile = try loadReviewProfile(config: config)
+    let provider = config.resolvedAIProvider
+    let providerSelection = config.instructionSet?.engineModels?[provider.rawValue]
+    let logURL = watcherLogURL()
+    let logAttributes = try? FileManager.default.attributesOfItem(atPath: logURL.path)
+    let logBytes = (logAttributes?[.size] as? NSNumber)?.intValue ?? 0
+    let appRunning = !NSRunningApplication.runningApplications(withBundleIdentifier: "com.ai-reviewer").isEmpty
+
+    return [
+        "appRunning": appRunning,
+        "provider": provider.rawValue,
+        "profile": profile.name,
+        "defaultModel": jsonNullable(providerSelection?.defaultModel ?? profile.defaultModel),
+        "defaultReasoningEffort": jsonNullable(providerSelection?.defaultReasoningEffort),
+        "configuredAgents": providerSelection?.agents?.count ?? profile.agents.count,
+        "reviewed": state.reviewed.count,
+        "failed": state.failed.count,
+        "skipped": state.skipped?.count ?? 0,
+        "lastSeenHead": jsonNullable(state.lastSeenHead),
+        "trackedWorktreeHeads": state.worktreeHeads?.count ?? 0,
+        "stateUpdatedAt": jsonNullable(state.updatedAt),
+        "statePath": stateURL(config: config).path,
+        "watcherLogPath": logURL.path,
+        "watcherLogBytes": logBytes,
+        "latestWatcherStatus": readLogText(lineLimit: 1).trimmingCharacters(in: .whitespacesAndNewlines)
+    ]
+}
+
+func jsonText(_ value: Any) throws -> String {
+    let data = try JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys, .fragmentsAllowed])
+    return String(decoding: data, as: UTF8.self)
+}
+
+func configJSONObject(at path: String) throws -> [String: Any] {
+    let url = URL(fileURLWithPath: expandedPath(path))
+    let data = try Data(contentsOf: url)
+    guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        throw AIReviewerError.invalidConfig("Config root must be a JSON object")
+    }
+    return object
+}
+
+func isSecretConfigKey(_ key: String) -> Bool {
+    let normalized = key.lowercased()
+    return normalized.contains("apikey") || normalized.contains("secret") || normalized.contains("token")
+}
+
+func redactedConfigValue(_ value: Any, key: String? = nil) -> Any {
+    if let key, isSecretConfigKey(key), !(value is NSNull) {
+        return "(configured)"
+    }
+    if let dictionary = value as? [String: Any] {
+        var redacted: [String: Any] = [:]
+        for (nestedKey, nestedValue) in dictionary {
+            redacted[nestedKey] = redactedConfigValue(nestedValue, key: nestedKey)
+        }
+        return redacted
+    }
+    if let array = value as? [Any] {
+        return array.map { redactedConfigValue($0) }
+    }
+    return value
+}
+
+func redactedConfigObject(_ object: [String: Any]) -> [String: Any] {
+    var result: [String: Any] = [:]
+    for (key, value) in object {
+        result[key] = redactedConfigValue(value, key: key)
+    }
+    return result
+}
+
+func configValue(in object: [String: Any], path: String) throws -> Any {
+    let components = path.split(separator: ".").map(String.init)
+    guard !components.isEmpty else {
+        return object
+    }
+    var current: Any = object
+    for component in components {
+        guard let dictionary = current as? [String: Any], let next = dictionary[component] else {
+            throw AIReviewerError.invalidConfig("No config value exists at '\(path)'")
+        }
+        current = next
+    }
+    return current
+}
+
+func parsedCLIJSONValue(_ rawValue: String) -> Any {
+    if let data = rawValue.data(using: .utf8),
+       let parsed = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) {
+        return parsed
+    }
+    return rawValue
+}
+
+func settingConfigValue(_ value: Any?, path: String, in object: inout [String: Any]) throws {
+    let components = path.split(separator: ".").map(String.init)
+    guard let leaf = components.last else {
+        throw AIReviewerError.invalidConfig("Config path cannot be empty")
+    }
+
+    func update(_ dictionary: inout [String: Any], at index: Int) throws {
+        let component = components[index]
+        if index == components.count - 1 {
+            if let value {
+                dictionary[leaf] = value
+            } else {
+                dictionary.removeValue(forKey: leaf)
+            }
+            return
+        }
+
+        var child = dictionary[component] as? [String: Any] ?? [:]
+        try update(&child, at: index + 1)
+        dictionary[component] = child
+    }
+
+    try update(&object, at: 0)
+}
+
+func saveConfigJSONObject(_ object: [String: Any], to path: String) throws -> AppConfig {
+    let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+    let decoded: AppConfig
+    do {
+        decoded = try JSONDecoder().decode(AppConfig.self, from: data)
+    } catch {
+        throw AIReviewerError.invalidConfig(error.localizedDescription)
+    }
+    try saveCLIConfig(decoded, to: path)
+    return decoded
+}
+
+func cliOption(_ name: String, arguments: [String]) -> String? {
+    guard let index = arguments.firstIndex(of: name), arguments.indices.contains(index + 1) else {
+        return nil
+    }
+    return arguments[index + 1]
+}
+
+func cliProvider(_ rawValue: String?) throws -> AIProvider? {
+    guard let rawValue else {
+        return nil
+    }
+    guard let provider = AIProvider(rawValue: rawValue) else {
+        throw AIReviewerError.invalidConfig("Unsupported provider '\(rawValue)'")
+    }
+    return provider
+}
+
+func runAppCLI(arguments: [String]) throws {
+    switch arguments.first {
+    case "show":
+        try postAppCommand(action: "show")
+        print("Opened AI Reviewer")
+    case "refresh":
+        try postAppCommand(action: "refresh")
+        print("Refreshed the active app tab")
+    case "quit":
+        try postAppCommand(action: "quit", launchIfNeeded: false)
+        print("Sent app quit command")
+    case "tab":
+        guard arguments.count == 2, ["reviews", "logs", "settings", "instruction-set"].contains(arguments[1]) else {
+            throw AIReviewerError.missingArgument(usage())
+        }
+        try postAppCommand(action: "tab", value: arguments[1])
+        print("Switched app to \(arguments[1])")
+    default:
+        throw AIReviewerError.missingArgument(usage())
+    }
+}
+
+func runWatcherCLI(arguments: [String]) throws {
+    guard arguments.count == 1 else {
+        throw AIReviewerError.missingArgument(usage())
+    }
+    switch arguments[0] {
+    case "start":
+        try postAppCommand(action: "watcher-start")
+        print("Sent watcher start command")
+    case "stop":
+        guard !NSRunningApplication.runningApplications(withBundleIdentifier: "com.ai-reviewer").isEmpty else {
+            print("AI Reviewer is not running")
+            return
+        }
+        try postAppCommand(action: "watcher-stop", launchIfNeeded: false)
+        print("Sent watcher stop command")
+    default: throw AIReviewerError.missingArgument(usage())
+    }
+}
+
+func ledgerWorktreeID(ledgerKey: String, storedID: String?, defaultWorktreeID: String) -> String {
+    if let storedID, !storedID.isEmpty {
+        return storedID
+    }
+    if let separator = ledgerKey.firstIndex(of: ":") {
+        return String(ledgerKey[..<separator])
+    }
+    return defaultWorktreeID
+}
+
+func activeCLIReviewLockDetails(config: AppConfig, commits: Set<String>) -> [String: String] {
+    let directory = reviewCommitLockURL(commit: "placeholder").deletingLastPathComponent()
+    let keys: Set<URLResourceKey> = [.contentModificationDateKey, .isRegularFileKey]
+    guard let urls = try? FileManager.default.contentsOfDirectory(
+        at: directory,
+        includingPropertiesForKeys: Array(keys),
+        options: [.skipsHiddenFiles]
+    ) else {
+        return [:]
+    }
+    let cutoff = Date().addingTimeInterval(-max(86_400, Double(config.codexRunTimeoutSeconds) * 2))
+    let candidates = urls.compactMap { url -> String? in
+        let commit = url.deletingPathExtension().lastPathComponent
+        guard commits.contains(commit),
+              let values = try? url.resourceValues(forKeys: keys),
+              values.isRegularFile == true,
+              (values.contentModificationDate ?? .distantPast) >= cutoff else {
+            return nil
+        }
+        return commit
+    }
+    return activeReviewLockDetails(for: candidates)
+}
+
+func cliReviewHistory(config: AppConfig, activeCommitQuery: String? = nil) throws -> [ReviewHistoryItem] {
+    let state = try loadState(config: config)
+    let recentItems = try loadReviewHistory(config: config, runningCommits: [], queuedCommits: [])
+    let defaultWorktreeID = reportWorktreeID(config: config)
+    let ledgerShas = Set(
+        state.reviewed.values.map(\.sha) +
+        state.failed.values.map(\.sha) +
+        (state.skipped?.values.map(\.sha) ?? []) +
+        recentItems.map(\.sha)
+    )
+    var activeCandidates = Set(recentItems.map(\.sha))
+    if let activeCommitQuery {
+        activeCandidates.formUnion(ledgerShas.filter {
+            $0.lowercased() == activeCommitQuery || $0.lowercased().hasPrefix(activeCommitQuery)
+        })
+    }
+    let activeLocks = activeCLIReviewLockDetails(config: config, commits: activeCandidates)
+    var itemsByLedgerKey: [String: ReviewHistoryItem] = [:]
+
+    func recentMetadata(ledgerKey: String, sha: String, worktreeID: String) -> ReviewHistoryItem? {
+        recentItems.first { $0.ledgerKey == ledgerKey }
+            ?? recentItems.first { $0.sha == sha && $0.worktreeID == worktreeID }
+            ?? recentItems.first { $0.sha == sha }
+    }
+
+    func makeItem(
+        ledgerKey: String,
+        sha: String,
+        shortSha: String,
+        storedWorktreeID: String?,
+        storedWorktreePath: String?,
+        storedWorktreeBranch: String?,
+        timestamp: String,
+        terminalStatus: ReviewHistoryStatus,
+        detail: String,
+        reviewPath: String?,
+        localReviewPath: String?,
+        bundlePath: String?,
+        logPath: String?
+    ) -> ReviewHistoryItem {
+        let worktreeID = ledgerWorktreeID(
+            ledgerKey: ledgerKey,
+            storedID: storedWorktreeID,
+            defaultWorktreeID: defaultWorktreeID
+        )
+        let metadata = recentMetadata(ledgerKey: ledgerKey, sha: sha, worktreeID: worktreeID)
+        let runningDetail = activeLocks[sha]
+        return ReviewHistoryItem(
+            sha: sha,
+            shortSha: shortSha,
+            worktreeID: worktreeID,
+            worktreePath: storedWorktreePath ?? metadata?.worktreePath ?? repoURL(config: config).path,
+            worktreeBranch: storedWorktreeBranch ?? metadata?.worktreeBranch,
+            ledgerKey: ledgerKey,
+            date: metadata?.date ?? timestamp,
+            subject: metadata?.subject ?? "Commit \(shortSha)",
+            status: runningDetail == nil ? terminalStatus : .running,
+            detail: runningDetail ?? detail,
+            reviewPath: runningDetail == nil ? reviewPath : nil,
+            localReviewPath: runningDetail == nil ? localReviewPath : nil,
+            bundlePath: runningDetail == nil ? bundlePath : nil,
+            logPath: runningDetail == nil ? logPath : nil
+        )
+    }
+
+    for (ledgerKey, skipped) in state.skipped ?? [:] {
+        itemsByLedgerKey[ledgerKey] = makeItem(
+            ledgerKey: ledgerKey,
+            sha: skipped.sha,
+            shortSha: skipped.shortSha,
+            storedWorktreeID: skipped.worktreeID,
+            storedWorktreePath: skipped.worktreePath,
+            storedWorktreeBranch: skipped.worktreeBranch,
+            timestamp: skipped.skippedAt,
+            terminalStatus: .skipped,
+            detail: skipped.reason,
+            reviewPath: nil,
+            localReviewPath: nil,
+            bundlePath: nil,
+            logPath: nil
+        )
+    }
+
+    for (ledgerKey, failure) in state.failed {
+        itemsByLedgerKey[ledgerKey] = makeItem(
+            ledgerKey: ledgerKey,
+            sha: failure.sha,
+            shortSha: failure.shortSha,
+            storedWorktreeID: failure.worktreeID,
+            storedWorktreePath: failure.worktreePath,
+            storedWorktreeBranch: failure.worktreeBranch,
+            timestamp: failure.failedAt,
+            terminalStatus: .failed,
+            detail: failure.error,
+            reviewPath: failure.localReviewPath,
+            localReviewPath: failure.localReviewPath,
+            bundlePath: failure.bundlePath,
+            logPath: logPathForReviewPath(failure.localReviewPath)
+        )
+    }
+
+    for (ledgerKey, reviewed) in state.reviewed {
+        itemsByLedgerKey[ledgerKey] = makeItem(
+            ledgerKey: ledgerKey,
+            sha: reviewed.sha,
+            shortSha: reviewed.shortSha,
+            storedWorktreeID: reviewed.worktreeID,
+            storedWorktreePath: reviewed.worktreePath,
+            storedWorktreeBranch: reviewed.worktreeBranch,
+            timestamp: reviewed.reviewedAt,
+            terminalStatus: .completed,
+            detail: "Review completed.",
+            reviewPath: reviewed.copiedReportPath,
+            localReviewPath: reviewed.localReviewPath,
+            bundlePath: reviewed.bundlePath,
+            logPath: nil
+        )
+    }
+
+    for recent in recentItems {
+        let matchingLedgerKey = itemsByLedgerKey[recent.ledgerKey] != nil
+            ? recent.ledgerKey
+            : itemsByLedgerKey.first(where: {
+                $0.value.sha == recent.sha && $0.value.worktreeID == recent.worktreeID
+            })?.key
+        if recent.status == .running || recent.status == .queued {
+            itemsByLedgerKey[matchingLedgerKey ?? recent.ledgerKey] = recent
+        } else if matchingLedgerKey == nil {
+            itemsByLedgerKey[recent.ledgerKey] = recent
+        }
+    }
+
+    return itemsByLedgerKey.values.sorted {
+        if $0.date != $1.date {
+            return $0.date > $1.date
+        }
+        return $0.ledgerKey < $1.ledgerKey
+    }
+}
+
+func enrichedReviewMetadata(config: AppConfig, item: ReviewHistoryItem) -> (date: String, subject: String) {
+    guard item.subject == "Commit \(item.shortSha)" else {
+        return (item.date, item.subject)
+    }
+    var paths = [item.worktreePath]
+    if let configured = try? configuredWorktreeConfigs(config: config) {
+        paths.append(contentsOf: configured.map { repoURL(config: $0).path })
+    }
+    for path in Array(Set(paths)) {
+        guard let output = try? runGit(
+            repoPath: path,
+            arguments: ["show", "-s", "--date=iso-strict", "--format=%ad%x1f%s", item.sha]
+        ) else {
+            continue
+        }
+        let parts = output.split(separator: "\u{1f}", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+        if parts.count == 2 {
+            return (parts[0], parts[1])
+        }
+    }
+    return (item.date, item.subject)
+}
+
+struct ReviewArtifactInfo {
+    let text: String?
+    let path: String?
+    let source: String?
+    let verdict: String?
+    let findings: [String]
+}
+
+func reviewArtifactInfo(for item: ReviewHistoryItem) -> ReviewArtifactInfo {
+    var candidates: [(path: String, source: String)] = []
+    if let path = item.reviewPath {
+        candidates.append((path, path == item.localReviewPath ? "cached" : "copied"))
+    }
+    if let localPath = item.localReviewPath, !candidates.contains(where: { $0.path == localPath }) {
+        candidates.append((localPath, "cached"))
+    }
+    if let bundlePath = item.bundlePath,
+       let bundleReview = resolveBundleReviewURL(bundleURL: URL(fileURLWithPath: bundlePath, isDirectory: true))?.path,
+       !candidates.contains(where: { $0.path == bundleReview }) {
+        candidates.append((bundleReview, "cached"))
+    }
+    var selectedArtifact: (text: String, path: String, source: String)?
+    for candidate in candidates {
+        if let text = readTextFileIfPresent(path: candidate.path) {
+            selectedArtifact = (text, candidate.path, candidate.source)
+            break
+        }
+    }
+    guard let selectedArtifact else {
+        return ReviewArtifactInfo(text: nil, path: item.reviewPath, source: nil, verdict: nil, findings: [])
+    }
+    let text = selectedArtifact.text
+    let lines = text.components(separatedBy: .newlines)
+    let verdict = lines.first { $0.hasPrefix("VERDICT:") }
+        .map { String($0.dropFirst("VERDICT:".count)).trimmingCharacters(in: .whitespaces) }
+    let findings = lines.filter {
+        $0.range(of: #"^\[[0-9]+\|"#, options: .regularExpression) != nil
+    }
+    return ReviewArtifactInfo(
+        text: text,
+        path: selectedArtifact.path,
+        source: selectedArtifact.source,
+        verdict: verdict,
+        findings: findings
+    )
+}
+
+func reviewItemJSONObject(config: AppConfig, item: ReviewHistoryItem) -> [String: Any] {
+    let metadata = enrichedReviewMetadata(config: config, item: item)
+    let artifact = reviewArtifactInfo(for: item)
+    let expectedBundleURL = bundlesURL(config: config)
+        .appendingPathComponent("\(item.worktreeID)-\(item.sha)", isDirectory: true)
+    let bundlePath = item.bundlePath
+        ?? (FileManager.default.fileExists(atPath: expectedBundleURL.path) ? expectedBundleURL.path : nil)
+    let logPath = item.logPath
+        ?? bundlePath.flatMap {
+            resolveBundleReviewLogURL(bundleURL: URL(fileURLWithPath: $0, isDirectory: true))?.path
+        }
+    return [
+        "sha": item.sha,
+        "shortSha": item.shortSha,
+        "ledgerKey": item.ledgerKey,
+        "worktree": [
+            "id": item.worktreeID,
+            "path": item.worktreePath,
+            "branch": jsonNullable(item.worktreeBranch)
+        ],
+        "timestamp": metadata.date,
+        "subject": metadata.subject,
+        "status": item.status.rawValue.lowercased(),
+        "detail": item.detail,
+        "detailsIncluded": true,
+        "artifactReady": item.status == .completed && artifact.text != nil,
+        "artifactChecked": true,
+        "artifactSource": jsonNullable(artifact.source),
+        "verdict": jsonNullable(artifact.verdict),
+        "findings": artifact.findings,
+        "reportPath": jsonNullable(artifact.path),
+        "bundlePath": jsonNullable(bundlePath),
+        "logPath": jsonNullable(logPath)
+    ]
+}
+
+func reviewListItemJSONObject(item: ReviewHistoryItem) -> [String: Any] {
+    let artifactSource: String?
+    if let reviewPath = item.reviewPath {
+        artifactSource = reviewPath == item.localReviewPath ? "cached" : "copied"
+    } else {
+        artifactSource = nil
+    }
+    return [
+        "sha": item.sha,
+        "shortSha": item.shortSha,
+        "ledgerKey": item.ledgerKey,
+        "worktree": [
+            "id": item.worktreeID,
+            "path": item.worktreePath,
+            "branch": jsonNullable(item.worktreeBranch)
+        ],
+        "timestamp": item.date,
+        "subject": item.subject,
+        "status": item.status.rawValue.lowercased(),
+        "detail": item.detail,
+        "detailsIncluded": false,
+        "artifactReady": item.status == .completed && item.reviewPath != nil,
+        "artifactChecked": false,
+        "artifactSource": jsonNullable(artifactSource),
+        "verdict": NSNull(),
+        "findings": NSNull(),
+        "reportPath": jsonNullable(item.reviewPath),
+        "bundlePath": jsonNullable(item.bundlePath),
+        "logPath": jsonNullable(item.logPath)
+    ]
+}
+
+struct ReviewCLIQueryOptions {
+    let positional: [String]
+    let jsonOutput: Bool
+    let details: Bool
+    let limit: Int?
+    let offset: Int
+}
+
+func parseReviewCLIQueryOptions(_ arguments: [String]) throws -> ReviewCLIQueryOptions {
+    var positional: [String] = []
+    var jsonOutput = false
+    var details = false
+    var limit: Int?
+    var offset = 0
+    var index = 0
+    while index < arguments.count {
+        let argument = arguments[index]
+        switch argument {
+        case "--json":
+            jsonOutput = true
+        case "--details":
+            details = true
+        case "--limit", "--offset":
+            guard arguments.indices.contains(index + 1),
+                  let value = Int(arguments[index + 1]) else {
+                throw AIReviewerError.invalidReviewOption("\(argument) requires an integer value")
+            }
+            if argument == "--limit" {
+                guard value > 0 else {
+                    throw AIReviewerError.invalidReviewOption("--limit must be greater than zero")
+                }
+                limit = value
+            } else {
+                guard value >= 0 else {
+                    throw AIReviewerError.invalidReviewOption("--offset cannot be negative")
+                }
+                offset = value
+            }
+            index += 1
+        default:
+            if argument.hasPrefix("--") {
+                throw AIReviewerError.invalidReviewOption("unsupported option '\(argument)'")
+            }
+            positional.append(argument)
+        }
+        index += 1
+    }
+    return ReviewCLIQueryOptions(
+        positional: positional,
+        jsonOutput: jsonOutput,
+        details: details,
+        limit: limit,
+        offset: offset
+    )
+}
+
+func runReviewsCLI(config: AppConfig, arguments: [String]) throws {
+    let options = try parseReviewCLIQueryOptions(arguments)
+    let jsonOutput = options.jsonOutput
+    let positional = options.positional
+    switch positional.first {
+    case "list":
+        guard positional.count <= 2 else {
+            throw AIReviewerError.missingArgument(usage())
+        }
+        let filter = positional.count > 1 ? positional[1].lowercased() : "all"
+        let allowed = ["all", "completed", "failed", "skipped", "queued", "running", "pending"]
+        guard allowed.contains(filter) else {
+            throw AIReviewerError.invalidReviewFilter(filter)
+        }
+        if options.details {
+            guard jsonOutput else {
+                throw AIReviewerError.invalidReviewOption("--details requires --json")
+            }
+            guard let limit = options.limit, limit <= 100 else {
+                throw AIReviewerError.invalidReviewOption("--details requires --limit with a value from 1 to 100")
+            }
+        }
+        let items = try cliReviewHistory(config: config)
+            .filter { filter == "all" || $0.status.rawValue.lowercased() == filter }
+        let start = min(options.offset, items.count)
+        let remaining = items.dropFirst(start)
+        let page = Array(remaining.prefix(options.limit ?? remaining.count))
+        if jsonOutput {
+            let objects = options.details
+                ? page.map { reviewItemJSONObject(config: config, item: $0) }
+                : page.map(reviewListItemJSONObject)
+            print(try jsonText(objects))
+        } else {
+            for item in page {
+                print("\(item.status.rawValue.lowercased())\t\(item.shortSha)\t\(item.worktreeID)\t\(item.subject)")
+            }
+        }
+    case "show":
+        guard options.limit == nil, options.offset == 0 else {
+            throw AIReviewerError.invalidReviewOption("--limit and --offset are only supported by reviews list")
+        }
+        guard positional.count == 2 else {
+            throw AIReviewerError.missingArgument(usage())
+        }
+        let normalized = positional[1].lowercased()
+        let matches = try cliReviewHistory(config: config, activeCommitQuery: normalized).filter {
+            $0.ledgerKey.lowercased() == normalized ||
+            $0.sha.lowercased() == normalized ||
+            $0.sha.lowercased().hasPrefix(normalized)
+        }
+        guard !matches.isEmpty else {
+            throw AIReviewerError.reviewNotFound(positional[1])
+        }
+        guard matches.count == 1, let item = matches.first else {
+            throw AIReviewerError.ambiguousReview(positional[1])
+        }
+        if jsonOutput {
+            print(try jsonText(reviewItemJSONObject(config: config, item: item)))
+        } else if let log = readTextFileIfPresent(path: item.logPath) {
+            let metadata = enrichedReviewMetadata(config: config, item: item)
+            print("Commit: \(item.sha)")
+            print("Ledger Key: \(item.ledgerKey)")
+            print("Worktree: \(item.worktreeID)")
+            print("Status: \(item.status.rawValue)")
+            print("Date: \(metadata.date)")
+            print("Subject: \(metadata.subject)")
+            print("Detail: \(item.detail)")
+            let artifact = reviewArtifactInfo(for: item)
+            print("Artifact: \(artifact.text == nil ? "Not ready" : "\(artifact.source ?? "available") at \(artifact.path ?? "unknown path")")")
+            if let review = artifact.text {
+                print("\n\(review)")
+            } else {
+                print("\nLog:\n\(log)")
+            }
+        } else {
+            let metadata = enrichedReviewMetadata(config: config, item: item)
+            print("Commit: \(item.sha)")
+            print("Ledger Key: \(item.ledgerKey)")
+            print("Worktree: \(item.worktreeID)")
+            print("Status: \(item.status.rawValue)")
+            print("Date: \(metadata.date)")
+            print("Subject: \(metadata.subject)")
+            print("Detail: \(item.detail)")
+            let artifact = reviewArtifactInfo(for: item)
+            print("Artifact: \(artifact.text == nil ? "Not ready" : "\(artifact.source ?? "available") at \(artifact.path ?? "unknown path")")")
+            if let review = artifact.text {
+                print("\n\(review)")
+            }
+        }
+    case "rerun":
+        guard !jsonOutput, !options.details, options.limit == nil, options.offset == 0, positional.count == 2 else {
+            throw AIReviewerError.missingArgument(usage())
+        }
+        try postAppCommand(action: "reviews-rerun", value: positional[1])
+        print("Queued rerun request for \(positional[1])")
+    case "queue-pending":
+        guard !jsonOutput, !options.details, options.limit == nil, options.offset == 0, positional.count == 1 else {
+            throw AIReviewerError.missingArgument(usage())
+        }
+        try postAppCommand(action: "reviews-queue-pending")
+        print("Queued failed and pending reviews")
+    case "reconcile":
+        guard !jsonOutput, !options.details, options.limit == nil, options.offset == 0, positional.count == 1 else {
+            throw AIReviewerError.missingArgument(usage())
+        }
+        let reports = try reviewPendingCommitsForConfiguredWorktrees(config: config)
+        print("Reconciliation completed with \(reports.count) new \(reports.count == 1 ? "report" : "reports")")
+    default:
+        throw AIReviewerError.missingArgument(usage())
+    }
+}
+
+func runConfigCLI(configPath: String, arguments: [String]) throws {
+    var object = try configJSONObject(at: configPath)
+    let showSecrets = arguments.contains("--show-secrets")
+    switch arguments.first {
+    case "show":
+        print(try jsonText(showSecrets ? object : redactedConfigObject(object)))
+    case "get":
+        guard arguments.count >= 2 else {
+            throw AIReviewerError.missingArgument(usage())
+        }
+        let value = try configValue(in: object, path: arguments[1])
+        let output = showSecrets ? value : redactedConfigValue(value, key: arguments[1].split(separator: ".").last.map(String.init))
+        print(try jsonText(output))
+    case "set":
+        guard arguments.count == 3 else {
+            throw AIReviewerError.missingArgument(usage())
+        }
+        try settingConfigValue(parsedCLIJSONValue(arguments[2]), path: arguments[1], in: &object)
+        _ = try saveConfigJSONObject(object, to: configPath)
+        print("Updated \(arguments[1])")
+    case "unset":
+        guard arguments.count == 2 else {
+            throw AIReviewerError.missingArgument(usage())
+        }
+        try settingConfigValue(nil, path: arguments[1], in: &object)
+        _ = try saveConfigJSONObject(object, to: configPath)
+        print("Removed \(arguments[1])")
+    case "restore-backup":
+        guard arguments.count == 1 else {
+            throw AIReviewerError.missingArgument(usage())
+        }
+        let configURL = URL(fileURLWithPath: expandedPath(configPath))
+        let backupURL = configURL.appendingPathExtension("cli-backup")
+        let backupData = try Data(contentsOf: backupURL)
+        let restored = try JSONDecoder().decode(AppConfig.self, from: backupData)
+        try validateCLIConfigMutation(restored)
+        if let currentData = try? Data(contentsOf: configURL) {
+            try currentData.write(to: configURL.appendingPathExtension("cli-restore-point"), options: .atomic)
+        }
+        try saveConfig(restored, to: configURL)
+        try postAppCommand(action: "reload-config", launchIfNeeded: false)
+        print("Restored \(backupURL.path)")
+    default:
+        throw AIReviewerError.missingArgument(usage())
+    }
+}
+
+func instructionSetJSON(_ instructionSet: InstructionSet?) throws -> Data {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    if let instructionSet {
+        return try encoder.encode(instructionSet)
+    }
+    return Data("null\n".utf8)
+}
+
+func runInstructionSetCLI(configPath: String, config: AppConfig, arguments: [String]) throws {
+    var next = config
+    switch arguments.first {
+    case "show":
+        print(String(decoding: try instructionSetJSON(config.instructionSet), as: UTF8.self))
+    case "export":
+        guard arguments.count == 2 else {
+            throw AIReviewerError.missingArgument(usage())
+        }
+        let url = URL(fileURLWithPath: expandedPath(arguments[1]))
+        try writeData(try instructionSetJSON(config.instructionSet), to: url)
+        print("Exported \(url.path)")
+    case "import":
+        guard arguments.count == 2 else {
+            throw AIReviewerError.missingArgument(usage())
+        }
+        let url = URL(fileURLWithPath: expandedPath(arguments[1]))
+        let data = try Data(contentsOf: url)
+        next.instructionSet = try JSONDecoder().decode(InstructionSet.self, from: data)
+        try saveCLIConfig(next, to: configPath)
+        print("Imported \(url.path)")
+    case "clear":
+        next.instructionSet = nil
+        try saveCLIConfig(next, to: configPath)
+        print("Cleared instruction set overrides")
+    default:
+        throw AIReviewerError.missingArgument(usage())
+    }
+}
+
+func runEngineCLI(configPath: String, config: AppConfig, arguments: [String]) throws {
+    switch arguments.first {
+    case "show":
+        print(config.resolvedAIProvider.rawValue)
+    case "set":
+        guard arguments.count == 2, let provider = try cliProvider(arguments[1]) else {
+            throw AIReviewerError.missingArgument(usage())
+        }
+        var next = config
+        next.aiProvider = provider.rawValue
+        try saveCLIConfig(next, to: configPath)
+        print("Engine set to \(provider.rawValue)")
+    default:
+        throw AIReviewerError.missingArgument(usage())
+    }
+}
+
+func runModelsCLI(configPath: String, config: AppConfig, arguments: [String]) throws {
+    switch arguments.first {
+    case "list":
+        let provider = try cliProvider(arguments.count > 1 ? arguments[1] : nil) ?? config.resolvedAIProvider
+        for model in availableModels(for: provider, config: config) {
+            if provider == .codex {
+                let options = codexReasoningEffortOptions(config: config, model: model)
+                let efforts = options.supported.isEmpty ? "none" : options.supported.joined(separator: ",")
+                print("\(model)\tdefault=\(options.defaultEffort ?? "none")\tefforts=\(efforts)")
+            } else {
+                print(model)
+            }
+        }
+    case "set":
+        guard arguments.count >= 2 else {
+            throw AIReviewerError.missingArgument(usage())
+        }
+        let model = arguments[1]
+        let provider = try cliProvider(cliOption("--provider", arguments: arguments)) ?? config.resolvedAIProvider
+        let requestedEffort = cliOption("--effort", arguments: arguments)
+        let agentID = cliOption("--agent", arguments: arguments)
+        let knownModels = availableModels(for: provider, config: config)
+        guard knownModels.contains(model) else {
+            throw AIReviewerError.invalidConfig("Model '\(model)' is not available for \(provider.rawValue)")
+        }
+
+        let effort: String?
+        if provider == .codex {
+            let options = codexReasoningEffortOptions(config: config, model: model)
+            if let requestedEffort, !options.supported.contains(requestedEffort) {
+                throw AIReviewerError.invalidConfig(
+                    "Effort '\(requestedEffort)' is not supported by \(model); choose \(options.supported.joined(separator: ", "))"
+                )
+            }
+            effort = requestedEffort ?? options.defaultEffort
+        } else {
+            guard requestedEffort == nil else {
+                throw AIReviewerError.invalidConfig("Reasoning effort only applies to Codex models")
+            }
+            effort = nil
+        }
+
+        var next = config
+        var instructionSet = next.instructionSet ?? InstructionSet(
+            defaultModel: nil,
+            globalInstructions: nil,
+            agents: nil,
+            engineModels: nil
+        )
+        var selections = instructionSet.engineModels ?? [:]
+        var selection = selections[provider.rawValue] ?? InstructionSetEngineModelSelection(
+            defaultModel: nil,
+            agents: nil,
+            defaultReasoningEffort: nil,
+            agentReasoningEfforts: nil
+        )
+
+        if let agentID {
+            var agentModels = selection.agents ?? [:]
+            agentModels[agentID] = model
+            selection.agents = agentModels
+            var agentEfforts = selection.agentReasoningEfforts ?? [:]
+            if let effort {
+                agentEfforts[agentID] = effort
+            } else {
+                agentEfforts.removeValue(forKey: agentID)
+            }
+            selection.agentReasoningEfforts = agentEfforts.isEmpty ? nil : agentEfforts
+
+            var agentConfigs = instructionSet.agents ?? [:]
+            var agentConfig = agentConfigs[agentID] ?? InstructionSetAgentConfig(
+                model: nil,
+                instructions: nil,
+                providerModels: nil
+            )
+            var providerModels = agentConfig.providerModels ?? [:]
+            providerModels[provider.rawValue] = model
+            agentConfig.providerModels = providerModels
+            agentConfigs[agentID] = agentConfig
+            instructionSet.agents = agentConfigs
+        } else {
+            selection.defaultModel = model
+            selection.defaultReasoningEffort = effort
+        }
+
+        selections[provider.rawValue] = selection
+        instructionSet.engineModels = selections
+        next.instructionSet = instructionSet
+        try saveCLIConfig(next, to: configPath)
+        print("Set \(agentID.map { "agent \($0)" } ?? "default") \(provider.rawValue) model to \(model)\(effort.map { " at \($0)" } ?? "")")
+    default:
+        throw AIReviewerError.missingArgument(usage())
+    }
+}
+
 func watch(config: AppConfig) throws -> Never {
     try validate(config: config)
     scheduleReviewCacheCleanup(config: config)
@@ -1009,24 +3187,27 @@ func watch(config: AppConfig) throws -> Never {
         throw AIReviewerError.commandFailed("AI Reviewer watcher is already running.")
     }
 
-    let repoPath = repoURL(config: config).path
     let interval = max(1, config.pollIntervalSeconds)
-    var lastHead = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
+    var targets = try configuredWorktreeTargets(config: config)
+    var lastHeads = Dictionary(uniqueKeysWithValues: targets.map { ($0.path, $0.head) })
 
-    print("watching: \(repoPath)")
-    print("initialHead: \(lastHead)")
+    print(config.shouldWatchAllWorktrees ? "watchingWorktrees: \(targets.count)" : "watching: \(targets.first?.path ?? repoURL(config: config).path)")
+    for target in targets {
+        print("worktree: \(target.path)")
+        print("initialHead: \(target.head)")
+    }
     if config.shouldReviewCurrentHeadOnStartup {
         do {
-            _ = try reviewPendingCommits(config: config)
+            _ = try reviewPendingCommitsForConfiguredWorktrees(config: config)
         } catch {
             fputs("watch startup warning: \(error)\n", stderr)
         }
     } else {
         do {
-            _ = try reconcileCurrentHead(config: config)
+            _ = try reconcileCurrentHeads(config: config)
         } catch {
             fputs("watch startup reconciliation warning: \(error)\n", stderr)
-            try recordSeenHead(config: config, head: lastHead)
+            try recordSeenHeadsForConfiguredWorktrees(config: config)
         }
     }
 
@@ -1034,14 +3215,29 @@ func watch(config: AppConfig) throws -> Never {
         Thread.sleep(forTimeInterval: TimeInterval(interval))
 
         do {
-            let head = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
-            if head != lastHead {
-                print("headChanged: \(lastHead) -> \(head)")
-                _ = try reviewPendingCommits(config: config)
-                lastHead = head
-            } else if try hasRetryableFailedReviews(config: config) {
+            targets = try configuredWorktreeTargets(config: config)
+            let activePaths = Set(targets.map(\.path))
+            lastHeads = lastHeads.filter { activePaths.contains($0.key) }
+
+            var changedTargets: [WorktreeTarget] = []
+            for target in targets {
+                if let previousHead = lastHeads[target.path] {
+                    if previousHead != target.head {
+                        print("headChanged: \(target.path) \(previousHead) -> \(target.head)")
+                        changedTargets.append(target)
+                    }
+                } else {
+                    print("worktreeDiscovered: \(target.path) \(target.head)")
+                    changedTargets.append(target)
+                }
+                lastHeads[target.path] = target.head
+            }
+
+            if !changedTargets.isEmpty {
+                _ = try reviewPendingCommitsForConfiguredWorktrees(config: config)
+            } else if try hasRetryableFailedReviewsForConfiguredWorktrees(config: config) {
                 print("retryingFailedReviews")
-                _ = try reviewPendingCommits(config: config)
+                _ = try reviewPendingCommitsForConfiguredWorktrees(config: config)
             }
         } catch {
             fputs("watch warning: \(error)\n", stderr)
@@ -1310,11 +3506,13 @@ func materializeCommit(config: AppConfig, profile: ReviewProfile, commit: String
 
     let repoPath = repoURL(config: config).path
     let branch = try runGit(repoPath: repoPath, arguments: ["branch", "--show-current"])
+    let worktreeID = reportWorktreeID(config: config)
+    let worktreePath = standardizedWorktreePath(repoPath)
     let resolvedCommit = try runGit(repoPath: repoPath, arguments: ["rev-parse", commit])
     let shortCommit = try runGit(repoPath: repoPath, arguments: ["rev-parse", "--short", resolvedCommit])
 
     let bundleURL = bundlesURL(config: config)
-        .appendingPathComponent(resolvedCommit)
+        .appendingPathComponent(reviewBundleKey(config: config, commit: resolvedCommit))
     let snapshotsURL = bundleURL.appendingPathComponent("snapshots")
 
     try trashExistingItem(at: bundleURL)
@@ -1374,6 +3572,9 @@ func materializeCommit(config: AppConfig, profile: ReviewProfile, commit: String
         commit: resolvedCommit,
         shortCommit: shortCommit,
         branch: branch.isEmpty ? "(detached)" : branch,
+        worktreeID: worktreeID,
+        worktreePath: worktreePath,
+        worktreeBranch: branch.isEmpty ? nil : branch,
         createdAt: ISO8601DateFormatter().string(from: Date()),
         reviewProfile: profile.name,
         changedFiles: changedFiles
@@ -1399,7 +3600,9 @@ func resolveBundleURL(config: AppConfig, bundle: String) throws -> URL {
             candidate = exact
         } else {
             let contents = try FileManager.default.contentsOfDirectory(atPath: root.path)
-            let matches = contents.filter { $0.hasPrefix(bundle) }
+            let matches = contents.filter { name in
+                name.hasPrefix(bundle) || name.contains("-\(bundle)")
+            }
             guard matches.count == 1, let match = matches.first else {
                 throw AIReviewerError.missingPath("bundle \(bundle) under \(root.path)")
             }
@@ -1432,6 +3635,8 @@ func runCodexPrompt(config: AppConfig, bundleURL: URL) -> String {
     - Review only files in this bundle.
     - Do not access any path outside the current working directory.
     - Do not edit files, create files, run tests, install packages, or call network services.
+    - Do not delegate, spawn subagents, create child agents, or attempt additional orchestration.
+    - You are already one focused worker inside an external review orchestration. Complete this review yourself.
     - The live source repository is intentionally not available.
 
     Bundle files:
@@ -1477,6 +3682,7 @@ func runCodex(config: AppConfig, bundleURL: URL) throws -> URL {
         bundleURL: bundleURL,
         prompt: prompt,
         model: config.codexModel,
+        reasoningEffort: resolvedCodexReasoningEffort(config: config, model: config.codexModel, requested: nil),
         outputURL: outputURL,
         logURL: logURL,
         homeURL: homeURL,
@@ -1522,7 +3728,7 @@ func copyCursorAuthMaterial(from sourcePath: String, to destinationURL: URL) thr
     let sourceURL = URL(fileURLWithPath: expandedPath(sourcePath))
     try FileManager.default.createDirectory(at: destinationURL, withIntermediateDirectories: true)
 
-    for filename in ["auth.json", "cli-config.json", "config.json", "mcp.json", "settings.json"] {
+    for filename in ["auth.json", "cli-config.json", "config.json", "mcp.json", "settings.json", "agent-cli-state.json"] {
         let sourceFile = sourceURL.appendingPathComponent(filename)
         guard FileManager.default.fileExists(atPath: sourceFile.path) else {
             continue
@@ -1542,12 +3748,209 @@ func copyCursorAuthMaterial(from sourcePath: String, to destinationURL: URL) thr
     }
 }
 
-func sandboxProfile(bundleURL: URL, runURL: URL, authHomeURL: URL, outputURL: URL, logURL: URL) -> String {
+func prepareCursorRuntimeHome(homeURL: URL, cursorHomeURL: URL) throws {
+    try FileManager.default.createDirectory(at: homeURL, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: cursorHomeURL, withIntermediateDirectories: true)
+
+    let homeCursorURL = homeURL.appendingPathComponent(".cursor")
+    if FileManager.default.fileExists(atPath: homeCursorURL.path) {
+        try FileManager.default.removeItem(at: homeCursorURL)
+    }
+    try FileManager.default.createSymbolicLink(at: homeCursorURL, withDestinationURL: cursorHomeURL)
+}
+
+let cursorAuthMaterialFiles = ["auth.json", "cli-config.json", "config.json", "mcp.json", "settings.json", "agent-cli-state.json"]
+
+func cursorAuthMaterialExists(at path: String) -> Bool {
+    let baseURL = URL(fileURLWithPath: expandedPath(path))
+    return cursorAuthMaterialFiles.contains { filename in
+        FileManager.default.fileExists(atPath: baseURL.appendingPathComponent(filename).path)
+    }
+}
+
+func resolvedCursorAPIKey(config: AppConfig) -> String? {
+    if let configured = config.cursorAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !configured.isEmpty {
+        return configured
+    }
+
+    let raw = ProcessInfo.processInfo.environment["CURSOR_API_KEY"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let key = raw, !key.isEmpty else {
+        return nil
+    }
+    return key
+}
+
+func resolvedOpenRouterAPIKey(config: AppConfig) -> String? {
+    if let configured = config.openRouterAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !configured.isEmpty {
+        return configured
+    }
+
+    let raw = ProcessInfo.processInfo.environment["OPENROUTER_API_KEY"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let key = raw, !key.isEmpty else {
+        return nil
+    }
+    return key
+}
+
+struct OpenRouterChatRequest: Codable {
+    let model: String
+    let messages: [OpenRouterChatMessage]
+    let temperature: Double
+}
+
+struct OpenRouterChatMessage: Codable {
+    let role: String
+    let content: String
+}
+
+struct OpenRouterChatResponse: Codable {
+    let choices: [OpenRouterChatChoice]?
+    let error: OpenRouterAPIError?
+}
+
+struct OpenRouterChatChoice: Codable {
+    let message: OpenRouterChatMessage?
+}
+
+struct OpenRouterAPIError: Codable {
+    let message: String?
+    let code: String?
+}
+
+func isCursorConfigTempRenameRace(_ error: Error) -> Bool {
+    let text = String(describing: error).lowercased()
+    return text.contains("enoent") &&
+        text.contains("cli-config.json.tmp") &&
+        text.contains("cli-config.json") &&
+        text.contains("rename")
+}
+
+func cursorLaunchStaggerDelay(index: Int, config: AppConfig) -> UInt32 {
+    guard config.resolvedAIProvider == .cursor,
+          resolvedCursorAPIKey(config: config) == nil,
+          config.agentReviewConcurrency > 1
+    else {
+        return 0
+    }
+
+    return UInt32(index % max(1, config.agentReviewConcurrency)) * 250_000
+}
+
+func cursorAuthFailureMessage(authPath: String, status: Int32) -> String {
+    """
+    cursor authentication required (agent exited with status \(status)).
+    Run `agent login` in Terminal, set CURSOR_API_KEY before launching AI Reviewer,
+    or add a Cursor API key under Settings → Show Advanced.
+    Auth is read from \(authPath) and macOS Keychain.
+    """
+}
+
+func resolveCodexExecutable() throws -> String {
+    let candidates = [
+        expandedPath("~/.local/bin/codex"),
+        "/opt/homebrew/bin/codex",
+        "/usr/local/bin/codex"
+    ]
+
+    for candidate in candidates {
+        let url = URL(fileURLWithPath: candidate)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            continue
+        }
+
+        let resolved = url.resolvingSymlinksInPath().path
+        if FileManager.default.isExecutableFile(atPath: resolved) {
+            return resolved
+        }
+    }
+
+    throw AIReviewerError.invalidConfig(
+        "Codex CLI not found. Install Codex, or ensure `codex` exists in ~/.local/bin, /opt/homebrew/bin, or /usr/local/bin."
+    )
+}
+
+func codexSandboxSubpaths(for codexExecutable: String) -> [String] {
+    let resolved = URL(fileURLWithPath: codexExecutable).resolvingSymlinksInPath()
+    let candidates = [
+        expandedPath("~/.local/bin"),
+        resolved.deletingLastPathComponent().standardizedFileURL.path
+    ]
+
+    var seen = Set<String>()
+    return candidates.filter { path in
+        guard FileManager.default.fileExists(atPath: path), seen.insert(path).inserted else {
+            return false
+        }
+        return true
+    }
+}
+
+func resolveCursorAgentExecutable() throws -> String {
+    let candidates = [
+        expandedPath("~/.local/bin/agent"),
+        "/opt/homebrew/bin/agent",
+        "/usr/local/bin/agent"
+    ]
+
+    for candidate in candidates {
+        let url = URL(fileURLWithPath: candidate)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            continue
+        }
+
+        let resolved = url.resolvingSymlinksInPath().path
+        if FileManager.default.isExecutableFile(atPath: resolved) {
+            return resolved
+        }
+    }
+
+    throw AIReviewerError.invalidConfig(
+        "Cursor Agent CLI not found. Install it from Cursor, or ensure `agent` exists in ~/.local/bin, /opt/homebrew/bin, or /usr/local/bin."
+    )
+}
+
+func cursorAgentSandboxSubpaths(for agentExecutable: String) -> [String] {
+    let resolvedAgent = URL(fileURLWithPath: agentExecutable).resolvingSymlinksInPath()
+    let installDir = resolvedAgent.deletingLastPathComponent().standardizedFileURL.path
+    let candidates = [
+        expandedPath("~/.local/bin"),
+        expandedPath("~/.local/share/cursor-agent"),
+        installDir
+    ]
+
+    var seen = Set<String>()
+    return candidates.filter { path in
+        guard FileManager.default.fileExists(atPath: path), seen.insert(path).inserted else {
+            return false
+        }
+        return true
+    }
+}
+
+func sandboxProfile(
+    bundleURL: URL,
+    runURL: URL,
+    authHomeURL: URL,
+    outputURL: URL,
+    logURL: URL,
+    extraReadSubpaths: [String] = [],
+    extraWriteSubpaths: [String] = []
+) -> String {
     let bundlePath = sandboxString(bundleURL.resolvingSymlinksInPath().standardizedFileURL.path)
     let runPath = sandboxString(runURL.resolvingSymlinksInPath().standardizedFileURL.path)
     let authHomePath = sandboxString(authHomeURL.resolvingSymlinksInPath().standardizedFileURL.path)
     let outputPath = sandboxString(outputURL.resolvingSymlinksInPath().standardizedFileURL.path)
     let logPath = sandboxString(logURL.resolvingSymlinksInPath().standardizedFileURL.path)
+    let extraReadRules = extraReadSubpaths
+        .map { sandboxString($0) }
+        .map { "      (subpath \"\($0)\")" }
+        .joined(separator: "\n")
+    let extraWriteRules = extraWriteSubpaths
+        .map { sandboxString($0) }
+        .map { "      (subpath \"\($0)\")" }
+        .joined(separator: "\n")
 
     return """
     (version 1)
@@ -1576,7 +3979,8 @@ func sandboxProfile(bundleURL: URL, runURL: URL, authHomeURL: URL, outputURL: UR
       (subpath "/private/var/db/timezone")
       (subpath "\(bundlePath)")
       (subpath "\(runPath)")
-      (subpath "\(authHomePath)"))
+      (subpath "\(authHomePath)")
+    \(extraReadRules))
     (allow file-write*
       (subpath "/dev")
       (subpath "/tmp")
@@ -1586,7 +3990,8 @@ func sandboxProfile(bundleURL: URL, runURL: URL, authHomeURL: URL, outputURL: UR
       (subpath "\(runPath)")
       (subpath "\(authHomePath)")
       (literal "\(outputPath)")
-      (literal "\(logPath)"))
+      (literal "\(logPath)")
+    \(extraWriteRules))
     """
 }
 
@@ -1633,12 +4038,14 @@ func runCodexExecution(
     bundleURL: URL,
     prompt: String,
     model: String?,
+    reasoningEffort: String?,
     outputURL: URL,
     logURL: URL,
     homeURL: URL,
     tmpURL: URL
 ) throws {
     let reviewPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    let codexExecutable = try resolveCodexExecutable()
 
     try FileManager.default.createDirectory(at: homeURL, withIntermediateDirectories: true)
     try FileManager.default.createDirectory(at: tmpURL, withIntermediateDirectories: true)
@@ -1648,7 +4055,14 @@ func runCodexExecution(
     try copyCodexAuthMaterial(from: config.codexHome, to: runCodexHomeURL)
     let sandboxURL = runURL.appendingPathComponent("codex.sb")
     try writeData(
-        Data(sandboxProfile(bundleURL: bundleURL, runURL: runURL, authHomeURL: runCodexHomeURL, outputURL: outputURL, logURL: logURL).utf8),
+        Data(sandboxProfile(
+            bundleURL: bundleURL,
+            runURL: runURL,
+            authHomeURL: runCodexHomeURL,
+            outputURL: outputURL,
+            logURL: logURL,
+            extraReadSubpaths: codexSandboxSubpaths(for: codexExecutable)
+        ).utf8),
         to: sandboxURL
     )
 
@@ -1675,9 +4089,10 @@ func runCodexExecution(
         "USER=\(NSUserName())",
         "LOGNAME=\(NSUserName())",
         "SHELL=/bin/bash",
-        "codex",
+        codexExecutable,
         "--ask-for-approval", "never",
         "exec",
+        "--disable", "multi_agent",
         "--disable", "shell_zsh_fork",
         "--disable", "shell_snapshot",
         "--ignore-user-config",
@@ -1693,11 +4108,18 @@ func runCodexExecution(
     if let model, !model.isEmpty {
         arguments += ["--model", model]
     }
+    if let reasoningEffort, !reasoningEffort.isEmpty {
+        arguments += ["-c", "model_reasoning_effort=\"\(reasoningEffort)\""]
+    }
 
     arguments += ["--output-last-message", outputURL.path, "-"]
     process.arguments = arguments
 
     let inputPipe = Pipe()
+    defer {
+        inputPipe.fileHandleForReading.closeFile()
+        inputPipe.fileHandleForWriting.closeFile()
+    }
     process.standardInput = inputPipe
     process.standardOutput = logHandle
     process.standardError = logHandle
@@ -1739,19 +4161,22 @@ func runCursorExecution(
     homeURL: URL,
     tmpURL: URL
 ) throws {
-    let reviewPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    let cursorAPIKey = resolvedCursorAPIKey(config: config)
+    let sourceCursorHomePath = expandedPath(config.resolvedCursorHome)
+    let usesAPIKeyAuth = cursorAPIKey != nil
+    let runCursorHomeURL = homeURL.deletingLastPathComponent().appendingPathComponent("cursor-home", isDirectory: true)
+
+    let agentExecutable = try resolveCursorAgentExecutable()
+    let localBin = expandedPath("~/.local/bin")
+    let reviewPath = "\(localBin):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
     try FileManager.default.createDirectory(at: homeURL, withIntermediateDirectories: true)
     try FileManager.default.createDirectory(at: tmpURL, withIntermediateDirectories: true)
     try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-    let runURL = homeURL.deletingLastPathComponent()
-    let runCursorHomeURL = runURL.appendingPathComponent("cursor-home", isDirectory: true)
-    try copyCursorAuthMaterial(from: config.resolvedCursorHome, to: runCursorHomeURL)
-    let sandboxURL = runURL.appendingPathComponent("cursor.sb")
-    try writeData(
-        Data(sandboxProfile(bundleURL: bundleURL, runURL: runURL, authHomeURL: runCursorHomeURL, outputURL: outputURL, logURL: logURL).utf8),
-        to: sandboxURL
-    )
+    try copyCursorAuthMaterial(from: sourceCursorHomePath, to: runCursorHomeURL)
+    if usesAPIKeyAuth {
+        try prepareCursorRuntimeHome(homeURL: homeURL, cursorHomeURL: runCursorHomeURL)
+    }
 
     FileManager.default.createFile(atPath: logURL.path, contents: nil)
     let logHandle = try FileHandle(forWritingTo: logURL)
@@ -1760,23 +4185,19 @@ func runCursorExecution(
         try? logHandle.close()
     }
 
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
-    process.currentDirectoryURL = bundleURL
+    var environment = ProcessInfo.processInfo.environment
+    environment["HOME"] = usesAPIKeyAuth ? homeURL.path : NSHomeDirectory()
+    environment["CURSOR_HOME"] = runCursorHomeURL.path
+    environment["TMPDIR"] = tmpURL.path
+    environment["PATH"] = reviewPath
+    environment["USER"] = NSUserName()
+    environment["LOGNAME"] = NSUserName()
+    environment["SHELL"] = environment["SHELL"] ?? "/bin/bash"
+    if let cursorAPIKey {
+        environment["CURSOR_API_KEY"] = cursorAPIKey
+    }
 
     var arguments = [
-        "-f",
-        sandboxURL.path,
-        "/usr/bin/env",
-        "-i",
-        "HOME=\(homeURL.path)",
-        "CURSOR_HOME=\(runCursorHomeURL.path)",
-        "TMPDIR=\(tmpURL.path)",
-        "PATH=\(reviewPath)",
-        "USER=\(NSUserName())",
-        "LOGNAME=\(NSUserName())",
-        "SHELL=/bin/bash",
-        "agent",
         "-p",
         "--mode", "ask",
         "--sandbox", "enabled",
@@ -1789,10 +4210,23 @@ func runCursorExecution(
         arguments += ["--model", model]
     }
 
+    if let cursorAPIKey {
+        arguments += ["--api-key", cursorAPIKey]
+    }
+
     arguments += [prompt]
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: agentExecutable)
     process.arguments = arguments
+    process.environment = environment
+    process.currentDirectoryURL = bundleURL
 
     let outputPipe = Pipe()
+    defer {
+        outputPipe.fileHandleForReading.closeFile()
+        outputPipe.fileHandleForWriting.closeFile()
+    }
     process.standardOutput = outputPipe
     process.standardError = logHandle
     let termination = DispatchSemaphore(value: 0)
@@ -1800,17 +4234,21 @@ func runCursorExecution(
         termination.signal()
     }
 
-    try process.run()
+    let executeProcess = {
+        try process.run()
 
-    if termination.wait(timeout: .now() + .seconds(config.codexRunTimeoutSeconds)) == .timedOut {
-        process.terminate()
-        if termination.wait(timeout: .now() + .seconds(5)) == .timedOut {
-            kill(process.processIdentifier, SIGKILL)
-            _ = termination.wait(timeout: .now() + .seconds(5))
+        if termination.wait(timeout: .now() + .seconds(config.codexRunTimeoutSeconds)) == .timedOut {
+            process.terminate()
+            if termination.wait(timeout: .now() + .seconds(5)) == .timedOut {
+                kill(process.processIdentifier, SIGKILL)
+                _ = termination.wait(timeout: .now() + .seconds(5))
+            }
+
+            throw AIReviewerError.commandFailed("cursor agent timed out after \(config.codexRunTimeoutSeconds) seconds")
         }
-
-        throw AIReviewerError.commandFailed("cursor agent timed out after \(config.codexRunTimeoutSeconds) seconds")
     }
+
+    try executeProcess()
 
     let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
     try writeData(outputData, to: outputURL)
@@ -1819,9 +4257,111 @@ func runCursorExecution(
         let logData = (try? Data(contentsOf: logURL)) ?? Data()
         let logText = String(data: logData, encoding: .utf8) ?? ""
         let tail = logText.split(separator: "\n").suffix(40).joined(separator: "\n")
+        let normalizedTail = logText.lowercased()
+        if normalizedTail.contains("authentication required") {
+            throw AIReviewerError.commandFailed(cursorAuthFailureMessage(authPath: sourceCursorHomePath, status: process.terminationStatus))
+        }
         throw AIReviewerError.commandFailed("cursor agent exited with status \(process.terminationStatus)\n\(tail)")
     }
 
+    guard FileManager.default.fileExists(atPath: outputURL.path) else {
+        throw AIReviewerError.missingPath(outputURL.path)
+    }
+}
+
+func runOpenRouterExecution(
+    config: AppConfig,
+    bundleURL: URL,
+    prompt: String,
+    model: String?,
+    outputURL: URL,
+    logURL: URL
+) throws {
+    guard let apiKey = resolvedOpenRouterAPIKey(config: config) else {
+        throw AIReviewerError.invalidConfig(
+            "OpenRouter API key not configured. Set OPENROUTER_API_KEY before launching AI Reviewer, or add an OpenRouter API key under Settings -> Show Advanced."
+        )
+    }
+
+    let resolvedModel = model?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        ? model!.trimmingCharacters(in: .whitespacesAndNewlines)
+        : config.resolvedOpenRouterModel
+    guard let endpointURL = URL(string: "https://openrouter.ai/api/v1/chat/completions") else {
+        throw AIReviewerError.invalidConfig("OpenRouter endpoint URL is invalid")
+    }
+
+    try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let requestPayload = OpenRouterChatRequest(
+        model: resolvedModel,
+        messages: [
+            OpenRouterChatMessage(role: "user", content: prompt)
+        ],
+        temperature: 0
+    )
+    let requestData = try JSONEncoder().encode(requestPayload)
+
+    var request = URLRequest(url: endpointURL)
+    request.httpMethod = "POST"
+    request.timeoutInterval = TimeInterval(config.codexRunTimeoutSeconds)
+    request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("AI Reviewer", forHTTPHeaderField: "X-Title")
+    request.httpBody = requestData
+
+    var logLines = [
+        "openrouter",
+        "endpoint: \(endpointURL.absoluteString)",
+        "model: \(resolvedModel)",
+        "promptBytes: \(prompt.utf8.count)"
+    ]
+
+    let semaphore = DispatchSemaphore(value: 0)
+    let resultBox = URLSessionResultBox()
+    let task = URLSession.shared.dataTask(with: request) { data, urlResponse, error in
+        resultBox.store(data: data, response: urlResponse, error: error)
+        semaphore.signal()
+    }
+
+    task.resume()
+    if semaphore.wait(timeout: .now() + .seconds(config.codexRunTimeoutSeconds)) == .timedOut {
+        task.cancel()
+        logLines.append("error: OpenRouter request timed out after \(config.codexRunTimeoutSeconds) seconds")
+        try writeData(Data(logLines.joined(separator: "\n").utf8), to: logURL)
+        throw AIReviewerError.commandFailed("OpenRouter request timed out after \(config.codexRunTimeoutSeconds) seconds")
+    }
+
+    let (responseData, response, responseError) = resultBox.snapshot()
+    if let responseError {
+        logLines.append("error: \(responseError)")
+        try writeData(Data(logLines.joined(separator: "\n").utf8), to: logURL)
+        throw AIReviewerError.commandFailed("OpenRouter request failed: \(responseError)")
+    }
+
+    let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+    logLines.append("status: \(statusCode)")
+    if !responseData.isEmpty {
+        let bodyPreview = String(data: responseData, encoding: .utf8) ?? ""
+        logLines.append("responseBytes: \(responseData.count)")
+        logLines.append(String(bodyPreview.prefix(4_000)))
+    }
+    try writeData(Data(logLines.joined(separator: "\n").utf8), to: logURL)
+
+    guard (200..<300).contains(statusCode) else {
+        let body = String(data: responseData, encoding: .utf8) ?? ""
+        let tail = body.split(separator: "\n").suffix(20).joined(separator: "\n")
+        throw AIReviewerError.commandFailed("OpenRouter exited with HTTP \(statusCode)\n\(tail)")
+    }
+
+    let decoded = try JSONDecoder().decode(OpenRouterChatResponse.self, from: responseData)
+    if let error = decoded.error {
+        throw AIReviewerError.commandFailed("OpenRouter error: \(error.message ?? error.code ?? "unknown error")")
+    }
+    guard let content = decoded.choices?.first?.message?.content,
+          !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        throw AIReviewerError.commandFailed("OpenRouter response did not include a review message")
+    }
+
+    try writeData(Data(content.utf8), to: outputURL)
     guard FileManager.default.fileExists(atPath: outputURL.path) else {
         throw AIReviewerError.missingPath(outputURL.path)
     }
@@ -1832,11 +4372,13 @@ func runReviewExecution(
     bundleURL: URL,
     prompt: String,
     model: String?,
+    reasoningEffort: String?,
     outputURL: URL,
     logURL: URL,
     homeURL: URL,
     tmpURL: URL
 ) throws {
+    print("runReviewExecution: provider=\(config.resolvedAIProvider.rawValue)")
     switch config.resolvedAIProvider {
     case .codex:
         try runCodexExecution(
@@ -1844,6 +4386,7 @@ func runReviewExecution(
             bundleURL: bundleURL,
             prompt: prompt,
             model: model,
+            reasoningEffort: reasoningEffort,
             outputURL: outputURL,
             logURL: logURL,
             homeURL: homeURL,
@@ -1859,6 +4402,15 @@ func runReviewExecution(
             logURL: logURL,
             homeURL: homeURL,
             tmpURL: tmpURL
+        )
+    case .openrouter:
+        try runOpenRouterExecution(
+            config: config,
+            bundleURL: bundleURL,
+            prompt: prompt,
+            model: model,
+            outputURL: outputURL,
+            logURL: logURL
         )
     }
 }
@@ -1880,6 +4432,8 @@ func profileAgentPrompt(config: AppConfig, bundleURL: URL, profile: ReviewProfil
     - Review only files and prompt content in this bundle.
     - Do not access paths outside the current working directory.
     - Do not edit files, create files, run tests, install packages, or call network services.
+    - Do not delegate, spawn subagents, create child agents, or attempt additional orchestration.
+    - You are already one focused specialist inside an external multi-agent review. Complete this assignment yourself.
     - The live source repository is intentionally not available.
 
     Output rules for this specialist:
@@ -2026,6 +4580,8 @@ func runProfileAgents(
 
     print("profileAgents: \(agents.map(\.id).joined(separator: ","))")
     print("profileAgentParallelism: \(parallelism)")
+    print("reviewEngine: \(config.resolvedAIProvider.rawValue)")
+    print("defaultProfileModel: \(profile.defaultModel ?? "default")")
 
     for (index, agent) in agents.enumerated() {
         semaphore.wait()
@@ -2048,16 +4604,51 @@ func runProfileAgents(
                     agent: agent,
                     snapshotByteLimit: config.promptSnapshotByteLimit
                 )
-                try runReviewExecution(
+                let model = resolvedReviewModel(config: config, profile: profile, agent: agent)
+                let reasoningEffort = resolvedReviewReasoningEffort(
                     config: config,
-                    bundleURL: bundleURL,
-                    prompt: prompt,
-                    model: resolvedReviewModel(config: config, profile: profile, agent: agent),
-                    outputURL: output,
-                    logURL: log,
-                    homeURL: agentURL.appendingPathComponent("home"),
-                    tmpURL: agentURL.appendingPathComponent("tmp")
+                    profile: profile,
+                    agent: agent,
+                    model: model
                 )
+                let homeURL = agentURL.appendingPathComponent("home")
+                let tmpURL = agentURL.appendingPathComponent("tmp")
+                let launchDelay = cursorLaunchStaggerDelay(index: index, config: config)
+                if launchDelay > 0 {
+                    usleep(launchDelay)
+                }
+
+                do {
+                    try runReviewExecution(
+                        config: config,
+                        bundleURL: bundleURL,
+                        prompt: prompt,
+                        model: model,
+                        reasoningEffort: reasoningEffort,
+                        outputURL: output,
+                        logURL: log,
+                        homeURL: homeURL,
+                        tmpURL: tmpURL
+                    )
+                } catch {
+                    guard isCursorConfigTempRenameRace(error) else {
+                        throw error
+                    }
+
+                    print("profileAgentRetry: \(agent.id): cursor cli-config temp rename race")
+                    usleep(750_000)
+                    try runReviewExecution(
+                        config: config,
+                        bundleURL: bundleURL,
+                        prompt: prompt,
+                        model: model,
+                        reasoningEffort: reasoningEffort,
+                        outputURL: output,
+                        logURL: log,
+                        homeURL: homeURL,
+                        tmpURL: tmpURL
+                    )
+                }
                 let outputText = (try? String(contentsOf: output, encoding: .utf8)) ?? ""
 
                 results.set(index: index, agent: agent, output: outputText)
@@ -2210,21 +4801,17 @@ func profileReviewText(manifest: BundleManifest, profile: ReviewProfile, agents:
 
 func copyReportBack(config: AppConfig, reviewURL: URL, shortCommit: String) throws -> URL {
     let reportData = try Data(contentsOf: reviewURL)
-    let reportsDirectory = reportsURL(config: config)
+    let reportsDirectory = copiedReportsURL(config: config)
     try FileManager.default.createDirectory(at: reportsDirectory, withIntermediateDirectories: true)
 
-    let reportURL = reportsDirectory.appendingPathComponent("\(shortCommit)-\(timestampForFilename()).md")
+    let reportURL = reportsDirectory.appendingPathComponent("\(reportWorktreeID(config: config))-\(shortCommit)-\(timestampForFilename()).md")
     try writeData(reportData, to: reportURL)
     print("copiedReport: \(reportURL.path)")
     return reportURL
 }
 
 func reviewOnce(config: AppConfig) throws -> URL? {
-    try validatePaths(config: config)
-
-    let repoPath = repoURL(config: config).path
-    let commit = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
-    return try reviewCommit(config: config, commit: commit)
+    try reviewPendingCommitsForConfiguredWorktrees(config: config).last
 }
 
 func reviewCommit(config: AppConfig, commit: String) throws -> URL? {
@@ -2234,8 +4821,12 @@ func reviewCommit(config: AppConfig, commit: String) throws -> URL? {
     }
 
     let repoPath = repoURL(config: config).path
+    let worktreeID = reportWorktreeID(config: config)
+    let worktreePath = standardizedWorktreePath(repoPath)
+    let worktreeBranch = reportWorktreeBranch(config: config)
     let resolvedCommit = try runGit(repoPath: repoPath, arguments: ["rev-parse", commit])
     let shortCommit = try runGit(repoPath: repoPath, arguments: ["rev-parse", "--short", resolvedCommit])
+    let ledgerKey = reviewLedgerKey(config: config, commit: resolvedCommit)
     let commitLock = FileLock(url: reviewCommitLockURL(commit: resolvedCommit))
     guard try commitLock.tryLock() else {
         throw AIReviewerError.commandFailed("Review for \(shortCommit) is already running.")
@@ -2243,11 +4834,14 @@ func reviewCommit(config: AppConfig, commit: String) throws -> URL? {
 
     if try shouldSkipCommit(repoPath: repoPath, commit: resolvedCommit) {
         try mutateState(config: config) { state in
-            state.lastSeenHead = resolvedCommit
+            recordSeenHead(&state, config: config, head: resolvedCommit)
             state.skipped = state.skipped ?? [:]
-            state.skipped?[resolvedCommit] = ReviewSkipRecord(
+            state.skipped?[ledgerKey] = ReviewSkipRecord(
                 sha: resolvedCommit,
                 shortSha: shortCommit,
+                worktreeID: worktreeID,
+                worktreePath: worktreePath,
+                worktreeBranch: worktreeBranch,
                 skippedAt: isoNow(),
                 reason: "commit message bypass marker"
             )
@@ -2258,8 +4852,8 @@ func reviewCommit(config: AppConfig, commit: String) throws -> URL? {
 
     var alreadyReviewed: ReviewRecord?
     try mutateState(config: config) { state in
-        state.lastSeenHead = resolvedCommit
-        if let reviewed = state.reviewed[resolvedCommit] {
+        recordSeenHead(&state, config: config, head: resolvedCommit)
+        if let reviewed = reviewedRecord(in: state, config: config, commit: resolvedCommit) {
             alreadyReviewed = reviewed
             state.lastBundlePath = reviewed.bundlePath
             state.lastReviewPath = reviewed.localReviewPath
@@ -2290,16 +4884,19 @@ func reviewCommit(config: AppConfig, commit: String) throws -> URL? {
             let copiedReportURL = try copyReportBack(config: config, reviewURL: localReviewURL, shortCommit: shortCommit)
             try mutateState(config: config) { state in
                 state.lastReviewPath = localReviewURL.path
-                state.reviewed[resolvedCommit] = ReviewRecord(
+                state.reviewed[ledgerKey] = ReviewRecord(
                     sha: resolvedCommit,
                     shortSha: shortCommit,
+                    worktreeID: worktreeID,
+                    worktreePath: worktreePath,
+                    worktreeBranch: worktreeBranch,
                     reviewedAt: isoNow(),
                     bundlePath: materializedBundleURL.path,
                     localReviewPath: localReviewURL.path,
                     copiedReportPath: copiedReportURL.path
                 )
-                state.failed.removeValue(forKey: resolvedCommit)
-                state.skipped?.removeValue(forKey: resolvedCommit)
+                state.failed.removeValue(forKey: ledgerKey)
+                state.skipped?.removeValue(forKey: ledgerKey)
             }
 
             print("reviewed: \(shortCommit)")
@@ -2308,21 +4905,27 @@ func reviewCommit(config: AppConfig, commit: String) throws -> URL? {
     } catch AIReviewerError.permanentReviewSkip(let reason) {
         _ = try? mutateState(config: config) { state in
             state.skipped = state.skipped ?? [:]
-            state.skipped?[resolvedCommit] = ReviewSkipRecord(
+            state.skipped?[ledgerKey] = ReviewSkipRecord(
                 sha: resolvedCommit,
                 shortSha: shortCommit,
+                worktreeID: worktreeID,
+                worktreePath: worktreePath,
+                worktreeBranch: worktreeBranch,
                 skippedAt: isoNow(),
                 reason: reason
             )
-            state.failed.removeValue(forKey: resolvedCommit)
+            state.failed.removeValue(forKey: ledgerKey)
         }
         print("skippedReview: \(shortCommit) \(reason)")
         return nil
     } catch {
         _ = try? mutateState(config: config) { state in
-            state.failed[resolvedCommit] = ReviewFailureRecord(
+            state.failed[ledgerKey] = ReviewFailureRecord(
                 sha: resolvedCommit,
                 shortSha: shortCommit,
+                worktreeID: worktreeID,
+                worktreePath: worktreePath,
+                worktreeBranch: worktreeBranch,
                 failedAt: isoNow(),
                 error: "\(error)",
                 bundlePath: bundleURL?.path,
@@ -2364,7 +4967,7 @@ func hasRetryableFailedReviews(config: AppConfig) throws -> Bool {
         .map(String.init)
 
     for commit in recentHistory {
-        if let failure = state.failed[commit],
+        if let failure = failureRecord(in: state, config: config, commit: commit),
            shouldRetryFailure(failure, retryAfterSeconds: config.failedReviewRetrySeconds) {
             return true
         }
@@ -2373,9 +4976,23 @@ func hasRetryableFailedReviews(config: AppConfig) throws -> Bool {
     return false
 }
 
+func recordSeenHead(_ state: inout ReviewState, config: AppConfig, head: String) {
+    state.lastSeenHead = head
+    state.worktreeHeads = state.worktreeHeads ?? [:]
+    state.worktreeHeads?[worktreeStateKey(config: config)] = head
+}
+
+func lastSeenHeadForWorktree(_ state: ReviewState, config: AppConfig) -> String? {
+    if let head = state.worktreeHeads?[worktreeStateKey(config: config)], !head.isEmpty {
+        return head
+    }
+
+    return state.lastSeenHead
+}
+
 func recordSeenHead(config: AppConfig, head: String) throws {
     try mutateState(config: config) { state in
-        state.lastSeenHead = head
+        recordSeenHead(&state, config: config, head: head)
     }
 }
 
@@ -2385,13 +5002,269 @@ func hasReviewLedgerEntry(_ state: ReviewState, commit: String) -> Bool {
         (state.skipped ?? [:])[commit] != nil
 }
 
+func legacyRecordMatchesWorktree(
+    worktreeID: String,
+    worktreePath: String?,
+    copiedReportPath: String?,
+    recordWorktreeID: String?,
+    recordWorktreePath: String?
+) -> Bool {
+    if let recordWorktreeID, !recordWorktreeID.isEmpty {
+        return recordWorktreeID == worktreeID
+    }
+    if let recordWorktreePath, !recordWorktreePath.isEmpty {
+        return standardizedWorktreePath(recordWorktreePath) == worktreePath
+    }
+    if let copiedReportPath, !copiedReportPath.isEmpty {
+        if let worktreePath, copiedReportPath == worktreePath || copiedReportPath.hasPrefix(worktreePath + "/") {
+            return true
+        }
+        let filename = URL(fileURLWithPath: copiedReportPath).lastPathComponent
+        if filename.hasPrefix("\(worktreeID)-") {
+            return true
+        }
+    }
+
+    // Older records were keyed only by commit SHA, before worktree lanes existed.
+    // Treat those as global history so completed reviews do not reappear as pending.
+    return recordWorktreeID == nil && recordWorktreePath == nil
+}
+
+func laneRecordKeyMatchesCommit(_ key: String, commit: String) -> Bool {
+    key.hasSuffix(":\(commit)")
+}
+
+func reviewedRecordForCommit(in state: ReviewState, commit: String) -> ReviewRecord? {
+    state.reviewed.first { key, record in
+        record.sha == commit && laneRecordKeyMatchesCommit(key, commit: commit)
+    }?.value
+}
+
+struct ReviewLedgerIndexes {
+    let reviewedByCommit: [String: ReviewRecord]
+    let failedByCommit: [String: ReviewFailureRecord]
+    let skippedByCommit: [String: ReviewSkipRecord]
+
+    init(state: ReviewState) {
+        var reviewed: [String: ReviewRecord] = [:]
+        for (key, record) in state.reviewed where laneRecordKeyMatchesCommit(key, commit: record.sha) {
+            if reviewed[record.sha] == nil {
+                reviewed[record.sha] = record
+            }
+        }
+
+        var failed: [String: ReviewFailureRecord] = [:]
+        for (key, record) in state.failed where laneRecordKeyMatchesCommit(key, commit: record.sha) {
+            if failed[record.sha] == nil {
+                failed[record.sha] = record
+            }
+        }
+
+        var skipped: [String: ReviewSkipRecord] = [:]
+        for (key, record) in state.skipped ?? [:] where laneRecordKeyMatchesCommit(key, commit: record.sha) {
+            if skipped[record.sha] == nil {
+                skipped[record.sha] = record
+            }
+        }
+
+        reviewedByCommit = reviewed
+        failedByCommit = failed
+        skippedByCommit = skipped
+    }
+}
+
+func skipRecordForCommit(in state: ReviewState, commit: String) -> ReviewSkipRecord? {
+    state.skipped?.first { key, record in
+        record.sha == commit && laneRecordKeyMatchesCommit(key, commit: commit)
+    }?.value
+}
+
+func failureRecordForCommit(in state: ReviewState, commit: String) -> ReviewFailureRecord? {
+    state.failed.first { key, record in
+        record.sha == commit && laneRecordKeyMatchesCommit(key, commit: commit)
+    }?.value
+}
+
+func reviewedRecord(in state: ReviewState, config: AppConfig, commit: String) -> ReviewRecord? {
+    let key = reviewLedgerKey(config: config, commit: commit)
+    let worktreeID = reportWorktreeID(config: config)
+    let worktreePath = standardizedWorktreePath(repoURL(config: config).path)
+    return reviewedRecord(
+        in: state,
+        legacyCommit: commit,
+        ledgerKey: key,
+        worktreeID: worktreeID,
+        worktreePath: worktreePath
+    )
+}
+
+func reviewedRecord(
+    in state: ReviewState,
+    legacyCommit: String,
+    ledgerKey: String,
+    worktreeID: String,
+    worktreePath: String?,
+    indexedByCommit: [String: ReviewRecord]? = nil
+) -> ReviewRecord? {
+    if let record = state.reviewed[ledgerKey] {
+        return record
+    }
+    if let indexedByCommit {
+        if let record = indexedByCommit[legacyCommit] {
+            return record
+        }
+    } else if let record = reviewedRecordForCommit(in: state, commit: legacyCommit) {
+        return record
+    }
+    guard let legacy = state.reviewed[legacyCommit] else {
+        return nil
+    }
+    return legacyRecordMatchesWorktree(
+        worktreeID: worktreeID,
+        worktreePath: worktreePath,
+        copiedReportPath: legacy.copiedReportPath,
+        recordWorktreeID: legacy.worktreeID,
+        recordWorktreePath: legacy.worktreePath
+    ) ? legacy : nil
+}
+
+func failureRecord(in state: ReviewState, config: AppConfig, commit: String) -> ReviewFailureRecord? {
+    let key = reviewLedgerKey(config: config, commit: commit)
+    let worktreeID = reportWorktreeID(config: config)
+    let worktreePath = standardizedWorktreePath(repoURL(config: config).path)
+    return failureRecord(
+        in: state,
+        legacyCommit: commit,
+        ledgerKey: key,
+        worktreeID: worktreeID,
+        worktreePath: worktreePath
+    )
+}
+
+func failureRecord(
+    in state: ReviewState,
+    legacyCommit: String,
+    ledgerKey: String,
+    worktreeID: String,
+    worktreePath: String?,
+    indexedByCommit: [String: ReviewFailureRecord]? = nil
+) -> ReviewFailureRecord? {
+    if let record = state.failed[ledgerKey] {
+        return record
+    }
+    if let indexedByCommit {
+        if let record = indexedByCommit[legacyCommit] {
+            return record
+        }
+    } else if let record = failureRecordForCommit(in: state, commit: legacyCommit) {
+        return record
+    }
+    guard let legacy = state.failed[legacyCommit] else {
+        return nil
+    }
+    return legacyRecordMatchesWorktree(
+        worktreeID: worktreeID,
+        worktreePath: worktreePath,
+        copiedReportPath: legacy.localReviewPath,
+        recordWorktreeID: legacy.worktreeID,
+        recordWorktreePath: legacy.worktreePath
+    ) ? legacy : nil
+}
+
+func skipRecord(in state: ReviewState, config: AppConfig, commit: String) -> ReviewSkipRecord? {
+    let key = reviewLedgerKey(config: config, commit: commit)
+    let worktreeID = reportWorktreeID(config: config)
+    let worktreePath = standardizedWorktreePath(repoURL(config: config).path)
+    return skipRecord(
+        in: state,
+        legacyCommit: commit,
+        ledgerKey: key,
+        worktreeID: worktreeID,
+        worktreePath: worktreePath
+    )
+}
+
+func skipRecord(
+    in state: ReviewState,
+    legacyCommit: String,
+    ledgerKey: String,
+    worktreeID: String,
+    worktreePath: String?,
+    indexedByCommit: [String: ReviewSkipRecord]? = nil
+) -> ReviewSkipRecord? {
+    if let record = state.skipped?[ledgerKey] {
+        return record
+    }
+    if let indexedByCommit {
+        if let record = indexedByCommit[legacyCommit] {
+            return record
+        }
+    } else if let record = skipRecordForCommit(in: state, commit: legacyCommit) {
+        return record
+    }
+    guard let legacy = state.skipped?[legacyCommit] else {
+        return nil
+    }
+    if legacy.worktreeID == nil && legacy.worktreePath == nil {
+        return legacy
+    }
+    return legacyRecordMatchesWorktree(
+        worktreeID: worktreeID,
+        worktreePath: worktreePath,
+        copiedReportPath: nil,
+        recordWorktreeID: legacy.worktreeID,
+        recordWorktreePath: legacy.worktreePath
+    ) ? legacy : nil
+}
+
+func hasReviewLedgerEntry(_ state: ReviewState, config: AppConfig, commit: String) -> Bool {
+    reviewedRecord(in: state, config: config, commit: commit) != nil ||
+        failureRecord(in: state, config: config, commit: commit) != nil ||
+        skipRecord(in: state, config: config, commit: commit) != nil
+}
+
+func commitFromLedgerKey(_ value: String) -> String {
+    if let separator = value.lastIndex(of: ":") {
+        return String(value[value.index(after: separator)...])
+    }
+    return value
+}
+
+func hasReviewLedgerEntryForCommit(_ state: ReviewState, commit: String) -> Bool {
+    reviewedRecordForCommit(in: state, commit: commit) != nil ||
+        failureRecordForCommit(in: state, commit: commit) != nil ||
+        skipRecordForCommit(in: state, commit: commit) != nil ||
+        hasReviewLedgerEntry(state, commit: commit)
+}
+
+func removeReviewLedgerEntries(_ state: inout ReviewState, config: AppConfig, commit: String) {
+    let key = reviewLedgerKey(config: config, commit: commit)
+    state.reviewed.removeValue(forKey: key)
+    state.failed.removeValue(forKey: key)
+    state.skipped?.removeValue(forKey: key)
+
+    if reviewedRecord(in: state, config: config, commit: commit) != nil {
+        state.reviewed.removeValue(forKey: commit)
+    }
+    if failureRecord(in: state, config: config, commit: commit) != nil {
+        state.failed.removeValue(forKey: commit)
+    }
+    if skipRecord(in: state, config: config, commit: commit) != nil {
+        state.skipped?.removeValue(forKey: commit)
+    }
+}
+
 func currentHeadNeedsStartupReconciliation(config: AppConfig) throws -> Bool {
     try validatePaths(config: config)
 
     let repoPath = repoURL(config: config).path
     let head = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
     let state = try loadState(config: config)
-    return !hasReviewLedgerEntry(state, commit: head)
+    return !hasReviewLedgerEntry(state, config: config, commit: head)
+}
+
+func hasPendingReviews(config: AppConfig) throws -> Bool {
+    !(try pendingReviewCommits(config: config)).isEmpty
 }
 
 func reconcileCurrentHead(config: AppConfig) throws -> [URL] {
@@ -2400,7 +5273,7 @@ func reconcileCurrentHead(config: AppConfig) throws -> [URL] {
     let repoPath = repoURL(config: config).path
     let head = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
     let state = try loadState(config: config)
-    guard !hasReviewLedgerEntry(state, commit: head) else {
+    guard !hasReviewLedgerEntry(state, config: config, commit: head) else {
         try recordSeenHead(config: config, head: head)
         return []
     }
@@ -2411,11 +5284,14 @@ func reconcileCurrentHead(config: AppConfig) throws -> [URL] {
         .count
     if parentCount > 1 {
         try mutateState(config: config) { state in
-            state.lastSeenHead = head
+            recordSeenHead(&state, config: config, head: head)
             state.skipped = state.skipped ?? [:]
-            state.skipped?[head] = ReviewSkipRecord(
+            state.skipped?[reviewLedgerKey(config: config, commit: head)] = ReviewSkipRecord(
                 sha: head,
                 shortSha: shortHead,
+                worktreeID: reportWorktreeID(config: config),
+                worktreePath: standardizedWorktreePath(repoPath),
+                worktreeBranch: reportWorktreeBranch(config: config),
                 skippedAt: isoNow(),
                 reason: "merge commit"
             )
@@ -2430,14 +5306,16 @@ func reconcileCurrentHead(config: AppConfig) throws -> [URL] {
     return []
 }
 
-func pendingReviewCommits(config: AppConfig) throws -> [String] {
-    try validatePaths(config: config)
+func pendingReviewCommits(config: AppConfig, validate: Bool = true) throws -> [String] {
+    if validate {
+        try validatePaths(config: config)
+    }
 
     let repoPath = repoURL(config: config).path
     let state = try loadState(config: config)
     let head = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
     let output: String
-    if let lastSeenHead = state.lastSeenHead,
+    if let lastSeenHead = lastSeenHeadForWorktree(state, config: config),
        !lastSeenHead.isEmpty {
         if (try? runGit(repoPath: repoPath, arguments: ["merge-base", "--is-ancestor", lastSeenHead, head])) != nil {
             output = try runGit(repoPath: repoPath, arguments: ["rev-list", "--reverse", "--max-count=\(config.reviewSweepDepth)", "\(lastSeenHead)..\(head)"])
@@ -2448,23 +5326,26 @@ func pendingReviewCommits(config: AppConfig) throws -> [String] {
         output = try runGit(repoPath: repoPath, arguments: ["rev-list", "--reverse", "--max-count=\(config.reviewSweepDepth)", "HEAD"])
     }
 
-    let reviewed = Set(state.reviewed.keys)
-    let skipped = Set((state.skipped ?? [:]).keys)
     let recentHistory = try runGit(repoPath: repoPath, arguments: ["rev-list", "--reverse", "--max-count=\(config.reviewSweepDepth)", "HEAD"])
         .split(separator: "\n")
         .map(String.init)
     let rangeCandidates = Set(output.split(separator: "\n").map(String.init))
-    let candidates = recentHistory.filter { rangeCandidates.contains($0) || state.failed[$0] != nil }
+    let candidates = recentHistory.filter { commit in
+        rangeCandidates.contains(commit) ||
+            failureRecord(in: state, config: config, commit: commit) != nil ||
+            !hasReviewLedgerEntry(state, config: config, commit: commit)
+    }
 
     var pending: [String] = []
     var newSkips: [String: ReviewSkipRecord] = [:]
 
     for commit in candidates {
-        if reviewed.contains(commit) || skipped.contains(commit) {
+        if reviewedRecord(in: state, config: config, commit: commit) != nil ||
+            skipRecord(in: state, config: config, commit: commit) != nil {
             continue
         }
 
-        if let failure = state.failed[commit],
+        if let failure = failureRecord(in: state, config: config, commit: commit),
            !shouldRetryFailure(failure, retryAfterSeconds: config.failedReviewRetrySeconds) {
             continue
         }
@@ -2473,9 +5354,12 @@ func pendingReviewCommits(config: AppConfig) throws -> [String] {
             .split(separator: " ")
             .count
         if parentCount > 1 {
-            newSkips[commit] = ReviewSkipRecord(
+            newSkips[reviewLedgerKey(config: config, commit: commit)] = ReviewSkipRecord(
                 sha: commit,
                 shortSha: try runGit(repoPath: repoPath, arguments: ["rev-parse", "--short", commit]),
+                worktreeID: reportWorktreeID(config: config),
+                worktreePath: standardizedWorktreePath(repoPath),
+                worktreeBranch: reportWorktreeBranch(config: config),
                 skippedAt: isoNow(),
                 reason: "merge commit"
             )
@@ -2483,9 +5367,12 @@ func pendingReviewCommits(config: AppConfig) throws -> [String] {
         }
 
         if try shouldSkipCommit(repoPath: repoPath, commit: commit) {
-            newSkips[commit] = ReviewSkipRecord(
+            newSkips[reviewLedgerKey(config: config, commit: commit)] = ReviewSkipRecord(
                 sha: commit,
                 shortSha: try runGit(repoPath: repoPath, arguments: ["rev-parse", "--short", commit]),
+                worktreeID: reportWorktreeID(config: config),
+                worktreePath: standardizedWorktreePath(repoPath),
+                worktreeBranch: reportWorktreeBranch(config: config),
                 skippedAt: isoNow(),
                 reason: "commit message bypass marker"
             )
@@ -2509,7 +5396,6 @@ func pendingReviewCommits(config: AppConfig) throws -> [String] {
 
 func reviewPendingCommits(config: AppConfig) throws -> [URL] {
     let pending = try pendingReviewCommits(config: config)
-    var reports: [URL] = []
 
     if pending.isEmpty {
         let repoPath = repoURL(config: config).path
@@ -2518,13 +5404,139 @@ func reviewPendingCommits(config: AppConfig) throws -> [URL] {
         return []
     }
 
-    for commit in pending {
-        if let report = try reviewCommit(config: config, commit: commit) {
-            reports.append(report)
+    let tasks = pending.map { PendingReviewTask(config: config, commit: $0) }
+    return try reviewPendingTasks(tasks, limit: config.commitReviewConcurrency)
+}
+
+func reviewPendingTasks(_ tasks: [PendingReviewTask], limit: Int) throws -> [URL] {
+    guard !tasks.isEmpty else {
+        return []
+    }
+
+    let slotLimit = max(1, limit)
+    guard slotLimit > 1, tasks.count > 1 else {
+        var reports: [URL] = []
+        for task in tasks {
+            if let report = try reviewCommit(config: task.config, commit: task.commit) {
+                reports.append(report)
+            }
+        }
+        return reports
+    }
+
+    let queue = DispatchQueue(label: "com.ai-reviewer.commit-reviews", attributes: .concurrent)
+    let semaphore = DispatchSemaphore(value: slotLimit)
+    let group = DispatchGroup()
+    let results = PendingReviewTaskResults()
+
+    for task in tasks {
+        group.enter()
+        queue.async {
+            semaphore.wait()
+            defer {
+                semaphore.signal()
+                group.leave()
+            }
+
+            do {
+                results.append(report: try reviewCommit(config: task.config, commit: task.commit))
+            } catch {
+                results.append(error: error)
+            }
         }
     }
 
+    group.wait()
+    let snapshot = results.snapshot()
+    if let firstError = snapshot.errors.first {
+        throw firstError
+    }
+    return snapshot.reports
+}
+
+func reviewPendingCommitsForConfiguredWorktrees(config: AppConfig) throws -> [URL] {
+    var tasks: [PendingReviewTask] = []
+    for targetConfig in try configuredWorktreeConfigs(config: config) {
+        let pending = try pendingReviewCommits(config: targetConfig, validate: false)
+        if pending.isEmpty {
+            let repoPath = repoURL(config: targetConfig).path
+            let head = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
+            try recordSeenHead(config: targetConfig, head: head)
+        } else {
+            tasks.append(contentsOf: pending.map { PendingReviewTask(config: targetConfig, commit: $0) })
+        }
+    }
+
+    return try reviewPendingTasks(tasks, limit: config.commitReviewConcurrency)
+}
+
+func hasRetryableFailedReviewsForConfiguredWorktrees(config: AppConfig) throws -> Bool {
+    for targetConfig in try configuredWorktreeConfigs(config: config) {
+        if try hasRetryableFailedReviews(config: targetConfig) {
+            return true
+        }
+    }
+    return false
+}
+
+func hasPendingReviewsForConfiguredWorktrees(config: AppConfig) throws -> Bool {
+    for targetConfig in try configuredWorktreeConfigs(config: config) {
+        if !(try pendingReviewCommits(config: targetConfig, validate: false)).isEmpty {
+            return true
+        }
+    }
+    return false
+}
+
+func hasPendingReviews(config: AppConfig, target: WorktreeTarget, state: ReviewState) -> Bool {
+    let targetConfig = configForWorktree(config, path: target.path)
+    if hasReviewLedgerEntry(state, config: targetConfig, commit: target.head) {
+        return false
+    }
+    return lastSeenHeadForWorktree(state, config: targetConfig) != target.head
+}
+
+func hasPendingReviewsForConfiguredWorktreeTargets(config: AppConfig, targets: [WorktreeTarget]) throws -> Bool {
+    let state = try loadState(config: config)
+    for target in targets {
+        if hasPendingReviews(config: config, target: target, state: state) {
+            return true
+        }
+    }
+    return false
+}
+
+func currentHeadsNeedStartupReconciliation(config: AppConfig) throws -> Bool {
+    for targetConfig in try configuredWorktreeConfigs(config: config) {
+        if try currentHeadNeedsStartupReconciliation(config: targetConfig) {
+            return true
+        }
+    }
+    return false
+}
+
+func reconcileCurrentHeads(config: AppConfig) throws -> [URL] {
+    var reports: [URL] = []
+    for targetConfig in try configuredWorktreeConfigs(config: config) {
+        reports.append(contentsOf: try reconcileCurrentHead(config: targetConfig))
+    }
     return reports
+}
+
+func recordSeenHeadsForConfiguredWorktrees(config: AppConfig) throws {
+    try recordSeenHeads(config: config, targets: configuredWorktreeTargets(config: config))
+}
+
+func recordSeenHeads(config: AppConfig, targets: [WorktreeTarget]) throws {
+    try mutateState(config: config) { state in
+        for target in targets {
+            recordSeenHead(
+                &state,
+                config: configForWorktree(config, path: target.path),
+                head: target.head
+            )
+        }
+    }
 }
 
 func logPathForReviewPath(_ path: String?) -> String? {
@@ -2562,30 +5574,62 @@ func preferredReviewPath(_ record: ReviewRecord) -> String? {
     return record.copiedReportPath
 }
 
+func reviewHistoryLines(config: AppConfig) throws -> [ReviewHistoryLine] {
+    let arguments = [
+        "log",
+        "--max-count=\(config.reviewSweepDepth)",
+        "--date=iso-strict",
+        "--format=%H%x1f%h%x1f%ad%x1f%s"
+    ]
+    var rows: [ReviewHistoryLine] = []
+    let primaryPath = primaryWorktreePath(config: config)
+
+    for target in try configuredWorktreeTargets(config: config) {
+        let worktreePath = standardizedWorktreePath(target.path)
+        let worktreeID: String
+        if let codexID = codexWorktreeID(from: worktreePath) {
+            worktreeID = sanitizedReportFilenameComponent(codexID)
+        } else if worktreePath == primaryPath {
+            worktreeID = "main"
+        } else if let branch = target.branch, !branch.isEmpty {
+            worktreeID = sanitizedReportFilenameComponent(branch)
+        } else {
+            worktreeID = sanitizedReportFilenameComponent(URL(fileURLWithPath: worktreePath).lastPathComponent)
+        }
+        let output = try runGit(repoPath: worktreePath, arguments: arguments)
+        for line in output.split(separator: "\n", omittingEmptySubsequences: true).map(String.init) {
+            rows.append(ReviewHistoryLine(
+                worktreeID: worktreeID,
+                worktreePath: worktreePath,
+                worktreeBranch: target.branch,
+                line: line
+            ))
+        }
+    }
+
+    return rows.sorted { lhs, rhs in
+        let lhsParts = lhs.line.split(separator: "\u{1f}", maxSplits: 3, omittingEmptySubsequences: false)
+        let rhsParts = rhs.line.split(separator: "\u{1f}", maxSplits: 3, omittingEmptySubsequences: false)
+        guard lhsParts.count == 4, rhsParts.count == 4 else {
+            return lhs.line < rhs.line
+        }
+        return lhsParts[2] > rhsParts[2]
+    }
+}
+
 func loadReviewHistory(config: AppConfig, runningCommits: Set<String> = [], queuedCommits: Set<String> = []) throws -> [ReviewHistoryItem] {
-    try validatePaths(config: config)
-
-    let repoPath = repoURL(config: config).path
     let state = try loadState(config: config)
-    let output = try runGit(
-        repoPath: repoPath,
-        arguments: [
-            "log",
-            "--max-count=\(config.reviewSweepDepth)",
-            "--date=iso-strict",
-            "--format=%H%x1f%h%x1f%ad%x1f%s"
-        ]
-    )
-
-    let historyLines = output.split(separator: "\n", omittingEmptySubsequences: true)
+    let ledgerIndexes = ReviewLedgerIndexes(state: state)
+    let historyLines = try reviewHistoryLines(config: config)
+    let primaryPath = primaryWorktreePath(config: config)
     let historyCommits = historyLines.compactMap { line -> String? in
-        line.split(separator: "\u{1f}", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init)
+        line.line.split(separator: "\u{1f}", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init)
     }
     let activeLockDetails = activeReviewLockDetails(for: historyCommits)
 
     let rows = historyLines
-        .compactMap { line -> ReviewHistoryItem? in
-            let parts = line.split(separator: "\u{1f}", maxSplits: 3, omittingEmptySubsequences: false).map(String.init)
+        .compactMap { row -> ReviewHistoryItem? in
+            let parts = row.line.split(separator: "\u{1f}", maxSplits: 3, omittingEmptySubsequences: false).map(String.init)
             guard parts.count == 4 else {
                 return nil
             }
@@ -2594,11 +5638,16 @@ func loadReviewHistory(config: AppConfig, runningCommits: Set<String> = [], queu
             let shortSha = parts[1]
             let date = parts[2]
             let subject = parts[3]
+            let ledgerKey = "\(row.worktreeID):\(sha)"
 
-            if runningCommits.contains(sha) || activeLockDetails[sha] != nil {
+            if runningCommits.contains(ledgerKey) || runningCommits.contains(sha) || activeLockDetails[sha] != nil {
                 return ReviewHistoryItem(
                     sha: sha,
                     shortSha: shortSha,
+                    worktreeID: row.worktreeID,
+                    worktreePath: row.worktreePath,
+                    worktreeBranch: row.worktreeBranch,
+                    ledgerKey: ledgerKey,
                     date: date,
                     subject: subject,
                     status: .running,
@@ -2610,10 +5659,14 @@ func loadReviewHistory(config: AppConfig, runningCommits: Set<String> = [], queu
                 )
             }
 
-            if queuedCommits.contains(sha) {
+            if queuedCommits.contains(ledgerKey) || queuedCommits.contains(sha) {
                 return ReviewHistoryItem(
                     sha: sha,
                     shortSha: shortSha,
+                    worktreeID: row.worktreeID,
+                    worktreePath: row.worktreePath,
+                    worktreeBranch: row.worktreeBranch,
+                    ledgerKey: ledgerKey,
                     date: date,
                     subject: subject,
                     status: .queued,
@@ -2625,11 +5678,22 @@ func loadReviewHistory(config: AppConfig, runningCommits: Set<String> = [], queu
                 )
             }
 
-            if let reviewed = state.reviewed[sha] {
+            if let reviewed = reviewedRecord(
+                in: state,
+                legacyCommit: sha,
+                ledgerKey: ledgerKey,
+                worktreeID: row.worktreeID,
+                worktreePath: row.worktreePath,
+                indexedByCommit: ledgerIndexes.reviewedByCommit
+            ) {
                 let reviewPath = preferredReviewPath(reviewed)
                 return ReviewHistoryItem(
                     sha: sha,
                     shortSha: reviewed.shortSha,
+                    worktreeID: row.worktreeID,
+                    worktreePath: row.worktreePath,
+                    worktreeBranch: row.worktreeBranch,
+                    ledgerKey: ledgerKey,
                     date: date,
                     subject: subject,
                     status: .completed,
@@ -2641,10 +5705,21 @@ func loadReviewHistory(config: AppConfig, runningCommits: Set<String> = [], queu
                 )
             }
 
-            if let failure = state.failed[sha] {
+            if let failure = failureRecord(
+                in: state,
+                legacyCommit: sha,
+                ledgerKey: ledgerKey,
+                worktreeID: row.worktreeID,
+                worktreePath: row.worktreePath,
+                indexedByCommit: ledgerIndexes.failedByCommit
+            ) {
                 return ReviewHistoryItem(
                     sha: sha,
                     shortSha: failure.shortSha,
+                    worktreeID: row.worktreeID,
+                    worktreePath: row.worktreePath,
+                    worktreeBranch: row.worktreeBranch,
+                    ledgerKey: ledgerKey,
                     date: date,
                     subject: subject,
                     status: .failed,
@@ -2656,10 +5731,21 @@ func loadReviewHistory(config: AppConfig, runningCommits: Set<String> = [], queu
                 )
             }
 
-            if let skipped = state.skipped?[sha] {
+            if let skipped = skipRecord(
+                in: state,
+                legacyCommit: sha,
+                ledgerKey: ledgerKey,
+                worktreeID: row.worktreeID,
+                worktreePath: row.worktreePath,
+                indexedByCommit: ledgerIndexes.skippedByCommit
+            ) {
                 return ReviewHistoryItem(
                     sha: sha,
                     shortSha: skipped.shortSha,
+                    worktreeID: row.worktreeID,
+                    worktreePath: row.worktreePath,
+                    worktreeBranch: row.worktreeBranch,
+                    ledgerKey: ledgerKey,
                     date: date,
                     subject: subject,
                     status: .skipped,
@@ -2674,6 +5760,10 @@ func loadReviewHistory(config: AppConfig, runningCommits: Set<String> = [], queu
             return ReviewHistoryItem(
                 sha: sha,
                 shortSha: shortSha,
+                worktreeID: row.worktreeID,
+                worktreePath: row.worktreePath,
+                worktreeBranch: row.worktreeBranch,
+                ledgerKey: ledgerKey,
                 date: date,
                 subject: subject,
                 status: .pending,
@@ -2685,16 +5775,91 @@ func loadReviewHistory(config: AppConfig, runningCommits: Set<String> = [], queu
             )
         }
 
-    return rows
+    var preferredRowsByCommit: [String: ReviewHistoryItem] = [:]
+    for row in rows {
+        if let existing = preferredRowsByCommit[row.sha] {
+            if reviewHistoryItem(row, isPreferredOver: existing, primaryWorktreePath: primaryPath) {
+                preferredRowsByCommit[row.sha] = row
+            }
+        } else {
+            preferredRowsByCommit[row.sha] = row
+        }
+    }
+
+    let uniqueRows = rows.filter { row in
+        preferredRowsByCommit[row.sha]?.ledgerKey == row.ledgerKey
+    }
+
+    return Array(uniqueRows.prefix(config.reviewSweepDepth))
+}
+
+func reviewHistoryCacheSignature(
+    config: AppConfig,
+    runningCommits: Set<String>,
+    queuedCommits: Set<String>
+) throws -> String {
+    let targets = try configuredWorktreeTargets(config: config)
+    let targetSignature = targets
+        .map { "\($0.path):\($0.head)" }
+        .sorted()
+        .joined(separator: "\u{1E}")
+    let attributes = try? FileManager.default.attributesOfItem(atPath: stateURL(config: config).path)
+    let stateSize = (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
+    let stateModified = (attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+
+    return [
+        standardizedWorktreePath(repoURL(config: config).path),
+        String(config.shouldWatchAllWorktrees),
+        String(config.reviewSweepDepth),
+        targetSignature,
+        "\(stateSize):\(stateModified)",
+        runningCommits.sorted().joined(separator: ","),
+        queuedCommits.sorted().joined(separator: ",")
+    ].joined(separator: "\u{1F}")
+}
+
+func reviewHistoryStatusRank(_ status: ReviewHistoryStatus) -> Int {
+    switch status {
+    case .running:
+        return 0
+    case .queued:
+        return 1
+    case .completed:
+        return 2
+    case .failed:
+        return 3
+    case .skipped:
+        return 4
+    case .pending:
+        return 5
+    }
+}
+
+func reviewHistoryItem(_ candidate: ReviewHistoryItem, isPreferredOver existing: ReviewHistoryItem, primaryWorktreePath: String) -> Bool {
+    let candidateStatusRank = reviewHistoryStatusRank(candidate.status)
+    let existingStatusRank = reviewHistoryStatusRank(existing.status)
+    if candidateStatusRank != existingStatusRank {
+        return candidateStatusRank < existingStatusRank
+    }
+
+    let candidateIsPrimary = standardizedWorktreePath(candidate.worktreePath) == primaryWorktreePath
+    let existingIsPrimary = standardizedWorktreePath(existing.worktreePath) == primaryWorktreePath
+    if candidateIsPrimary != existingIsPrimary {
+        return candidateIsPrimary
+    }
+
+    if candidate.worktreeID != existing.worktreeID {
+        return candidate.worktreeID < existing.worktreeID
+    }
+
+    return candidate.ledgerKey < existing.ledgerKey
 }
 
 func rerunReviewCommit(config: AppConfig, commit: String) throws -> URL? {
     let repoPath = repoURL(config: config).path
     let resolvedCommit = try runGit(repoPath: repoPath, arguments: ["rev-parse", commit])
     try mutateState(config: config) { state in
-        state.reviewed.removeValue(forKey: resolvedCommit)
-        state.failed.removeValue(forKey: resolvedCommit)
-        state.skipped?.removeValue(forKey: resolvedCommit)
+        removeReviewLedgerEntries(&state, config: config, commit: resolvedCommit)
     }
     return try reviewCommit(config: config, commit: resolvedCommit)
 }
@@ -2707,43 +5872,92 @@ func readTextFileIfPresent(path: String?) -> String? {
     return try? String(contentsOfFile: path, encoding: .utf8)
 }
 
+func readFileTail(url: URL, maxBytes: Int) throws -> (data: Data, startsMidFile: Bool) {
+    let handle = try FileHandle(forReadingFrom: url)
+    defer {
+        try? handle.close()
+    }
+
+    let fileSize = try handle.seekToEnd()
+    let requestedBytes = UInt64(max(1, maxBytes))
+    let startOffset = fileSize > requestedBytes ? fileSize - requestedBytes : 0
+    try handle.seek(toOffset: startOffset)
+    return (try handle.readToEnd() ?? Data(), startOffset > 0)
+}
+
+func completeUTF8LogTail(_ tail: (data: Data, startsMidFile: Bool)) -> String {
+    var text = String(decoding: tail.data, as: UTF8.self)
+    if tail.startsMidFile, let firstNewline = text.firstIndex(of: "\n") {
+        text.removeSubrange(text.startIndex...firstNewline)
+    }
+    return text
+}
+
 func readLogText(lineLimit: Int = 250) -> String {
     let logURL = watcherLogURL()
-    guard let data = try? Data(contentsOf: logURL),
-          let text = String(data: data, encoding: .utf8)
-    else {
+    guard FileManager.default.fileExists(atPath: logURL.path),
+          let tail = try? readFileTail(url: logURL, maxBytes: 1_048_576) else {
         return "No watcher log has been written yet."
     }
 
-    let lines = text.split(separator: "\n", omittingEmptySubsequences: false).suffix(lineLimit)
+    let text = completeUTF8LogTail(tail)
+    let lines = text.split(separator: "\n", omittingEmptySubsequences: true).suffix(lineLimit)
     return lines.joined(separator: "\n")
+}
+
+func trimWatcherLogIfNeeded(url: URL, maxBytes: Int = 5_242_880, keepBytes: Int = 1_048_576) throws {
+    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+    let fileSize = (attributes[.size] as? NSNumber)?.intValue ?? 0
+    guard fileSize > maxBytes else {
+        return
+    }
+
+    let tail = try readFileTail(url: url, maxBytes: keepBytes)
+    let text = completeUTF8LogTail(tail)
+    try writeData(Data(text.utf8), to: url)
 }
 
 struct ParsedCommand {
     let command: Command
     let configPath: String
     let bundle: String?
+    let arguments: [String]
 }
 
 func parseCommand(_ args: [String]) throws -> ParsedCommand {
-    guard args.count >= 4,
-          let command = Command(rawValue: args[1]),
-          args[2] == "--config"
-    else {
+    guard args.count >= 4, let command = Command(rawValue: args[1]) else {
         throw AIReviewerError.missingArgument(usage())
     }
 
+    var trailing = Array(args.dropFirst(2))
+    guard let configIndex = trailing.firstIndex(of: "--config"),
+          trailing.indices.contains(configIndex + 1) else {
+        throw AIReviewerError.missingArgument(usage())
+    }
+    let configPath = trailing[configIndex + 1]
+    trailing.removeSubrange(configIndex...(configIndex + 1))
+
     switch command {
-    case .validate, .watch, .materializeHead, .reviewHead, .reviewOnce:
-        guard args.count == 4 else {
+    case .validate, .logs, .watch, .materializeHead, .reviewHead, .reviewOnce:
+        guard trailing.isEmpty else {
             throw AIReviewerError.missingArgument(usage())
         }
-        return ParsedCommand(command: command, configPath: args[3], bundle: nil)
+        return ParsedCommand(command: command, configPath: configPath, bundle: nil, arguments: [])
+    case .status:
+        guard trailing.isEmpty || trailing == ["--json"] else {
+            throw AIReviewerError.missingArgument(usage())
+        }
+        return ParsedCommand(command: command, configPath: configPath, bundle: nil, arguments: trailing)
     case .runCodex:
-        guard args.count == 6, args[4] == "--bundle" else {
+        guard trailing.count == 2, trailing[0] == "--bundle" else {
             throw AIReviewerError.missingArgument(usage())
         }
-        return ParsedCommand(command: command, configPath: args[3], bundle: args[5])
+        return ParsedCommand(command: command, configPath: configPath, bundle: trailing[1], arguments: trailing)
+    case .app, .watcher, .reviews, .config, .instructionSet, .engine, .models:
+        guard !trailing.isEmpty else {
+            throw AIReviewerError.missingArgument(usage())
+        }
+        return ParsedCommand(command: command, configPath: configPath, bundle: nil, arguments: trailing)
     }
 }
 
@@ -2757,43 +5971,56 @@ struct WatcherUpdate: Sendable {
 
 final class AppWatcher: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.ai-reviewer.app-watcher", qos: .utility)
+    private var configURL: URL?
     private var timer: DispatchSourceTimer?
     private var isRunning = false
     private var isReviewing = false
     private var lastHead: String?
+    private var lastHeadsByWorktree: [String: String] = [:]
     private var lastReview: String?
     private var lastError: String?
+    private var lastLoggedSignature: String?
 
-    func start(config: AppConfig, onUpdate: @escaping @Sendable (WatcherUpdate) -> Void) {
-        queue.async {
+    func start(configURL: URL, onUpdate: @escaping @Sendable (WatcherUpdate) -> Void) {
+        queue.async { [weak self] in
+            guard let self else {
+                return
+            }
+            self.configURL = configURL
             self.timer?.cancel()
             self.timer = nil
             self.isRunning = true
             self.isReviewing = false
             self.lastReview = nil
             self.lastError = nil
+            self.lastLoggedSignature = nil
             self.send("Starting watcher...", onUpdate: onUpdate)
 
             do {
-                try validatePaths(config: config)
+                let config = try self.loadWatcherConfig()
                 scheduleReviewCacheCleanup(config: config)
-                let repoPath = repoURL(config: config).path
-                self.lastHead = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
-                self.send("Watching \(repoPath)", onUpdate: onUpdate)
+                let targets = try configuredWorktreeTargets(config: config)
+                self.lastHeadsByWorktree = Dictionary(uniqueKeysWithValues: targets.map { ($0.path, $0.head) })
+                self.lastHead = targets.first?.head
+                if config.shouldWatchAllWorktrees {
+                    self.send("Watching \(targets.count) worktree\(targets.count == 1 ? "" : "s")", onUpdate: onUpdate)
+                } else {
+                    self.send("Watching \(targets.first?.path ?? repoURL(config: config).path)", onUpdate: onUpdate)
+                }
 
                 if config.shouldReviewCurrentHeadOnStartup {
                     self.reviewPending(config: config, reason: "Reviewing pending commits on startup", onUpdate: onUpdate)
-                } else if try currentHeadNeedsStartupReconciliation(config: config) {
-                    self.reviewCurrentHead(config: config, reason: "Reconciling unreviewed current HEAD", onUpdate: onUpdate)
+                } else if try hasPendingReviewsForConfiguredWorktreeTargets(config: config, targets: targets) {
+                    self.reviewPending(config: config, reason: "Reviewing pending commits on startup", onUpdate: onUpdate)
                 } else {
-                    try recordSeenHead(config: config, head: self.lastHead ?? "")
+                    try recordSeenHeads(config: config, targets: targets)
                 }
 
                 let interval = max(1, config.pollIntervalSeconds)
                 let timer = DispatchSource.makeTimerSource(queue: self.queue)
                 timer.schedule(deadline: .now() + .seconds(interval), repeating: .seconds(interval))
                 timer.setEventHandler { [weak self] in
-                    self?.poll(config: config, onUpdate: onUpdate)
+                    self?.poll(onUpdate: onUpdate)
                 }
                 self.timer = timer
                 timer.resume()
@@ -2803,6 +6030,13 @@ final class AppWatcher: @unchecked Sendable {
                 self.send("Watcher failed to start", onUpdate: onUpdate)
             }
         }
+    }
+
+    private func loadWatcherConfig() throws -> AppConfig {
+        guard let configURL else {
+            throw AIReviewerError.invalidConfig("watcher config path is missing")
+        }
+        return try loadConfig(path: configURL.path)
     }
 
     func stop(onUpdate: @escaping @Sendable (WatcherUpdate) -> Void) {
@@ -2815,39 +6049,50 @@ final class AppWatcher: @unchecked Sendable {
         }
     }
 
-    private func poll(config: AppConfig, onUpdate: @escaping @Sendable (WatcherUpdate) -> Void) {
+    private func poll(onUpdate: @escaping @Sendable (WatcherUpdate) -> Void) {
         guard isRunning, !isReviewing else {
             return
         }
 
         do {
-            let repoPath = repoURL(config: config).path
-            let head = try runGit(repoPath: repoPath, arguments: ["rev-parse", "HEAD"])
+            let config = try loadWatcherConfig()
+            let targets = try configuredWorktreeTargets(config: config)
+            let activePaths = Set(targets.map(\.path))
+            lastHeadsByWorktree = lastHeadsByWorktree.filter { activePaths.contains($0.key) }
 
-            if lastHead == nil {
-                lastHead = head
+            var changedTargets: [WorktreeTarget] = []
+            for target in targets {
+                if let previousHead = lastHeadsByWorktree[target.path] {
+                    if previousHead != target.head {
+                        changedTargets.append(target)
+                    }
+                } else {
+                    changedTargets.append(target)
+                }
+                lastHeadsByWorktree[target.path] = target.head
             }
 
-            guard head != lastHead else {
-                if try hasRetryableFailedReviews(config: config) {
+            if changedTargets.isEmpty {
+                if try hasPendingReviewsForConfiguredWorktreeTargets(config: config, targets: targets) {
                     reviewPending(
                         config: config,
-                        reason: "Retrying failed reviews",
+                        reason: "Reviewing pending commits",
                         onUpdate: onUpdate
                     )
                     return
                 }
 
+                lastHead = targets.first?.head
                 lastError = nil
-                send("Watching for commits", onUpdate: onUpdate)
+                send(config.shouldWatchAllWorktrees ? "Watching \(targets.count) worktree\(targets.count == 1 ? "" : "s")" : "Watching for commits", onUpdate: onUpdate)
                 return
             }
 
-            let previousHead = lastHead
-            lastHead = head
+            lastHead = changedTargets.first?.head
+            let targetLabel = changedTargets.count == 1 ? changedTargets[0].displayName : "\(changedTargets.count) worktrees"
             reviewPending(
                 config: config,
-                reason: "HEAD changed \(short(previousHead)) -> \(short(head))",
+                reason: "HEAD changed in \(targetLabel)",
                 onUpdate: onUpdate
             )
         } catch {
@@ -2865,21 +6110,36 @@ final class AppWatcher: @unchecked Sendable {
         lastError = nil
         send(reason, onUpdate: onUpdate)
 
-        do {
-            let reports = try reviewPendingCommits(config: config)
-            if let reportURL = reports.last {
-                lastReview = reportURL.path
-                send("Review completed (\(reports.count) commit\(reports.count == 1 ? "" : "s"))", onUpdate: onUpdate)
-            } else {
-                lastError = nil
-                send("No pending commits", onUpdate: onUpdate)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = Result { try reviewPendingCommitsForConfiguredWorktrees(config: config) }
+            guard let watcher = self else {
+                return
             }
-        } catch {
-            lastError = "\(error)"
-            send("Review failed", onUpdate: onUpdate)
-        }
+            watcher.queue.async { [weak watcher] in
+                guard let watcher else {
+                    return
+                }
 
-        isReviewing = false
+                watcher.isReviewing = false
+                switch result {
+                case .success(let reports):
+                    if let reportURL = reports.last {
+                        watcher.lastReview = reportURL.path
+                        if watcher.isRunning {
+                            watcher.send("Review completed (\(reports.count) commit\(reports.count == 1 ? "" : "s"))", onUpdate: onUpdate)
+                        } else {
+                            watcher.send("Watcher stopped", onUpdate: onUpdate)
+                        }
+                    } else {
+                        watcher.lastError = nil
+                        watcher.send(watcher.isRunning ? "No pending commits" : "Watcher stopped", onUpdate: onUpdate)
+                    }
+                case .failure(let error):
+                    watcher.lastError = "\(error)"
+                    watcher.send(watcher.isRunning ? "Review failed" : "Watcher stopped", onUpdate: onUpdate)
+                }
+            }
+        }
     }
 
     private func reviewCurrentHead(config: AppConfig, reason: String, onUpdate: @escaping @Sendable (WatcherUpdate) -> Void) {
@@ -2891,21 +6151,36 @@ final class AppWatcher: @unchecked Sendable {
         lastError = nil
         send(reason, onUpdate: onUpdate)
 
-        do {
-            let reports = try reconcileCurrentHead(config: config)
-            if let reportURL = reports.last {
-                lastReview = reportURL.path
-                send("Review completed (\(reports.count) commit\(reports.count == 1 ? "" : "s"))", onUpdate: onUpdate)
-            } else {
-                lastError = nil
-                send("No pending commits", onUpdate: onUpdate)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = Result { try reconcileCurrentHeads(config: config) }
+            guard let watcher = self else {
+                return
             }
-        } catch {
-            lastError = "\(error)"
-            send("Review failed", onUpdate: onUpdate)
-        }
+            watcher.queue.async { [weak watcher] in
+                guard let watcher else {
+                    return
+                }
 
-        isReviewing = false
+                watcher.isReviewing = false
+                switch result {
+                case .success(let reports):
+                    if let reportURL = reports.last {
+                        watcher.lastReview = reportURL.path
+                        if watcher.isRunning {
+                            watcher.send("Review completed (\(reports.count) commit\(reports.count == 1 ? "" : "s"))", onUpdate: onUpdate)
+                        } else {
+                            watcher.send("Watcher stopped", onUpdate: onUpdate)
+                        }
+                    } else {
+                        watcher.lastError = nil
+                        watcher.send(watcher.isRunning ? "No pending commits" : "Watcher stopped", onUpdate: onUpdate)
+                    }
+                case .failure(let error):
+                    watcher.lastError = "\(error)"
+                    watcher.send(watcher.isRunning ? "Review failed" : "Watcher stopped", onUpdate: onUpdate)
+                }
+            }
+        }
     }
 
     private func send(_ status: String, onUpdate: @Sendable (WatcherUpdate) -> Void) {
@@ -2916,7 +6191,18 @@ final class AppWatcher: @unchecked Sendable {
             lastReview: lastReview,
             lastError: lastError
         )
+        let logSignature = [
+            update.status,
+            String(update.isRunning),
+            update.lastHead ?? "",
+            update.lastReview ?? "",
+            update.lastError ?? ""
+        ].joined(separator: "\u{1F}")
+        guard logSignature != lastLoggedSignature else {
+            return
+        }
         appendLog(update)
+        lastLoggedSignature = logSignature
         onUpdate(update)
     }
 
@@ -2936,6 +6222,7 @@ final class AppWatcher: @unchecked Sendable {
             if !FileManager.default.fileExists(atPath: logURL.path) {
                 FileManager.default.createFile(atPath: logURL.path, contents: nil)
             }
+            try trimWatcherLogIfNeeded(url: logURL)
             let handle = try FileHandle(forWritingTo: logURL)
             defer {
                 try? handle.close()
@@ -2961,11 +6248,12 @@ final class FlippedDocumentView: NSView {
 }
 
 @MainActor
-final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
+final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSSplitViewDelegate, NSTextViewDelegate {
     private enum MainSection: Int {
         case reviews = 0
         case logs = 1
         case settings = 2
+        case instructionSet = 3
     }
 
     private enum MenuBadgeState {
@@ -2983,14 +6271,22 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var watcherRunning = false
     private var activeSection: MainSection = .reviews
     private var reviewItems: [ReviewHistoryItem] = []
+    private var cachedReviewHistoryItems: [ReviewHistoryItem] = []
+    private var cachedReviewHistorySignature: String?
+    private var loadingReviewHistorySignature: String?
+    private var reviewHistoryRefreshGeneration = 0
     private var selectedReviewIndex: Int?
+    private var reviewsViewerIsVisible: Bool {
+        activeSection == .reviews && window?.isVisible == true && window?.isMiniaturized == false
+    }
     private var runningCommits = Set<String>()
-    private var queuedManualCommits: [String] = []
+    private var queuedManualCommits: [ManualReviewRequest] = []
     private var activeManualCommits = Set<String>()
     private var hasStatusIssue = false
     private var advancedSettingsVisible = false
     private var configuredAIProvider: AIProvider = .codex
     private var didFinishSetup = false
+    private var isRestoringReviewsSplitWidth = false
 
     private let repoField = NSTextField()
     private let reportsField = NSTextField()
@@ -2998,8 +6294,30 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private let codexHomeField = NSTextField()
     private let codexModelField = NSTextField()
     private let aiProviderPopup = NSPopUpButton()
+    private let instructionSetGlobalInstructionsField = NSTextView()
+    private let instructionSetDefaultModelField = NSComboBox()
+    private let instructionSetDefaultEffortField = NSComboBox()
+    private var instructionSetAgentModelFields: [String: NSComboBox] = [:]
+    private var instructionSetAgentEffortFields: [String: NSComboBox] = [:]
+    private var instructionSetAgentInstructionFields: [String: NSTextView] = [:]
+    private struct PromptEditorLayout {
+        let textView: NSTextView
+        let heightConstraint: NSLayoutConstraint
+        let minimumHeight: CGFloat
+        let maximumHeight: CGFloat
+    }
+    private var promptEditorLayouts: [ObjectIdentifier: PromptEditorLayout] = [:]
+    private var instructionSetDraft = InstructionSet(
+        defaultModel: nil,
+        globalInstructions: nil,
+        agents: nil,
+        engineModels: nil
+    )
     private let cursorHomeField = NSTextField()
     private let cursorModelField = NSTextField()
+    private let cursorAPIKeyField = NSSecureTextField()
+    private let openRouterModelField = NSTextField()
+    private let openRouterAPIKeyField = NSSecureTextField()
     private let reviewProfileField = NSTextField()
     private let statePathField = NSTextField()
     private let pollIntervalField = NSTextField()
@@ -3014,6 +6332,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private let maxSnapshotField = NSTextField()
     private let maxPromptSnapshotField = NSTextField()
     private let startWatcherOnLaunchCheckbox = NSButton(checkboxWithTitle: "Start watching when app opens", target: nil, action: nil)
+    private let watchAllWorktreesCheckbox = NSButton(checkboxWithTitle: "Watch all local worktrees for this repository", target: nil, action: nil)
     private let hideDockIconCheckbox = NSButton(checkboxWithTitle: "Hide Dock icon", target: nil, action: nil)
     private let reviewStartupCheckbox = NSButton(checkboxWithTitle: "Review pending commits when watcher starts", target: nil, action: nil)
     private let launchAtLoginCheckbox = NSButton(checkboxWithTitle: "Launch AI Reviewer at login", target: nil, action: nil)
@@ -3021,11 +6340,16 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private let watcherField = NSTextField(labelWithString: "Watcher: stopped")
     private let summaryField = NSTextField(labelWithString: "No repository loaded")
     private let contentContainer = NSView()
-    private let segmentedControl = NSSegmentedControl(labels: ["Reviews", "Logs", "Settings"], trackingMode: .selectOne, target: nil, action: nil)
+    private let segmentedControl = NSSegmentedControl(labels: ["Reviews", "Logs", "Settings", "Instruction Set"], trackingMode: .selectOne, target: nil, action: nil)
     private let reviewTableView = NSTableView()
     private let reviewDetailTextView = NSTextView()
+    private let reviewsSplitViewIdentifier = NSUserInterfaceItemIdentifier("reviewsSplitView")
+    private let reviewsSplitWidthDefaultsKey = "reviewsSplitView.leftWidth.v4"
     private let logsTextView = NSTextView()
+    private let hideCompletedReviewsCheckbox = NSButton(checkboxWithTitle: "Hide Completed", target: nil, action: nil)
+    private let hideSkippedReviewsCheckbox = NSButton(checkboxWithTitle: "Hide Skipped", target: nil, action: nil)
     private var rerunReviewButton: NSButton?
+    private var queueFailedPendingButton: NSButton?
     private var openReviewButton: NSButton?
     private var openBundleButton: NSButton?
     private var primaryActionButton: NSButton?
@@ -3044,6 +6368,12 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         buildMenu()
         buildStatusItem()
         buildWindow()
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleCLICommand(_:)),
+            name: appCLICommandNotification,
+            object: nil
+        )
         let config = loadConfigIntoFields()
         refreshLoginItemCheckbox()
         applyActivationPolicy(config: config, windowVisible: false)
@@ -3051,7 +6381,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         window?.center()
 
         if config.shouldStartWatcherOnLaunch && !config.repoPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            beginWatching(showSettingsWindowOnFailure: true)
+            beginWatching(showSettingsWindowOnFailure: true, saveSettings: false)
         } else {
             showSettingsWindow()
         }
@@ -3067,7 +6397,10 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 
     func windowWillClose(_ notification: Notification) {
-        if activeSection == .settings {
+        if activeSection == .reviews {
+            persistReviewsSplitWidth()
+        }
+        if activeSection == .settings || activeSection == .instructionSet {
             persistSettingsFromFields(showStatus: false)
         }
         if let config = try? configFromFields() {
@@ -3085,12 +6418,75 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         if let config = try? configFromFields() {
             applyActivationPolicy(config: config, windowVisible: true)
         }
+        if activeSection == .reviews {
+            refreshReviewHistory()
+        }
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in
+            self?.updateAllPromptEditorHeights()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        DistributedNotificationCenter.default().removeObserver(self, name: appCLICommandNotification, object: nil)
+        if activeSection == .reviews {
+            persistReviewsSplitWidth()
+        }
         persistSettingsFromFields(showStatus: false)
         appWatcher.stop { _ in }
         watcherLock.unlock()
+    }
+
+    @objc private func handleCLICommand(_ notification: Notification) {
+        guard let action = notification.userInfo?["action"] as? String else {
+            return
+        }
+        let value = notification.userInfo?["value"] as? String
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else {
+                return
+            }
+            switch action {
+            case "show":
+                self.showSettingsWindow()
+            case "tab":
+                let section: MainSection?
+                switch value {
+                case "reviews": section = .reviews
+                case "logs": section = .logs
+                case "settings": section = .settings
+                case "instruction-set": section = .instructionSet
+                default: section = nil
+                }
+                if let section {
+                    self.showSettingsWindow()
+                    self.showSection(section)
+                }
+            case "refresh":
+                self.refreshCurrentView()
+            case "quit":
+                NSApp.terminate(nil)
+            case "reload-config":
+                _ = self.loadConfigIntoFields()
+                self.showSection(self.activeSection)
+            case "watcher-start":
+                _ = self.loadConfigIntoFields()
+                self.beginWatching(showSettingsWindowOnFailure: true, saveSettings: false)
+            case "watcher-stop":
+                self.stopWatching()
+            case "reviews-queue-pending":
+                self.queueFailedAndPendingReviews()
+            case "reviews-rerun":
+                if let value {
+                    self.queueReview(commit: value)
+                }
+            default:
+                break
+            }
+        }
     }
 
     private func buildMenu() {
@@ -3102,6 +6498,21 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         appMenu.addItem(NSMenuItem(title: "Quit AI Reviewer", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         appMenuItem.submenu = appMenu
         mainMenu.addItem(appMenuItem)
+
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(NSMenuItem(title: "Undo", action: Selector(("undo:")), keyEquivalent: "z"))
+        let redoItem = NSMenuItem(title: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        redoItem.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(redoItem)
+        editMenu.addItem(NSMenuItem.separator())
+        editMenu.addItem(NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x"))
+        editMenu.addItem(NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
+        editMenu.addItem(NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
+        editMenu.addItem(NSMenuItem(title: "Select All", action: #selector(NSResponder.selectAll(_:)), keyEquivalent: "a"))
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+
         NSApp.mainMenu = mainMenu
     }
 
@@ -3249,6 +6660,10 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         )
         window.title = "AI Reviewer"
         window.minSize = NSSize(width: 980, height: 680)
+        window.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
         window.isReleasedWhenClosed = false
         window.delegate = self
 
@@ -3285,14 +6700,18 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let startButton = button(title: "Start", action: #selector(startWatching))
         let stopButton = button(title: "Stop", action: #selector(stopWatching))
         let primaryButton = button(title: "Refresh", action: #selector(refreshCurrentView))
+        let queueFailedPendingButton = button(title: "Queue Failed/Pending", action: #selector(queueFailedAndPendingReviews))
         stopButton.isEnabled = false
+        queueFailedPendingButton.isEnabled = false
         startWatcherButton = startButton
         stopWatcherButton = stopButton
         primaryActionButton = primaryButton
+        self.queueFailedPendingButton = queueFailedPendingButton
 
         header.addArrangedSubview(titleStack)
         header.addArrangedSubview(spacer)
         header.addArrangedSubview(primaryButton)
+        header.addArrangedSubview(queueFailedPendingButton)
         header.addArrangedSubview(startButton)
         header.addArrangedSubview(stopButton)
         root.addArrangedSubview(header)
@@ -3308,11 +6727,14 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         root.addArrangedSubview(watcherField)
 
         contentContainer.translatesAutoresizingMaskIntoConstraints = false
+        contentContainer.setContentHuggingPriority(.defaultLow, for: .vertical)
+        contentContainer.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         root.addArrangedSubview(contentContainer)
 
-        statusField.lineBreakMode = .byWordWrapping
-        statusField.maximumNumberOfLines = 4
+        statusField.lineBreakMode = .byTruncatingMiddle
+        statusField.maximumNumberOfLines = 2
         statusField.textColor = .secondaryLabelColor
+        statusField.font = .systemFont(ofSize: 11)
         root.addArrangedSubview(statusField)
 
         window.contentView = NSView()
@@ -3323,10 +6745,10 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             root.topAnchor.constraint(equalTo: window.contentView!.topAnchor),
             root.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor),
             header.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -48),
-            segmentedControl.widthAnchor.constraint(equalToConstant: 300),
+            segmentedControl.widthAnchor.constraint(equalToConstant: 420),
             watcherField.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -48),
             contentContainer.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -48),
-            contentContainer.heightAnchor.constraint(greaterThanOrEqualToConstant: 460),
+            contentContainer.heightAnchor.constraint(greaterThanOrEqualToConstant: 300),
             statusField.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -48)
         ])
 
@@ -3346,23 +6768,38 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 
     private func showSection(_ section: MainSection) {
-        if activeSection == .settings, section != .settings {
-            persistSettingsFromFields(showStatus: true)
+        let preservedWindowFrame = window?.frame
+        if activeSection == .reviews, section != .reviews {
+            persistReviewsSplitWidth()
+            selectedReviewIndex = nil
+            reviewTableView.deselectAll(nil)
+            reviewDetailTextView.string = ""
+        }
+        if (activeSection == .settings || activeSection == .instructionSet), section != activeSection {
+            persistSettingsFromFields(showStatus: false, syncLoginItem: false)
         }
 
         activeSection = section
         segmentedControl.selectedSegment = section.rawValue
-        primaryActionButton?.title = section == .settings ? "Save" : "Refresh"
+        primaryActionButton?.title = (section == .settings || section == .instructionSet) ? "Save" : "Refresh"
+        queueFailedPendingButton?.isHidden = section != .reviews
 
         switch section {
         case .reviews:
             replaceContent(with: buildReviewsView())
-            refreshReviewHistory()
+            if reviewsViewerIsVisible {
+                refreshReviewHistory()
+            }
         case .logs:
             replaceContent(with: buildLogsView())
             refreshLogs(scrollToBottom: true)
         case .settings:
             replaceContent(with: buildSettingsView())
+        case .instructionSet:
+            replaceContent(with: buildInstructionSetView())
+        }
+        if let preservedWindowFrame {
+            window?.setFrame(preservedWindowFrame, display: false)
         }
     }
 
@@ -3373,10 +6810,10 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     @objc private func refreshCurrentView() {
         switch activeSection {
         case .reviews:
-            refreshReviewHistory()
+            refreshReviewHistory(forceReload: true)
         case .logs:
             refreshLogs(scrollToBottom: true)
-        case .settings:
+        case .settings, .instructionSet:
             persistSettingsFromFields(showStatus: true)
         }
     }
@@ -3384,27 +6821,57 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private func buildReviewsView() -> NSView {
         configureReviewTableIfNeeded()
 
-        let layout = NSStackView()
-        layout.orientation = .horizontal
-        layout.alignment = .top
-        layout.spacing = 14
+        let listStack = NSStackView()
+        listStack.orientation = .vertical
+        listStack.alignment = .width
+        listStack.spacing = 8
+        listStack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 10)
+        listStack.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        listStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        listStack.translatesAutoresizingMaskIntoConstraints = false
+
+        let filterRow = NSStackView()
+        filterRow.orientation = .horizontal
+        filterRow.spacing = 12
+        hideCompletedReviewsCheckbox.target = self
+        hideCompletedReviewsCheckbox.action = #selector(reviewFilterChanged)
+        hideSkippedReviewsCheckbox.target = self
+        hideSkippedReviewsCheckbox.action = #selector(reviewFilterChanged)
+        filterRow.addArrangedSubview(hideCompletedReviewsCheckbox)
+        filterRow.addArrangedSubview(hideSkippedReviewsCheckbox)
+
+        let filterContainer = NSView()
+        filterContainer.translatesAutoresizingMaskIntoConstraints = false
+        filterRow.translatesAutoresizingMaskIntoConstraints = false
+        filterContainer.addSubview(filterRow)
+        NSLayoutConstraint.activate([
+            filterRow.leadingAnchor.constraint(equalTo: filterContainer.leadingAnchor),
+            filterRow.topAnchor.constraint(equalTo: filterContainer.topAnchor),
+            filterRow.bottomAnchor.constraint(equalTo: filterContainer.bottomAnchor),
+            filterRow.trailingAnchor.constraint(lessThanOrEqualTo: filterContainer.trailingAnchor),
+            filterContainer.heightAnchor.constraint(equalTo: filterRow.heightAnchor)
+        ])
 
         let tableScroll = NSScrollView()
         tableScroll.hasVerticalScroller = true
+        tableScroll.hasHorizontalScroller = false
         tableScroll.borderType = .noBorder
         tableScroll.documentView = reviewTableView
         tableScroll.translatesAutoresizingMaskIntoConstraints = false
         tableScroll.setContentHuggingPriority(.defaultLow, for: .horizontal)
         tableScroll.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        tableScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 500).isActive = true
         tableScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 430).isActive = true
+        listStack.addArrangedSubview(filterContainer)
+        listStack.addArrangedSubview(tableScroll)
 
         let detailStack = NSStackView()
         detailStack.orientation = .vertical
-        detailStack.alignment = .leading
+        detailStack.alignment = .width
         detailStack.spacing = 8
-        detailStack.setContentHuggingPriority(.required, for: .horizontal)
-        detailStack.setContentCompressionResistancePriority(.required, for: .horizontal)
+        detailStack.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 0)
+        detailStack.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        detailStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        detailStack.translatesAutoresizingMaskIntoConstraints = false
 
         let actionRow = NSStackView()
         actionRow.orientation = .horizontal
@@ -3420,6 +6887,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         actionRow.addArrangedSubview(openBundle)
 
         reviewDetailTextView.isEditable = false
+        reviewDetailTextView.isSelectable = true
         reviewDetailTextView.isRichText = false
         reviewDetailTextView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         reviewDetailTextView.textContainerInset = NSSize(width: 10, height: 10)
@@ -3432,12 +6900,106 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
         detailStack.addArrangedSubview(actionRow)
         detailStack.addArrangedSubview(detailScroll)
-        detailScroll.widthAnchor.constraint(equalTo: detailStack.widthAnchor).isActive = true
 
-        layout.addArrangedSubview(tableScroll)
-        layout.addArrangedSubview(detailStack)
-        detailStack.widthAnchor.constraint(equalToConstant: 360).isActive = true
-        return layout
+        let splitView = ReviewsSplitView()
+        splitView.identifier = reviewsSplitViewIdentifier
+        splitView.isVertical = true
+        splitView.dividerStyle = .thin
+        splitView.translatesAutoresizingMaskIntoConstraints = false
+        splitView.addArrangedSubview(listStack)
+        splitView.addArrangedSubview(detailStack)
+        splitView.setHoldingPriority(.init(249), forSubviewAt: 0)
+        splitView.setHoldingPriority(.init(250), forSubviewAt: 1)
+        splitView.heightAnchor.constraint(greaterThanOrEqualToConstant: 460).isActive = true
+        listStack.widthAnchor.constraint(greaterThanOrEqualToConstant: 360).isActive = true
+        detailStack.widthAnchor.constraint(greaterThanOrEqualToConstant: 320).isActive = true
+
+        DispatchQueue.main.async {
+            guard splitView.window != nil, splitView.subviews.count == 2 else {
+                return
+            }
+            self.isRestoringReviewsSplitWidth = true
+            let initialLeftWidth = self.restoredReviewsSplitWidth(for: splitView.bounds.width)
+            splitView.setPosition(initialLeftWidth, ofDividerAt: 0)
+            self.isRestoringReviewsSplitWidth = false
+            splitView.delegate = self
+            self.resetReviewTableHorizontalScroll()
+        }
+
+        return splitView
+    }
+
+    func splitView(
+        _ splitView: NSSplitView,
+        constrainMinCoordinate proposedMinimumPosition: CGFloat,
+        ofSubviewAt dividerIndex: Int
+    ) -> CGFloat {
+        guard splitView.identifier == reviewsSplitViewIdentifier else {
+            return proposedMinimumPosition
+        }
+        return 420
+    }
+
+    func splitView(
+        _ splitView: NSSplitView,
+        constrainMaxCoordinate proposedMaximumPosition: CGFloat,
+        ofSubviewAt dividerIndex: Int
+    ) -> CGFloat {
+        guard splitView.identifier == reviewsSplitViewIdentifier else {
+            return proposedMaximumPosition
+        }
+        return max(320, splitView.bounds.width - 320)
+    }
+
+    func splitViewDidResizeSubviews(_ notification: Notification) {
+        guard let splitView = notification.object as? NSSplitView,
+              splitView.identifier == reviewsSplitViewIdentifier,
+              !isRestoringReviewsSplitWidth else {
+            return
+        }
+        persistReviewsSplitWidth(splitView)
+    }
+
+    private func currentReviewsSplitView() -> NSSplitView? {
+        contentContainer.subviews.compactMap { $0 as? NSSplitView }.first {
+            $0.identifier == reviewsSplitViewIdentifier
+        }
+    }
+
+    private func persistReviewsSplitWidth(_ splitView: NSSplitView? = nil) {
+        let target = splitView ?? currentReviewsSplitView()
+        guard let target,
+              target.subviews.count >= 2,
+              target.bounds.width > 0 else {
+            return
+        }
+        UserDefaults.standard.set(Double(target.subviews[0].frame.width), forKey: reviewsSplitWidthDefaultsKey)
+    }
+
+    private func restoredReviewsSplitWidth(for totalWidth: CGFloat) -> CGFloat {
+        let fallback = totalWidth - 340
+        let saved = UserDefaults.standard.double(forKey: reviewsSplitWidthDefaultsKey)
+        let width = saved > 0 ? CGFloat(saved) : fallback
+        return clampedReviewsSplitWidth(width, totalWidth: totalWidth)
+    }
+
+    private func clampedReviewsSplitWidth(_ width: CGFloat, totalWidth: CGFloat) -> CGFloat {
+        let minimum: CGFloat = 420
+        let maximum = max(minimum, totalWidth - 320)
+        return min(max(width, minimum), maximum)
+    }
+
+    private func resetReviewTableHorizontalScroll() {
+        guard let clipView = reviewTableView.enclosingScrollView?.contentView else {
+            return
+        }
+        var bounds = clipView.bounds
+        guard bounds.origin.x != 0 else {
+            return
+        }
+        bounds.origin.x = 0
+        clipView.setBoundsOrigin(bounds.origin)
+        reviewTableView.scrollColumnToVisible(0)
     }
 
     private func configureReviewTableIfNeeded() {
@@ -3474,26 +7036,41 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
         let actions = NSStackView()
         actions.orientation = .horizontal
+        actions.alignment = .centerY
+        actions.distribution = .fill
         actions.spacing = 8
-        actions.addArrangedSubview(button(title: "Refresh Logs", action: #selector(refreshLogsAction)))
         actions.addArrangedSubview(button(title: "Open Logs Folder", action: #selector(openLogs)))
-        let note = NSTextField(labelWithString: "Showing latest 250 lines")
+        let note = NSTextField(labelWithString: "Latest 250 lines")
         note.textColor = .secondaryLabelColor
         actions.addArrangedSubview(note)
+        let actionsSpacer = NSView()
+        actionsSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        actions.addArrangedSubview(actionsSpacer)
         stack.addArrangedSubview(actions)
 
         logsTextView.isEditable = false
+        logsTextView.isSelectable = true
         logsTextView.isRichText = false
         logsTextView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         logsTextView.textContainerInset = NSSize(width: 10, height: 10)
+        logsTextView.isVerticallyResizable = true
+        logsTextView.isHorizontallyResizable = false
+        logsTextView.autoresizingMask = [.width]
+        logsTextView.minSize = NSSize(width: 0, height: 0)
+        logsTextView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        logsTextView.textContainer?.widthTracksTextView = true
+        logsTextView.textContainer?.heightTracksTextView = false
 
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
         scroll.borderType = .noBorder
+        logsTextView.frame = NSRect(origin: .zero, size: scroll.contentSize)
         scroll.documentView = logsTextView
         stack.addArrangedSubview(scroll)
         scroll.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 430).isActive = true
+        scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         return stack
     }
 
@@ -3506,6 +7083,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
         let title = NSTextField(labelWithString: "Settings")
         title.font = .systemFont(ofSize: 18, weight: .semibold)
+        title.alignment = .left
         form.addArrangedSubview(title)
 
         form.addArrangedSubview(sectionHeader("Project"))
@@ -3514,29 +7092,42 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         form.addArrangedSubview(row(label: "Review Instructions", field: reviewProfileField, buttonTitle: "Choose", action: #selector(chooseReviewProfile)))
 
         form.addArrangedSubview(sectionHeader("Automation"))
-        form.addArrangedSubview(providerRow())
         form.addArrangedSubview(row(label: "Reviews at Once", field: maxParallelCommitReviewsField))
         form.addArrangedSubview(row(label: "Agents per Review", field: maxParallelField))
         form.addArrangedSubview(checkboxRow(startWatcherOnLaunchCheckbox))
+        form.addArrangedSubview(checkboxRow(watchAllWorktreesCheckbox))
         form.addArrangedSubview(checkboxRow(hideDockIconCheckbox))
         form.addArrangedSubview(checkboxRow(launchAtLoginCheckbox))
 
         let buttonRow = NSStackView()
         buttonRow.orientation = .horizontal
+        buttonRow.alignment = .centerY
+        buttonRow.distribution = .fill
         buttonRow.spacing = 8
         buttonRow.addArrangedSubview(button(title: "Save", action: #selector(saveSettings)))
         buttonRow.addArrangedSubview(button(title: advancedSettingsVisible ? "Hide Advanced" : "Show Advanced", action: #selector(toggleAdvancedSettings)))
+        let buttonSpacer = NSView()
+        buttonSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        buttonRow.addArrangedSubview(buttonSpacer)
         form.addArrangedSubview(buttonRow)
 
         if advancedSettingsVisible {
             form.addArrangedSubview(sectionHeader("Advanced"))
             form.addArrangedSubview(row(label: "Cache Folder", field: cacheField))
-            if selectedAIProvider() == .codex {
+            switch configuredAIProvider {
+            case .codex:
                 form.addArrangedSubview(row(label: "Codex Home", field: codexHomeField))
                 form.addArrangedSubview(row(label: "Codex Model", field: codexModelField))
-            } else {
+            case .cursor:
                 form.addArrangedSubview(row(label: "Cursor Home", field: cursorHomeField))
                 form.addArrangedSubview(row(label: "Cursor Model", field: cursorModelField))
+                cursorAPIKeyField.placeholderString = "Optional; overrides agent login"
+                form.addArrangedSubview(row(label: "Cursor API Key", field: cursorAPIKeyField))
+            case .openrouter:
+                openRouterModelField.placeholderString = "deepseek/deepseek-v4-pro"
+                form.addArrangedSubview(row(label: "OpenRouter Model", field: openRouterModelField))
+                openRouterAPIKeyField.placeholderString = "Optional; falls back to OPENROUTER_API_KEY"
+                form.addArrangedSubview(row(label: "OpenRouter API Key", field: openRouterAPIKeyField))
             }
             form.addArrangedSubview(row(label: "State File", field: statePathField))
             form.addArrangedSubview(row(label: "Poll Seconds", field: pollIntervalField))
@@ -3559,35 +7150,360 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             form.addArrangedSubview(advancedButtons)
         }
 
+        constrainFormRowsToWidth(form)
+        return formScrollView(form)
+    }
+
+    private func buildInstructionSetContextConfig() -> AppConfig {
+        var config = defaultConfig()
+        config.reviewProfilePath = reviewProfileField.stringValue.isEmpty ? nil : reviewProfileField.stringValue
+        let codexHome = codexHomeField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !codexHome.isEmpty {
+            config.codexHome = codexHome
+        }
+        config.aiProvider = configuredAIProvider.rawValue
+        let cursorHome = cursorHomeField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cursorHome.isEmpty {
+            config.cursorHome = cursorHome
+        }
+        let cursorModel = cursorModelField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        config.cursorModel = cursorModel.isEmpty ? "composer-2.5" : cursorModel
+        let openRouterModel = openRouterModelField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        config.openRouterModel = openRouterModel.isEmpty ? "deepseek/deepseek-v4-pro" : openRouterModel
+
+        return config
+    }
+
+    private func buildInstructionSetView() -> NSView {
+        let form = NSStackView()
+        form.orientation = .vertical
+        form.alignment = .leading
+        form.spacing = 12
+        form.edgeInsets = NSEdgeInsets(top: 8, left: 0, bottom: 8, right: 0)
+
+        let title = NSTextField(labelWithString: "Instruction Set")
+        title.font = .systemFont(ofSize: 18, weight: .semibold)
+        title.alignment = .left
+        form.addArrangedSubview(title)
+
+        instructionSetAgentModelFields.removeAll()
+        instructionSetAgentEffortFields.removeAll()
+        instructionSetAgentInstructionFields.removeAll()
+        promptEditorLayouts.removeAll()
+
+        let config = buildInstructionSetContextConfig()
+        let profile: ReviewProfile
+        if let loadedProfile = try? loadReviewProfile(path: config.reviewProfilePath, config: config) {
+            profile = loadedProfile
+        } else {
+            profile = defaultReviewProfile(config: config)
+        }
+        let provider = configuredAIProvider
+        let resolvedInstructionSet = mergedInstructionSet(
+            base: instructionSetTemplate(from: profile, for: provider),
+            overrides: instructionSetDraft
+        )
+        if !instructionSetsEqual(resolvedInstructionSet, instructionSetDraft) {
+            instructionSetDraft = resolvedInstructionSet
+        }
+        let codexModels = availableModels(for: provider, config: config)
+
+        form.addArrangedSubview(sectionHeader("Engine"))
+        form.addArrangedSubview(providerRow())
+
+        let instructionSet = instructionSetDraft
+        let selectedDefaultModel = instructionSet.providerDefaultModel(for: provider)
+            ?? instructionSet.defaultModel
+        configureModelChoiceField(
+            instructionSetDefaultModelField,
+            choices: codexModels,
+            selected: selectedDefaultModel,
+            placeholder: providerDefaultModelPlaceholder(provider),
+            shouldPrefillFirstChoice: true
+        )
+        instructionSetDefaultModelField.target = self
+        instructionSetDefaultModelField.action = #selector(instructionSetModelChanged(_:))
+        if provider == .codex {
+            configureReasoningEffortField(
+                instructionSetDefaultEffortField,
+                model: instructionSetDefaultModelField.stringValue,
+                selected: instructionSet.providerDefaultReasoningEffort(for: provider),
+                config: config
+            )
+        }
+        instructionSetGlobalInstructionsField.string = instructionSet.globalInstructions ?? ""
+
+        form.addArrangedSubview(sectionHeader("Global Instruction Set"))
+        form.addArrangedSubview(modelChoiceRow(
+            label: "Default Model",
+            field: instructionSetDefaultModelField,
+            effortField: provider == .codex ? instructionSetDefaultEffortField : nil
+        ))
+        form.addArrangedSubview(multilineRow(
+            label: "Global Prompt",
+            textView: instructionSetGlobalInstructionsField,
+            minHeight: 150,
+            maxHeight: 320
+        ))
+
+        form.addArrangedSubview(sectionHeader("Per-Agent Prompt & Model"))
+        for (agentIndex, agent) in profile.agents.enumerated() {
+            if agentIndex > 0 {
+                form.addArrangedSubview(separatorView())
+            }
+            let agentModelField = NSComboBox()
+            let agentEffortField = NSComboBox()
+            let agentPromptField = NSTextView()
+            let override = instructionSet.agents?[agent.id]
+            let selectedModel = instructionSet.providerModel(for: provider, agentID: agent.id)
+                ?? override?.providerModel(for: provider)
+                ?? override?.model
+            configureModelChoiceField(
+                agentModelField,
+                choices: codexModels,
+                selected: selectedModel,
+                placeholder: "Leave blank to inherit default model"
+            )
+            agentModelField.target = self
+            agentModelField.action = #selector(instructionSetModelChanged(_:))
+            if provider == .codex {
+                configureReasoningEffortField(
+                    agentEffortField,
+                    model: agentModelField.stringValue,
+                    selected: instructionSet.providerReasoningEffort(for: provider, agentID: agent.id),
+                    config: config
+                )
+            }
+            agentPromptField.string = override?.instructions ?? ""
+
+            instructionSetAgentModelFields[agent.id] = agentModelField
+            instructionSetAgentEffortFields[agent.id] = agentEffortField
+            instructionSetAgentInstructionFields[agent.id] = agentPromptField
+
+            form.addArrangedSubview(sectionHeader(agent.title))
+            form.addArrangedSubview(modelChoiceRow(
+                label: "Model",
+                field: agentModelField,
+                effortField: provider == .codex ? agentEffortField : nil
+            ))
+            form.addArrangedSubview(multilineRow(
+                label: "Prompt",
+                textView: agentPromptField,
+                minHeight: 100,
+                maxHeight: 240
+            ))
+        }
+
+        if profile.agents.isEmpty {
+            form.addArrangedSubview(
+                NSTextField(labelWithString: "No agents found in this review profile. Edit a profile file first.")
+            )
+        }
+
+        let note = NSTextField(labelWithString: "Only non-empty instruction values are stored as overrides in config. Codex models and exact reasoning-effort labels are loaded from models_cache.json when available; Ultra is excluded because this app owns orchestration. OpenRouter defaults to deepseek/deepseek-v4-pro.")
+        note.font = .systemFont(ofSize: 11, weight: .regular)
+        note.textColor = .secondaryLabelColor
+        note.lineBreakMode = .byWordWrapping
+        note.maximumNumberOfLines = 0
+        form.addArrangedSubview(note)
+
+        constrainFormRowsToWidth(form)
+        note.widthAnchor.constraint(equalTo: form.widthAnchor).isActive = true
+        return formScrollView(form)
+    }
+
+    private func configureModelChoiceField(
+        _ field: NSComboBox,
+        choices: [String],
+        selected: String?,
+        placeholder: String,
+        shouldPrefillFirstChoice: Bool = false
+    ) {
+        let normalizedChoices = choices
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        var fieldChoices = normalizedChoices
+        if let selected {
+            let normalized = selected.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !normalized.isEmpty && !fieldChoices.contains(normalized) {
+                fieldChoices.insert(normalized, at: 0)
+            }
+        }
+
+        field.removeAllItems()
+        for choice in fieldChoices {
+            field.addItem(withObjectValue: choice)
+        }
+        field.isEditable = false
+        field.completes = false
+        field.usesDataSource = false
+        field.numberOfVisibleItems = max(1, min(10, max(4, normalizedChoices.count)))
+        field.placeholderString = placeholder
+
+        if let selected, !selected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let normalized = selected.trimmingCharacters(in: .whitespacesAndNewlines)
+            if fieldChoices.contains(normalized) {
+                field.stringValue = normalized
+                return
+            }
+        }
+
+        if shouldPrefillFirstChoice, let first = fieldChoices.first {
+            field.stringValue = first
+        } else {
+            field.stringValue = ""
+        }
+    }
+
+    private func formScrollView(_ form: NSStackView) -> NSScrollView {
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.borderType = .noBorder
+
         let container = FlippedDocumentView()
         container.translatesAutoresizingMaskIntoConstraints = false
         form.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(form)
-        let bottom = form.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor)
-        bottom.priority = .defaultLow
-        NSLayoutConstraint.activate([
-            form.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            form.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor),
-            form.topAnchor.constraint(equalTo: container.topAnchor),
-            bottom
-        ])
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.borderType = .noBorder
         scroll.documentView = container
-        container.frame = NSRect(x: 0, y: 0, width: 940, height: advancedSettingsVisible ? 780 : 360)
+
+        NSLayoutConstraint.activate([
+            container.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            container.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+            container.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            container.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            container.heightAnchor.constraint(greaterThanOrEqualTo: scroll.contentView.heightAnchor),
+            form.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            form.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            form.topAnchor.constraint(equalTo: container.topAnchor),
+            form.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        ])
         return scroll
+    }
+
+    private func constrainFormRowsToWidth(_ form: NSStackView) {
+        form.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        for view in form.arrangedSubviews {
+            view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            if view is NSStackView || view is NSBox {
+                view.widthAnchor.constraint(equalTo: form.widthAnchor).isActive = true
+            }
+        }
+    }
+
+    private func configureReasoningEffortField(
+        _ field: NSComboBox,
+        model: String?,
+        selected: String?,
+        config: AppConfig
+    ) {
+        let options = codexReasoningEffortOptions(config: config, model: model)
+        field.removeAllItems()
+        options.supported.forEach { field.addItem(withObjectValue: $0) }
+        field.isEditable = false
+        field.completes = false
+        field.usesDataSource = false
+        field.numberOfVisibleItems = max(1, options.supported.count)
+        field.placeholderString = options.supported.isEmpty ? "Not supported" : "Effort"
+        field.isEnabled = !options.supported.isEmpty
+        field.stringValue = resolvedCodexReasoningEffort(
+            config: config,
+            model: model,
+            requested: selected
+        ) ?? ""
+    }
+
+    @objc private func instructionSetModelChanged(_ sender: NSComboBox) {
+        guard configuredAIProvider == .codex else {
+            return
+        }
+
+        let config = buildInstructionSetContextConfig()
+        if sender === instructionSetDefaultModelField {
+            configureReasoningEffortField(
+                instructionSetDefaultEffortField,
+                model: sender.stringValue,
+                selected: instructionSetDefaultEffortField.stringValue,
+                config: config
+            )
+            return
+        }
+
+        guard let agentID = instructionSetAgentModelFields.first(where: { $0.value === sender })?.key,
+              let effortField = instructionSetAgentEffortFields[agentID] else {
+            return
+        }
+        configureReasoningEffortField(
+            effortField,
+            model: sender.stringValue,
+            selected: effortField.stringValue,
+            config: config
+        )
+    }
+
+    private func modelChoiceRow(label: String, field: NSComboBox, effortField: NSComboBox? = nil) -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 10
+
+        let labelView = NSTextField(labelWithString: label)
+        labelView.alignment = .left
+        labelView.widthAnchor.constraint(equalToConstant: 140).isActive = true
+
+        field.isEditable = false
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let minimumModelWidth = field.widthAnchor.constraint(greaterThanOrEqualToConstant: effortField == nil ? 260 : 220)
+        minimumModelWidth.priority = .defaultLow
+        minimumModelWidth.isActive = true
+
+        stack.addArrangedSubview(labelView)
+        stack.addArrangedSubview(field)
+        if let effortField {
+            let effortLabel = NSTextField(labelWithString: "Effort")
+            effortLabel.alignment = .left
+            effortField.translatesAutoresizingMaskIntoConstraints = false
+            effortField.widthAnchor.constraint(equalToConstant: 110).isActive = true
+            stack.addArrangedSubview(effortLabel)
+            stack.addArrangedSubview(effortField)
+        }
+        return stack
+    }
+
+    private func providerDefaultModelPlaceholder(_ provider: AIProvider) -> String {
+        switch provider {
+        case .codex:
+            return "Use engine default if empty"
+        case .cursor:
+            return "Composer 2.5"
+        case .openrouter:
+            return "deepseek/deepseek-v4-pro"
+        }
     }
 
     private func providerRow() -> NSView {
         aiProviderPopup.removeAllItems()
-        aiProviderPopup.addItems(withTitles: ["Codex", "Cursor (Composer 2.5)"])
-        aiProviderPopup.selectItem(at: configuredAIProvider == .cursor ? 1 : 0)
+        aiProviderPopup.addItems(withTitles: ["Codex", "Cursor (Composer 2.5)", "OpenRouter"])
+        switch configuredAIProvider {
+        case .codex:
+            aiProviderPopup.selectItem(at: 0)
+        case .cursor:
+            aiProviderPopup.selectItem(at: 1)
+        case .openrouter:
+            aiProviderPopup.selectItem(at: 2)
+        }
         aiProviderPopup.target = self
         aiProviderPopup.action = #selector(aiProviderChanged)
+        aiProviderPopup.setContentHuggingPriority(.defaultLow, for: .horizontal)
         aiProviderPopup.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         aiProviderPopup.translatesAutoresizingMaskIntoConstraints = false
-        aiProviderPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 430).isActive = true
+        let minimumProviderWidth = aiProviderPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 260)
+        minimumProviderWidth.priority = .defaultLow
+        minimumProviderWidth.isActive = true
 
         let stack = NSStackView()
         stack.orientation = .horizontal
@@ -3595,7 +7511,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         stack.spacing = 10
 
         let labelView = NSTextField(labelWithString: "Review Engine")
-        labelView.alignment = .right
+        labelView.alignment = .left
         labelView.widthAnchor.constraint(equalToConstant: 140).isActive = true
         stack.addArrangedSubview(labelView)
         stack.addArrangedSubview(aiProviderPopup)
@@ -3603,20 +7519,50 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 
     private func selectedAIProvider() -> AIProvider {
-        aiProviderPopup.indexOfSelectedItem == 1 ? .cursor : .codex
+        configuredAIProvider
+    }
+
+    private func effectiveAIProvider() -> AIProvider {
+        if aiProviderPopup.numberOfItems > 0 {
+            switch aiProviderPopup.indexOfSelectedItem {
+            case 1:
+                return .cursor
+            case 2:
+                return .openrouter
+            default:
+                return .codex
+            }
+        }
+        return configuredAIProvider
     }
 
     @objc private func aiProviderChanged() {
         commitFieldEditing()
-        configuredAIProvider = selectedAIProvider()
-        replaceContent(with: buildSettingsView())
+        let previousProvider = configuredAIProvider
+        let nextProvider = effectiveAIProvider()
+        instructionSetDraft = instructionSetFromFields(for: previousProvider)
+        configuredAIProvider = nextProvider
+        switch activeSection {
+        case .instructionSet:
+            replaceContent(with: buildInstructionSetView())
+        default:
+            replaceContent(with: buildSettingsView())
+        }
     }
 
     private func sectionHeader(_ title: String) -> NSTextField {
         let field = NSTextField(labelWithString: title)
         field.font = .systemFont(ofSize: 13, weight: .semibold)
         field.textColor = .secondaryLabelColor
+        field.alignment = .left
         return field
+    }
+
+    private func separatorView() -> NSBox {
+        let separator = NSBox()
+        separator.boxType = .separator
+        separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        return separator
     }
 
     @objc private func toggleAdvancedSettings() {
@@ -3746,29 +7692,122 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         return reviewItems[selectedReviewIndex]
     }
 
-    private func refreshReviewHistory() {
+    private func queueableFailedAndPendingItems() -> [ReviewHistoryItem] {
+        var seen = Set<String>()
+        return reviewItems.filter { item in
+            guard item.status == .failed || item.status == .pending,
+                  !runningCommits.contains(item.ledgerKey),
+                  !runningCommits.contains(item.sha),
+                  !activeManualCommits.contains(item.ledgerKey),
+                  !activeManualCommits.contains(item.sha),
+                  !queuedManualCommits.contains(where: { $0.ledgerKey == item.ledgerKey || $0.sha == item.sha }),
+                  !seen.contains(item.sha) else {
+                return false
+            }
+            seen.insert(item.sha)
+            return true
+        }
+    }
+
+    private func applyReviewFilters(_ items: [ReviewHistoryItem]) -> [ReviewHistoryItem] {
+        items.filter { item in
+            if hideCompletedReviewsCheckbox.state == .on && item.status == .completed {
+                return false
+            }
+            if hideSkippedReviewsCheckbox.state == .on && item.status == .skipped {
+                return false
+            }
+            return true
+        }
+    }
+
+    @objc private func reviewFilterChanged() {
+        refreshReviewHistory()
+    }
+
+    private func displayReviewHistory(_ loadedItems: [ReviewHistoryItem], config: AppConfig) {
+        let selectedLedgerKey = selectedReviewItem()?.ledgerKey
+        reviewItems = applyReviewFilters(loadedItems)
+        reviewTableView.reloadData()
+        resetReviewTableHorizontalScroll()
+        if let selectedLedgerKey,
+           let refreshedIndex = reviewItems.firstIndex(where: { $0.ledgerKey == selectedLedgerKey }) {
+            selectedReviewIndex = refreshedIndex
+            reviewTableView.selectRowIndexes(IndexSet(integer: refreshedIndex), byExtendingSelection: false)
+        } else {
+            selectedReviewIndex = nil
+            reviewTableView.deselectAll(nil)
+        }
+        updateSummary(config: config)
+        updateSelectedReviewDetail()
+    }
+
+    private func refreshReviewHistory(forceReload: Bool = false) {
+        guard reviewsViewerIsVisible else {
+            return
+        }
+
         do {
             let config = try configFromFields()
             pruneStaleRunningCommits(config: config)
-            reviewItems = try loadReviewHistory(
+            let runningSnapshot = runningCommits
+            let queuedSnapshot = Set(queuedManualCommits.map(\.ledgerKey))
+            let signature = try reviewHistoryCacheSignature(
                 config: config,
-                runningCommits: runningCommits,
-                queuedCommits: Set(queuedManualCommits)
+                runningCommits: runningSnapshot,
+                queuedCommits: queuedSnapshot
             )
-            reviewTableView.reloadData()
-            if reviewItems.indices.contains(selectedReviewIndex ?? -1) {
-                reviewTableView.selectRowIndexes(IndexSet(integer: selectedReviewIndex ?? 0), byExtendingSelection: false)
-            } else if !reviewItems.isEmpty {
-                selectedReviewIndex = 0
-                reviewTableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-            } else {
-                selectedReviewIndex = nil
+
+            if !forceReload,
+               cachedReviewHistorySignature == signature {
+                displayReviewHistory(cachedReviewHistoryItems, config: config)
+                return
             }
-            updateSummary(config: config)
-            updateSelectedReviewDetail()
+
+            if !forceReload, loadingReviewHistorySignature == signature {
+                return
+            }
+
+            if !cachedReviewHistoryItems.isEmpty {
+                displayReviewHistory(cachedReviewHistoryItems, config: config)
+            } else {
+                summaryField.stringValue = "Loading review history..."
+                reviewDetailTextView.string = "Review history is loading."
+            }
+
+            reviewHistoryRefreshGeneration += 1
+            let generation = reviewHistoryRefreshGeneration
+            loadingReviewHistorySignature = signature
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let result = Result {
+                    try loadReviewHistory(
+                        config: config,
+                        runningCommits: runningSnapshot,
+                        queuedCommits: queuedSnapshot
+                    )
+                }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.reviewHistoryRefreshGeneration == generation else {
+                        return
+                    }
+                    self.loadingReviewHistorySignature = nil
+                    switch result {
+                    case .success(let loadedItems):
+                        self.cachedReviewHistoryItems = loadedItems
+                        self.cachedReviewHistorySignature = signature
+                        if self.reviewsViewerIsVisible {
+                            self.displayReviewHistory(loadedItems, config: config)
+                        }
+                    case .failure(let error):
+                        if self.reviewsViewerIsVisible {
+                            self.reviewDetailTextView.string = "\(error)"
+                            self.summaryField.stringValue = "Unable to load review history"
+                            self.statusField.stringValue = "\(error)"
+                        }
+                    }
+                }
+            }
         } catch {
-            reviewItems = []
-            reviewTableView.reloadData()
             reviewDetailTextView.string = "\(error)"
             summaryField.stringValue = "Unable to load review history"
             statusField.stringValue = "\(error)"
@@ -3776,12 +7815,13 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 
     private func pruneStaleRunningCommits(config: AppConfig) {
-        guard let state = try? loadState(config: config) else {
-            return
-        }
+        runningCommits = runningCommits.filter { commitOrLedgerKey in
+            if activeManualCommits.contains(commitOrLedgerKey) {
+                return true
+            }
 
-        runningCommits = runningCommits.filter { commit in
-            activeManualCommits.contains(commit) || !hasReviewLedgerEntry(state, commit: commit)
+            let commit = commitFromLedgerKey(commitOrLedgerKey)
+            return activeReviewLockDetails(for: [commit])[commit] != nil
         }
     }
 
@@ -3792,10 +7832,12 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let queued = reviewItems.filter { $0.status == .queued || $0.status == .running }.count
         let pending = reviewItems.filter { $0.status == .pending }.count
         let repoName = URL(fileURLWithPath: expandedPath(config.repoPath)).lastPathComponent
-        summaryField.stringValue = "\(repoName) - \(completed) completed, \(failed) failed, \(skipped) skipped, \(queued) active, \(pending) pending in last \(config.reviewSweepDepth) commits"
+        summaryField.stringValue = "\(repoName) - \(completed) completed, \(failed) failed, \(skipped) skipped, \(queued) active, \(pending) pending in the \(config.reviewSweepDepth) most recent commits across all worktrees"
     }
 
     private func updateSelectedReviewDetail() {
+        queueFailedPendingButton?.isEnabled = !queueableFailedAndPendingItems().isEmpty
+
         guard let item = selectedReviewItem() else {
             reviewDetailTextView.string = "Select a commit to see review status and output."
             rerunReviewButton?.isEnabled = false
@@ -3810,6 +7852,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
         var header = """
         Commit: \(item.shortSha)
+        Worktree: \(item.worktreeID)
         Status: \(item.status.rawValue)
         Date: \(item.date)
         Subject: \(item.subject)
@@ -3827,47 +7870,114 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         reviewDetailTextView.string = header
     }
 
-    @objc private func rerunSelectedReview() {
-        guard let item = selectedReviewItem() else {
+    @objc private func queueFailedAndPendingReviews() {
+        let items = queueableFailedAndPendingItems()
+        guard !items.isEmpty else {
+            statusField.stringValue = "No failed or pending reviews to queue."
+            queueFailedPendingButton?.isEnabled = false
             return
         }
 
         do {
-            let config = try configFromFields()
-            if runningCommits.contains(item.sha) || queuedManualCommits.contains(item.sha) {
-                statusField.stringValue = "\(item.shortSha) is already queued or running."
-                return
-            }
-
-            queuedManualCommits.append(item.sha)
+            let config = try activeReviewConfig()
+            queuedManualCommits.append(contentsOf: items.map {
+                ManualReviewRequest(
+                    sha: $0.sha,
+                    shortSha: $0.shortSha,
+                    worktreePath: $0.worktreePath,
+                    ledgerKey: $0.ledgerKey
+                )
+            })
             updateStatusItemIcon()
             refreshReviewHistory()
-            statusField.stringValue = "Queued \(item.shortSha)"
+            statusField.stringValue = "Queued \(items.count) failed/pending review\(items.count == 1 ? "" : "s")."
             drainManualReviewQueue(config: config)
         } catch {
             statusField.stringValue = "\(error)"
         }
     }
 
-    private func drainManualReviewQueue(config: AppConfig) {
-        let limit = config.commitReviewConcurrency
-        while runningCommits.union(activeManualCommits).count < limit, !queuedManualCommits.isEmpty {
-            let commit = queuedManualCommits.removeFirst()
-            activeManualCommits.insert(commit)
-            runningCommits.insert(commit)
-            updateStatusItemIcon()
-            refreshReviewHistory()
-            runManualReview(config: config, commit: commit)
+    @objc private func rerunSelectedReview() {
+        guard let item = selectedReviewItem() else {
+            return
+        }
+
+        do {
+            let config = try activeReviewConfig()
+            try enqueueReview(item, config: config)
+        } catch {
+            statusField.stringValue = "\(error)"
         }
     }
 
-    private func runManualReview(config: AppConfig, commit: String) {
-        DispatchQueue.global(qos: .userInitiated).async {
+    private func queueReview(commit: String) {
+        do {
+            let config = try activeReviewConfig()
+            let items = try loadReviewHistory(
+                config: config,
+                runningCommits: runningCommits,
+                queuedCommits: Set(queuedManualCommits.map(\.ledgerKey))
+            )
+            let normalized = commit.lowercased()
+            let matches = items.filter {
+                $0.sha.lowercased() == normalized || $0.sha.lowercased().hasPrefix(normalized)
+            }
+            guard matches.count == 1, let item = matches.first else {
+                throw AIReviewerError.invalidConfig(
+                    matches.isEmpty ? "No reviewable commit matches '\(commit)'" : "Commit prefix '\(commit)' is ambiguous"
+                )
+            }
+            try enqueueReview(item, config: config)
+        } catch {
+            statusField.stringValue = "\(error)"
+        }
+    }
+
+    private func enqueueReview(_ item: ReviewHistoryItem, config: AppConfig) throws {
+        if runningCommits.contains(item.ledgerKey) ||
+            runningCommits.contains(item.sha) ||
+            activeManualCommits.contains(item.ledgerKey) ||
+            activeManualCommits.contains(item.sha) ||
+            queuedManualCommits.contains(where: { $0.ledgerKey == item.ledgerKey || $0.sha == item.sha }) {
+            throw AIReviewerError.invalidConfig("\(item.shortSha) is already queued or running")
+        }
+
+        queuedManualCommits.append(ManualReviewRequest(
+            sha: item.sha,
+            shortSha: item.shortSha,
+            worktreePath: item.worktreePath,
+            ledgerKey: item.ledgerKey
+        ))
+        updateStatusItemIcon()
+        if activeSection == .reviews {
+            refreshReviewHistory()
+        }
+        statusField.stringValue = "Queued \(item.shortSha)"
+        drainManualReviewQueue(config: config)
+    }
+
+    private func drainManualReviewQueue(config: AppConfig) {
+        let limit = config.commitReviewConcurrency
+        while runningCommits.union(activeManualCommits).count < limit, !queuedManualCommits.isEmpty {
+            let request = queuedManualCommits.removeFirst()
+            activeManualCommits.insert(request.ledgerKey)
+            runningCommits.insert(request.ledgerKey)
+            updateStatusItemIcon()
+            refreshReviewHistory()
+            runManualReview(config: configForWorktree(config, path: request.worktreePath), request: request)
+        }
+    }
+
+    private func runManualReview(config: AppConfig, request: ManualReviewRequest) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else {
+                return
+            }
             let result: String
             let succeeded: Bool
-            let short = String(commit.prefix(8))
+            let short = request.shortSha
             do {
-                if let reportURL = try rerunReviewCommit(config: config, commit: commit) {
+                if let reportURL = try rerunReviewCommit(config: config, commit: request.sha) {
                     result = "Review copied to \(reportURL.path)"
                 } else {
                     result = "Review did not produce a report for \(short)"
@@ -3882,12 +7992,12 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 guard let self else {
                     return
                 }
-                self.activeManualCommits.remove(commit)
-                self.runningCommits.remove(commit)
+                self.activeManualCommits.remove(request.ledgerKey)
+                self.runningCommits.remove(request.ledgerKey)
                 self.hasStatusIssue = !succeeded
                 self.statusField.stringValue = result
                 self.refreshReviewHistory()
-                if let nextConfig = try? self.configFromFields() {
+                if let nextConfig = try? self.activeReviewConfig() {
                     self.drainManualReviewQueue(config: nextConfig)
                 }
                 self.updateStatusItemIcon()
@@ -3915,19 +8025,25 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         NSWorkspace.shared.open(URL(fileURLWithPath: path))
     }
 
-    @objc private func refreshLogsAction() {
-        refreshLogs(scrollToBottom: true)
-    }
-
     private func refreshLogs(scrollToBottom: Bool, preservePosition: Bool = false) {
         let scrollView = logsTextView.enclosingScrollView
         let clipView = scrollView?.contentView
         let previousOrigin = clipView?.bounds.origin ?? .zero
         let visibleMaxY = (clipView?.bounds.maxY ?? 0)
-        let documentHeight = logsTextView.bounds.height
+        let documentHeight: CGFloat
+        if let layoutManager = logsTextView.layoutManager,
+           let textContainer = logsTextView.textContainer {
+            layoutManager.ensureLayout(for: textContainer)
+            documentHeight = layoutManager.usedRect(for: textContainer).height + (logsTextView.textContainerInset.height * 2)
+        } else {
+            documentHeight = logsTextView.bounds.height
+        }
         let wasNearBottom = documentHeight - visibleMaxY < 24
 
-        logsTextView.string = readLogText()
+        let newText = readLogText()
+        if logsTextView.string != newText {
+            logsTextView.string = newText
+        }
         if let textContainer = logsTextView.textContainer {
             logsTextView.layoutManager?.ensureLayout(for: textContainer)
         }
@@ -3938,7 +8054,22 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 scrollView?.reflectScrolledClipView(clipView)
             }
         } else if scrollToBottom || wasNearBottom {
-            logsTextView.scrollToEndOfDocument(nil)
+            scrollLogsToBottom()
+        }
+    }
+
+    private func scrollLogsToBottom() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else {
+                return
+            }
+            if let textContainer = self.logsTextView.textContainer {
+                self.logsTextView.layoutManager?.ensureLayout(for: textContainer)
+            }
+            self.logsTextView.scrollToEndOfDocument(nil)
+            if let scrollView = self.logsTextView.enclosingScrollView {
+                scrollView.reflectScrolledClipView(scrollView.contentView)
+            }
         }
     }
 
@@ -3948,6 +8079,9 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         }
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        if activeSection == .reviews {
+            refreshReviewHistory()
+        }
     }
 
     private func row(label: String, field: NSTextField, buttonTitle: String? = nil, action: Selector? = nil) -> NSView {
@@ -3957,12 +8091,16 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         stack.spacing = 10
 
         let labelView = NSTextField(labelWithString: label)
-        labelView.alignment = .right
+        labelView.alignment = .left
         labelView.widthAnchor.constraint(equalToConstant: 140).isActive = true
 
         field.lineBreakMode = .byTruncatingMiddle
         field.translatesAutoresizingMaskIntoConstraints = false
-        field.widthAnchor.constraint(greaterThanOrEqualToConstant: 430).isActive = true
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let minimumFieldWidth = field.widthAnchor.constraint(greaterThanOrEqualToConstant: 260)
+        minimumFieldWidth.priority = .defaultLow
+        minimumFieldWidth.isActive = true
 
         stack.addArrangedSubview(labelView)
         stack.addArrangedSubview(field)
@@ -3974,10 +8112,134 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         return stack
     }
 
+    private func multilineRow(
+        label: String,
+        textView: NSTextView,
+        minHeight: CGFloat,
+        maxHeight: CGFloat
+    ) -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .horizontal
+        stack.alignment = .top
+        stack.distribution = .fill
+        stack.spacing = 10
+
+        let labelView = NSTextField(labelWithString: label)
+        labelView.alignment = .left
+        labelView.widthAnchor.constraint(equalToConstant: 140).isActive = true
+
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.allowsUndo = true
+        textView.importsGraphics = false
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.delegate = self
+        textView.autoresizingMask = [.width]
+        textView.translatesAutoresizingMaskIntoConstraints = true
+        textView.font = .systemFont(ofSize: 12)
+        textView.isRichText = false
+        textView.smartInsertDeleteEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.isAutomaticTextCompletionEnabled = false
+        textView.textColor = .textColor
+        textView.drawsBackground = true
+        textView.backgroundColor = .textBackgroundColor
+        if let container = textView.textContainer {
+            container.widthTracksTextView = true
+            container.heightTracksTextView = false
+            container.containerSize = NSSize(width: 1, height: CGFloat.greatestFiniteMagnitude)
+        }
+        textView.textContainerInset = NSSize(width: 6, height: 6)
+        textView.insertionPointColor = .textColor
+
+        let scroll = NSScrollView()
+        textView.frame = NSRect(x: 0, y: 0, width: 480, height: minHeight)
+        scroll.documentView = textView
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.borderType = .bezelBorder
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        scroll.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let initialEditorWidth: CGFloat = 750
+        let heightConstraint = scroll.heightAnchor.constraint(equalToConstant: promptEditorHeight(
+            text: textView.string,
+            editorWidth: initialEditorWidth,
+            minimumHeight: minHeight,
+            maximumHeight: maxHeight
+        ))
+        heightConstraint.isActive = true
+        promptEditorLayouts[ObjectIdentifier(textView)] = PromptEditorLayout(
+            textView: textView,
+            heightConstraint: heightConstraint,
+            minimumHeight: minHeight,
+            maximumHeight: maxHeight
+        )
+
+        stack.addArrangedSubview(labelView)
+        stack.addArrangedSubview(scroll)
+        scroll.widthAnchor.constraint(equalTo: stack.widthAnchor, multiplier: 0.72).isActive = true
+        let trailingSpacer = NSView()
+        trailingSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        trailingSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        stack.addArrangedSubview(trailingSpacer)
+        DispatchQueue.main.async { [weak self, weak textView] in
+            guard let self, let textView else {
+                return
+            }
+            self.updatePromptEditorHeight(textView)
+        }
+        return stack
+    }
+
+    private func promptEditorHeight(
+        text: String,
+        editorWidth: CGFloat,
+        minimumHeight: CGFloat,
+        maximumHeight: CGFloat
+    ) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: 12)
+        let drawingWidth = max(200, editorWidth - 16)
+        let bounds = (text as NSString).boundingRect(
+            with: NSSize(width: drawingWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font]
+        )
+        return min(maximumHeight, max(minimumHeight, ceil(bounds.height) + 20))
+    }
+
+    func textDidChange(_ notification: Notification) {
+        guard let textView = notification.object as? NSTextView else {
+            return
+        }
+        updatePromptEditorHeight(textView)
+    }
+
+    private func updatePromptEditorHeight(_ textView: NSTextView) {
+        guard let layout = promptEditorLayouts[ObjectIdentifier(textView)] else {
+            return
+        }
+        let editorWidth = textView.enclosingScrollView?.contentSize.width ?? textView.bounds.width
+        layout.heightConstraint.constant = promptEditorHeight(
+            text: textView.string,
+            editorWidth: editorWidth,
+            minimumHeight: layout.minimumHeight,
+            maximumHeight: layout.maximumHeight
+        )
+    }
+
+    private func updateAllPromptEditorHeights() {
+        promptEditorLayouts.values.forEach { updatePromptEditorHeight($0.textView) }
+    }
+
     private func checkboxRow(_ checkbox: NSButton) -> NSView {
         let stack = NSStackView()
         stack.orientation = .horizontal
         stack.alignment = .centerY
+        stack.distribution = .fill
         stack.spacing = 10
 
         let spacer = NSView()
@@ -3985,6 +8247,9 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
         stack.addArrangedSubview(spacer)
         stack.addArrangedSubview(checkbox)
+        let trailingSpacer = NSView()
+        trailingSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        stack.addArrangedSubview(trailingSpacer)
         return stack
     }
 
@@ -4034,17 +8299,211 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         NSApp.setActivationPolicy(config.shouldHideDockIcon && !windowVisible ? .accessory : .regular)
     }
 
+    private func syncInstructionSetDraft(from config: AppConfig) {
+        if let rawInstructionSet = config.instructionSet {
+            let profileContext = {
+                var profileConfig = config
+                profileConfig.instructionSet = nil
+                return profileConfig
+            }()
+
+            if let profile = try? loadReviewProfile(path: profileContext.reviewProfilePath, config: profileContext) {
+                let template = instructionSetTemplate(from: profile, for: config.resolvedAIProvider)
+                let migrated = migrateInstructionSet(rawInstructionSet, for: config.resolvedAIProvider)
+                instructionSetDraft = mergedInstructionSet(base: template, overrides: migrated)
+                return
+            }
+        }
+
+        guard let profile = try? loadReviewProfile(path: config.reviewProfilePath, config: config) else {
+            instructionSetDraft = InstructionSet(
+                defaultModel: nil,
+                globalInstructions: nil,
+                agents: nil,
+                engineModels: nil
+            )
+            return
+        }
+
+        instructionSetDraft = instructionSetTemplate(from: profile, for: config.resolvedAIProvider)
+    }
+
+    private func instructionSetHasStoredValues(_ instructionSet: InstructionSet) -> Bool {
+        if let value = instructionSet.defaultModel, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return true
+        }
+        if let value = instructionSet.globalInstructions, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return true
+        }
+        if let agents = instructionSet.agents, !agents.isEmpty {
+            return true
+        }
+        if let engineModels = instructionSet.engineModels, !engineModels.isEmpty {
+            return true
+        }
+        return false
+    }
+
+    private func instructionSetsEqual(_ lhs: InstructionSet, _ rhs: InstructionSet) -> Bool {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return (try? encoder.encode(lhs)) == (try? encoder.encode(rhs))
+    }
+
+    private func bootstrapInstructionSetIfNeeded(for config: AppConfig) -> AppConfig {
+        guard FileManager.default.fileExists(atPath: configURL.path) else {
+            return config
+        }
+
+        let profileContext = {
+            var draftConfig = config
+            draftConfig.instructionSet = nil
+            return draftConfig
+        }()
+
+        guard let profile = try? loadReviewProfile(path: profileContext.reviewProfilePath, config: profileContext) else {
+            return config
+        }
+
+        let provider = config.resolvedAIProvider
+        let bootstrapped = instructionSetTemplate(from: profile, for: provider)
+        var next = config
+
+        if let rawInstructionSet = config.instructionSet {
+            let migrated = migrateInstructionSet(rawInstructionSet, for: provider)
+            let merged = mergedInstructionSet(base: bootstrapped, overrides: migrated)
+            instructionSetDraft = merged
+            if !instructionSetsEqual(merged, rawInstructionSet) {
+                next.instructionSet = merged
+                do {
+                    try saveConfig(next, to: configURL)
+                    statusField.stringValue = "Updated instruction set from review profile."
+                } catch {
+                    statusField.stringValue = "Unable to update instruction defaults: \(error)"
+                }
+            }
+            return next
+        }
+
+        guard instructionSetHasStoredValues(bootstrapped) else {
+            return config
+        }
+
+        next.instructionSet = bootstrapped
+        instructionSetDraft = bootstrapped
+
+        do {
+            try saveConfig(next, to: configURL)
+            statusField.stringValue = "Initialized instruction set defaults from review profile."
+        } catch {
+            statusField.stringValue = "Unable to initialize instruction defaults: \(error)"
+        }
+
+        return next
+    }
+
+    private func instructionSetFromFields(for provider: AIProvider) -> InstructionSet {
+        let globalInstructions = instructionSetGlobalInstructionsField.string
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedDefaultModel = instructionSetDefaultModelField.stringValue
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var next = instructionSetDraft
+        next.globalInstructions = globalInstructions.isEmpty ? nil : globalInstructions
+
+        var providerSelections = next.engineModels ?? [:]
+        var providerSelection = providerSelections[provider.rawValue] ?? InstructionSetEngineModelSelection(
+            defaultModel: nil,
+            agents: nil,
+            defaultReasoningEffort: nil,
+            agentReasoningEfforts: nil
+        )
+        providerSelection.defaultModel = normalizedDefaultModel.isEmpty ? nil : normalizedDefaultModel
+        providerSelection.defaultReasoningEffort = provider == .codex
+            ? resolvedCodexReasoningEffort(
+                config: buildInstructionSetContextConfig(),
+                model: normalizedDefaultModel,
+                requested: instructionSetDefaultEffortField.stringValue
+            )
+            : nil
+
+        var providerAgentModels = providerSelection.agents ?? [:]
+        var providerAgentEfforts = providerSelection.agentReasoningEfforts ?? [:]
+        for (agentID, modelField) in instructionSetAgentModelFields {
+            guard let promptField = instructionSetAgentInstructionFields[agentID] else {
+                continue
+            }
+
+            let normalizedModel = modelField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalizedPrompt = promptField.string.trimmingCharacters(in: .whitespacesAndNewlines)
+            var agentConfig = next.agents?[agentID] ?? InstructionSetAgentConfig(model: nil, instructions: nil, providerModels: nil)
+
+            let hasLegacyModel = agentConfig.model?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            agentConfig.instructions = normalizedPrompt.isEmpty ? nil : normalizedPrompt
+            var agentProviderModels = agentConfig.providerModels ?? [:]
+            if normalizedModel.isEmpty {
+                agentProviderModels.removeValue(forKey: provider.rawValue)
+            } else {
+                agentProviderModels[provider.rawValue] = normalizedModel
+            }
+
+            agentConfig.providerModels = agentProviderModels.isEmpty ? nil : agentProviderModels
+            next.agents = next.agents ?? [:]
+
+            if normalizedPrompt.isEmpty && !hasLegacyModel && agentConfig.providerModels == nil {
+                next.agents?.removeValue(forKey: agentID)
+            } else {
+                next.agents?[agentID] = agentConfig
+            }
+
+            if normalizedModel.isEmpty {
+                providerAgentModels.removeValue(forKey: agentID)
+            } else {
+                providerAgentModels[agentID] = normalizedModel
+            }
+
+            if provider == .codex,
+               !normalizedModel.isEmpty,
+               let effortField = instructionSetAgentEffortFields[agentID],
+               let effort = resolvedCodexReasoningEffort(
+                   config: buildInstructionSetContextConfig(),
+                   model: normalizedModel,
+                   requested: effortField.stringValue
+               ) {
+                providerAgentEfforts[agentID] = effort
+            } else {
+                providerAgentEfforts.removeValue(forKey: agentID)
+            }
+        }
+
+        providerSelection.agents = providerAgentModels.isEmpty ? nil : providerAgentModels
+        providerSelection.agentReasoningEfforts = providerAgentEfforts.isEmpty ? nil : providerAgentEfforts
+        if providerSelection.defaultModel == nil && providerSelection.agents == nil &&
+            providerSelection.defaultReasoningEffort == nil && providerSelection.agentReasoningEfforts == nil {
+            providerSelections.removeValue(forKey: provider.rawValue)
+        } else {
+            providerSelections[provider.rawValue] = providerSelection
+        }
+
+        next.engineModels = providerSelections.isEmpty ? nil : providerSelections
+        instructionSetDraft = next
+        return next
+    }
+
     @discardableResult
     private func loadConfigIntoFields() -> AppConfig {
-        let config: AppConfig
+        let loadedConfig: AppConfig
         if FileManager.default.fileExists(atPath: configURL.path),
            let loaded = try? loadConfig(path: configURL.path) {
-            config = loaded
+            loadedConfig = loaded
             statusField.stringValue = "Loaded \(configURL.path)"
         } else {
-            config = defaultConfig()
+            loadedConfig = defaultConfig()
             statusField.stringValue = "New config"
         }
+
+        syncInstructionSetDraft(from: loadedConfig)
+        let config = bootstrapInstructionSetIfNeeded(for: loadedConfig)
 
         repoField.stringValue = config.repoPath
         reportsField.stringValue = config.reportsPath
@@ -4054,6 +8513,9 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         configuredAIProvider = config.resolvedAIProvider
         cursorHomeField.stringValue = config.resolvedCursorHome
         cursorModelField.stringValue = config.resolvedCursorModel
+        cursorAPIKeyField.stringValue = config.cursorAPIKey ?? ""
+        openRouterModelField.stringValue = config.resolvedOpenRouterModel
+        openRouterAPIKeyField.stringValue = config.openRouterAPIKey ?? ""
         reviewProfileField.stringValue = config.reviewProfilePath ?? ""
         statePathField.stringValue = config.statePath ?? ""
         pollIntervalField.stringValue = "\(config.pollIntervalSeconds)"
@@ -4062,6 +8524,10 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         codexTimeoutField.stringValue = "\(config.codexRunTimeoutSeconds)"
         maxCodexRunCacheEntriesField.stringValue = "\(config.codexRunCacheEntryLimit)"
         maxBundleCacheEntriesField.stringValue = "\(config.bundleCacheEntryLimit)"
+        instructionSetDefaultModelField.stringValue = instructionSetDraft
+            .providerDefaultModel(for: config.resolvedAIProvider)
+            ?? instructionSetDraft.defaultModel ?? ""
+        instructionSetGlobalInstructionsField.string = instructionSetDraft.globalInstructions ?? ""
         maxParallelCommitReviewsField.stringValue = "\(config.commitReviewConcurrency)"
         maxParallelField.stringValue = "\(config.maxParallelReviews)"
         let profileMaxDiffBytes = (try? loadReviewProfile(config: config).maxDiffBytes) ?? config.reviewDiffByteLimit ?? 200_000
@@ -4069,9 +8535,18 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         maxSnapshotField.stringValue = "\(config.snapshotByteLimit)"
         maxPromptSnapshotField.stringValue = "\(config.promptSnapshotByteLimit)"
         startWatcherOnLaunchCheckbox.state = config.shouldStartWatcherOnLaunch ? .on : .off
+        watchAllWorktreesCheckbox.state = config.shouldWatchAllWorktrees ? .on : .off
         hideDockIconCheckbox.state = config.shouldHideDockIcon ? .on : .off
         reviewStartupCheckbox.state = config.shouldReviewCurrentHeadOnStartup ? .on : .off
         return config
+    }
+
+    private func activeReviewConfig() throws -> AppConfig {
+        if FileManager.default.fileExists(atPath: configURL.path) {
+            return try loadConfig(path: configURL.path)
+        }
+        configuredAIProvider = effectiveAIProvider()
+        return try configFromFields()
     }
 
     private func commitFieldEditing() {
@@ -4096,6 +8571,11 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             throw AIReviewerError.invalidConfig("numeric settings must be valid integers")
         }
 
+        let provider = configuredAIProvider
+        let instructionSet = activeSection == .instructionSet
+            ? instructionSetFromFields(for: provider)
+            : instructionSetDraft
+
         return AppConfig(
             repoPath: repoField.stringValue,
             reportsPath: reportsField.stringValue,
@@ -4106,14 +8586,19 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             reviewCachePath: cacheField.stringValue,
             maxSnapshotBytes: max(1, maxSnapshot),
             codexModel: codexModelField.stringValue.isEmpty ? nil : codexModelField.stringValue,
-            aiProvider: selectedAIProvider().rawValue,
+            aiProvider: provider.rawValue,
             cursorHome: cursorHomeField.stringValue.isEmpty ? nil : cursorHomeField.stringValue,
             cursorModel: cursorModelField.stringValue.isEmpty ? nil : cursorModelField.stringValue,
+            cursorAPIKey: cursorAPIKeyField.stringValue.isEmpty ? nil : cursorAPIKeyField.stringValue,
+            openRouterModel: openRouterModelField.stringValue.isEmpty ? nil : openRouterModelField.stringValue,
+            openRouterAPIKey: openRouterAPIKeyField.stringValue.isEmpty ? nil : openRouterAPIKeyField.stringValue,
             reviewProfilePath: reviewProfileField.stringValue.isEmpty ? nil : reviewProfileField.stringValue,
+            instructionSet: instructionSet,
             maxDiffBytes: max(1, maxDiffBytes),
             statePath: statePathField.stringValue.isEmpty ? nil : statePathField.stringValue,
             reviewCurrentHeadOnStartup: reviewStartupCheckbox.state == .on,
             startWatcherOnLaunch: startWatcherOnLaunchCheckbox.state == .on,
+            watchAllWorktrees: watchAllWorktreesCheckbox.state == .on,
             hideDockIcon: hideDockIconCheckbox.state == .on,
             sweepDepth: max(1, sweepDepth),
             retryFailedAfterSeconds: max(0, retryFailedAfter),
@@ -4125,12 +8610,14 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 
     @discardableResult
-    private func persistSettingsFromFields(showStatus: Bool) -> AppConfig? {
+    private func persistSettingsFromFields(showStatus: Bool, syncLoginItem: Bool = true) -> AppConfig? {
         do {
             let config = try configFromFields()
             try saveConfig(config, to: configURL)
             applyActivationPolicy(config: config, windowVisible: window?.isVisible == true && window?.isMiniaturized == false)
-            let loginItemStatus = try syncLoginItemSetting()
+            let loginItemStatus = syncLoginItem
+                ? try syncLoginItemSetting()
+                : loginItemStatusText(SMAppService.mainApp.status)
             drainManualReviewQueue(config: config)
             if showStatus {
                 statusField.stringValue = "Saved \(configURL.path)\nLogin item: \(loginItemStatus)"
@@ -4232,18 +8719,21 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 return "Review copied to \(reportURL.path)"
             }
 
-            return "HEAD already reviewed"
+            return "No pending commits"
         }
     }
 
     @objc private func startWatching() {
-        beginWatching(showSettingsWindowOnFailure: false)
+        beginWatching(showSettingsWindowOnFailure: false, saveSettings: true)
     }
 
-    private func beginWatching(showSettingsWindowOnFailure: Bool) {
+    private func beginWatching(showSettingsWindowOnFailure: Bool, saveSettings: Bool) {
         do {
-            let config = try configFromFields()
-            try saveConfig(config, to: configURL)
+            if saveSettings {
+                let config = try configFromFields()
+                try saveConfig(config, to: configURL)
+            }
+            let config = try activeReviewConfig()
             applyActivationPolicy(config: config, windowVisible: window?.isVisible == true && window?.isMiniaturized == false)
             guard try watcherLock.tryLock() else {
                 watcherRunning = false
@@ -4258,7 +8748,7 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             watcherRunning = true
             updateWatcherControls(status: "Watcher: starting...")
             watcherField.stringValue = "Watcher: starting..."
-            appWatcher.start(config: config) { [weak self] update in
+            appWatcher.start(configURL: configURL) { [weak self] update in
                 DispatchQueue.main.async {
                     self?.applyWatcherUpdate(update)
                 }
@@ -4290,6 +8780,15 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let status = update.status.lowercased()
         let errorText = update.lastError?.lowercased() ?? ""
         let alreadyRunningElsewhere = errorText.contains("already running")
+        let statusIsIdle = status.contains("completed") ||
+            status.contains("failed") ||
+            status.contains("no pending") ||
+            status.contains("watching") ||
+            status.contains("poll failed")
+        let statusIsReviewing = status.contains("head changed") ||
+            status.contains("reviewing pending") ||
+            status.contains("retrying failed") ||
+            status.contains("reconciling unreviewed")
 
         if alreadyRunningElsewhere {
             hasStatusIssue = false
@@ -4305,17 +8804,13 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         if let lastHead = update.lastHead {
             if alreadyRunningElsewhere {
                 runningCommits.insert(lastHead)
-            } else if status.contains("completed") ||
-                status.contains("failed") ||
-                status.contains("no pending") ||
-                status.contains("watching") {
-                runningCommits.remove(lastHead)
-            } else if status.contains("head changed") ||
-                        status.contains("reviewing pending") ||
-                        status.contains("retrying failed") ||
-                        status.contains("reconciling unreviewed") {
+            } else if statusIsIdle {
+                clearAutomaticRunningCommits()
+            } else if statusIsReviewing {
                 runningCommits.insert(lastHead)
             }
+        } else if statusIsIdle {
+            clearAutomaticRunningCommits()
         }
 
         var lines = ["Watcher: \(update.status)"]
@@ -4330,18 +8825,22 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         }
         watcherField.stringValue = lines.joined(separator: "\n")
         updateWatcherControls(status: lines[0])
-        if activeSection == .reviews {
+        if reviewsViewerIsVisible {
             refreshReviewHistory()
         } else if activeSection == .logs {
             refreshLogs(scrollToBottom: false, preservePosition: true)
         }
         updateStatusItemIcon()
-        if !queuedManualCommits.isEmpty, let config = try? configFromFields() {
+        if !queuedManualCommits.isEmpty, let config = try? activeReviewConfig() {
             drainManualReviewQueue(config: config)
         }
         if !update.isRunning {
             watcherLock.unlock()
         }
+    }
+
+    private func clearAutomaticRunningCommits() {
+        runningCommits = runningCommits.filter { activeManualCommits.contains($0) }
     }
 
     private func updateWatcherControls(status: String) {
@@ -4360,7 +8859,10 @@ final class SettingsAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             try saveConfig(config, to: configURL)
 
             statusField.stringValue = "\(label)..."
-            DispatchQueue.global(qos: .userInitiated).async {
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self else {
+                    return
+                }
                 let result: String
                 do {
                     result = try operation(config)
@@ -4422,6 +8924,8 @@ func runSettingsApp() {
 
 if CommandLine.arguments.count == 1 {
     runSettingsApp()
+} else if CommandLine.arguments.count == 2 && ["--help", "-h", "help"].contains(CommandLine.arguments[1]) {
+    print(usage())
 } else {
     do {
         let parsed = try parseCommand(CommandLine.arguments)
@@ -4430,6 +8934,31 @@ if CommandLine.arguments.count == 1 {
         switch parsed.command {
         case .validate:
             try validate(config: config)
+        case .status:
+            guard parsed.arguments.isEmpty || parsed.arguments == ["--json"] else {
+                throw AIReviewerError.missingArgument(usage())
+            }
+            if parsed.arguments == ["--json"] {
+                print(try jsonText(statusJSONObject(config: config)))
+            } else {
+                print(try statusSummary(config: config))
+            }
+        case .logs:
+            print(readLogText())
+        case .app:
+            try runAppCLI(arguments: parsed.arguments)
+        case .watcher:
+            try runWatcherCLI(arguments: parsed.arguments)
+        case .reviews:
+            try runReviewsCLI(config: config, arguments: parsed.arguments)
+        case .config:
+            try runConfigCLI(configPath: parsed.configPath, arguments: parsed.arguments)
+        case .instructionSet:
+            try runInstructionSetCLI(configPath: parsed.configPath, config: config, arguments: parsed.arguments)
+        case .engine:
+            try runEngineCLI(configPath: parsed.configPath, config: config, arguments: parsed.arguments)
+        case .models:
+            try runModelsCLI(configPath: parsed.configPath, config: config, arguments: parsed.arguments)
         case .watch:
             try watch(config: config)
         case .materializeHead:

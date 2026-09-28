@@ -40,34 +40,147 @@ This is early-stage software. The current app can:
 
 ## Quick Start
 
+### Requirements
+
+- macOS 14 or newer
+- Xcode 16 or newer, or matching Xcode Command Line Tools, providing Swift 6
+- Git
+- one configured review provider:
+  - **Codex:** install and authenticate the Codex CLI
+  - **Cursor:** install and authenticate Cursor Agent (`agent`), or provide a
+    Cursor API key
+  - **OpenRouter:** provide `OPENROUTER_API_KEY` or save the key in app settings
+
+The app has no third-party Swift package dependencies. Build-time tools come
+from Xcode/macOS, and provider CLIs are runtime dependencies only for the
+provider you select.
+
+Check a machine before installation with:
+
 ```bash
-scripts/build.sh
+scripts/preflight.sh --install
+scripts/preflight.sh --provider codex # or cursor/openrouter
+```
+
+### Fresh-machine installation
+
+```bash
+git clone https://github.com/PeterTimCousins/ai-reviewer.git
+cd ai-reviewer
 cp config/local.example.json config/local.json
 ```
 
-Edit `config/local.json`, then run:
+Edit `config/local.json` for the repository you want to watch, then install:
+
+```bash
+scripts/install.sh --config config/local.json
+```
+
+The installer performs a release build, ad-hoc signs and verifies the app,
+installs it to `~/Applications/AI Reviewer.app`, copies the optional config,
+and validates its repository paths, selected provider executable, and provider
+authentication. It does not copy provider credentials into the repo. You can
+instead omit `--config` and complete setup in the app.
+
+For development, build and run checks with:
+
+```bash
+scripts/check.sh
+scripts/smoke.sh
+```
+
+Then use the development bundle directly:
 
 ```bash
 scripts/smoke.sh
 build/AI\ Reviewer.app/Contents/MacOS/ai-reviewer-watcher materialize-head --config config/local.json
 build/AI\ Reviewer.app/Contents/MacOS/ai-reviewer-watcher review-head --config config/local.json
 build/AI\ Reviewer.app/Contents/MacOS/ai-reviewer-watcher review-once --config config/local.json
+build/AI\ Reviewer.app/Contents/MacOS/ai-reviewer-watcher status --config config/local.json
+build/AI\ Reviewer.app/Contents/MacOS/ai-reviewer-watcher logs --config config/local.json
 ```
 
 `config/local.json` is ignored by Git. `config/example.json` is safe for public
 use and contains placeholder paths only.
 
-Review profiles live under `profiles/`. A blank `reviewProfilePath` uses the
-bundled default profile for the selected review engine (`default-review.json` for
-Codex, `default-review-cursor.json` for Cursor/Composer 2.5). To use a specific
-profile, set `reviewProfilePath` to an absolute path or choose a JSON profile in
-the settings window. Private repo-specific profiles can live under ignored
-`profiles/local/`.
+### CLI control plane
 
-Set `aiProvider` to `cursor` (or choose **Cursor (Composer 2.5)** in Settings)
+The same `ai-reviewer-watcher` binary is the primary automation and setup
+surface. Run `ai-reviewer-watcher --help` for the complete command list. Common
+operations include:
+
+```bash
+BIN="$HOME/Applications/AI Reviewer.app/Contents/MacOS/ai-reviewer-watcher"
+CONFIG="$HOME/Library/Application Support/com.ai-reviewer/config.json"
+
+"$BIN" status --config "$CONFIG"
+"$BIN" status --config "$CONFIG" --json
+"$BIN" logs --config "$CONFIG"
+"$BIN" watcher --config "$CONFIG" start
+"$BIN" watcher --config "$CONFIG" stop
+"$BIN" reviews --config "$CONFIG" list failed
+"$BIN" reviews --config "$CONFIG" list all --json --limit 100 --offset 0
+"$BIN" reviews --config "$CONFIG" show <commit-sha>
+"$BIN" reviews --config "$CONFIG" show <commit-sha> --json
+"$BIN" reviews --config "$CONFIG" rerun <commit-sha>
+"$BIN" reviews --config "$CONFIG" queue-pending
+"$BIN" reviews --config "$CONFIG" reconcile
+"$BIN" engine --config "$CONFIG" set codex
+"$BIN" models --config "$CONFIG" set gpt-5.6-terra --effort medium
+"$BIN" models --config "$CONFIG" set gpt-5.6-sol --effort high --agent workflow
+"$BIN" config --config "$CONFIG" set maxParallelReviews 4
+"$BIN" config --config "$CONFIG" restore-backup
+"$BIN" instruction-set --config "$CONFIG" export /tmp/reviewer-instructions.json
+"$BIN" app --config "$CONFIG" tab logs
+```
+
+`config show` and `config get` redact secrets unless `--show-secrets` is passed.
+CLI mutations validate the decoded config and model-specific Codex effort,
+write atomically, retain the previous file as `config.json.cli-backup`, and tell
+the running app to reload so stale GUI fields cannot overwrite terminal changes.
+The `app` command can show, refresh, quit, or switch the running app between the
+Reviews, Logs, Settings, and Instruction Set tabs.
+
+Terminal review queries are ledger-first, so completed, failed, and skipped
+records remain available beyond the configured recent-history sweep. `--json`
+list output is metadata-only and supports `--limit` and `--offset`; this avoids
+opening thousands of historical artifacts. `reviews show --json` includes the
+resolved verdict and findings. Bounded list enrichment is available with
+`--json --details --limit <count>` for counts up to 100.
+
+Review profiles live under `profiles/`. A blank `reviewProfilePath` uses the
+bundled default profile (`default-review.json`) regardless of provider. To use a
+specific profile, set `reviewProfilePath` to an absolute path or choose a JSON
+profile in the settings window. Private repo-specific profiles can live under
+`profiles/local/` (git-ignored) and be selected in the settings file picker.
+
+Engine-specific behavior is now configured in the new **Instruction Set** tab. Use
+that tab to set the review engine, per-engine default model, and per-agent model
+and prompt overrides. Codex model rows also include a model-aware reasoning-effort
+selector. Supported effort values and defaults are loaded from Codex's
+`models_cache.json`, so changing models cannot carry an unsupported effort label
+into the next review. Ultra is deliberately excluded because it delegates to
+native Codex subagents, while AI Reviewer already owns that orchestration layer.
+These overrides are stored in the main app config so you no
+longer need separate `default-review-cursor.json` or cursor-specific profile
+files to switch engines.
+
+Codex review subprocesses explicitly disable native multi-agent delegation because
+AI Reviewer already owns the specialist orchestration. Each specialist therefore
+runs at its selected effort and completes its assigned pass directly, without
+creating another layer of Codex agents.
+
+Set `aiProvider` to `cursor` (or choose **Cursor (Composer 2.5)** in the
+Instruction Set tab)
 to run reviews through the Cursor Agent CLI instead of Codex. The app still
 materializes bundles and keeps the AI away from the live repository; only the
 executor and bundled instruction profile change.
+
+Set `aiProvider` to `openrouter` (or choose **OpenRouter** in the Instruction Set
+tab) to run the same specialist review passes through OpenRouter's chat
+completions API. The default OpenRouter model is `deepseek/deepseek-v4-pro`.
+Provide `openRouterAPIKey` in local app config or launch the app with
+`OPENROUTER_API_KEY` set.
 
 Open the manager window with:
 
@@ -79,6 +192,11 @@ Use **Start** and **Stop** in the manager window to run the watcher inside the
 app process. Closing the window leaves an active watcher running; reopen the
 window from the app menu, status item, or Dock icon
 when the Dock icon is enabled.
+Enable **Watch all local worktrees for this repository** to have the watcher
+poll every checkout returned by `git worktree list` for the configured
+repository. Worktrees are local-only checkout directories; the review ledger is
+still shared by commit SHA, so the same commit is not reviewed twice if it
+appears in more than one worktree.
 
 Enable **Launch AI Reviewer at login** to register the app with macOS Login
 Items. **Start watching when app opens** is enabled by default so the watcher
@@ -162,6 +280,8 @@ Defaults keep no scratch runs and the latest 200 bundles.
 
 Validation accepts normal Git worktrees, including linked `git worktree`
 checkouts, and creates the configured reports directory if it does not exist.
+When `watchAllWorktrees` is enabled, validation reports how many local worktrees
+are currently discovered for the configured repository.
 
 ## Planned Runtime Locations
 
@@ -177,6 +297,10 @@ Install the built app bundle with:
 ```bash
 scripts/install.sh
 ```
+
+Pass `--no-build` only when a verified `build/AI Reviewer.app` already exists.
+Builds default to release mode; set `AI_REVIEWER_BUILD_CONFIGURATION=debug`
+when you specifically need a debug bundle.
 
 ## Permission Policy
 
@@ -240,14 +364,15 @@ covers:
 - watched repository
 - reports path inside that repository
 - Review profile path
-- review engine (Codex or Cursor/Composer 2.5)
+- review engine (Codex, Cursor/Composer 2.5, or OpenRouter)
 - max concurrent commit reviews
 - max agents per review
 - start watching when app opens
 - hide Dock icon
 - launch at login
-- cache path, Codex home, Codex model, Cursor home, Cursor model, state path, polling, history, retry,
-  timeout, cache retention, max diff bytes, and snapshot limits in Advanced
+- cache path, Codex home, Codex model, Cursor home, Cursor model, OpenRouter
+  model/API key, state path, polling, history, retry, timeout, cache retention,
+  max diff bytes, and snapshot limits in Advanced
 - materialize/review bundle development actions in Advanced
 - watcher enabled/disabled and recent review state
 
@@ -259,19 +384,20 @@ A review profile is a JSON file that defines:
 - default maximum reviewable diff bytes, overridden by the app-level
   `maxDiffBytes` setting when present
 - global review instructions
-- optional `provider` (`codex` or `cursor`) to match the selected review engine
+- optional `provider` (`codex`, `cursor`, or `openrouter`) for compatibility with
+  legacy profile metadata only; engine selection is configured in the Instruction
+  Set section
 - specialist agents, categories, optional model overrides, and conditional
   activation rules
 
 AI Reviewer copies the active profile into each local bundle as
-`review-profile.json`. If a profile sets `provider`, it must match the configured
-review engine. Specialist runs receive the profile instructions through prompts
-while their working directory remains the local bundle.
+`review-profile.json`. Instruction-set overrides from the config are merged on top
+so you can keep profiles engine-agnostic. Specialist runs receive the profile
+instructions through prompts while their working directory remains the local
+bundle.
 
 Bundled profiles:
 
 - `profiles/default-review.json`: general-purpose enterprise review with
   correctness, security, data integrity, contract, workflow, resilience,
-  frontend, and test specialists (Codex)
-- `profiles/default-review-cursor.json`: same specialist layout tuned for Cursor
-  Agent with Composer 2.5
+  frontend, and test specialists (used by both engines)

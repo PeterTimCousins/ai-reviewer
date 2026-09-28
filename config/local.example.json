@@ -9,12 +9,28 @@
   "aiProvider": "codex",
   "cursorHome": "~/.cursor",
   "cursorModel": "composer-2.5",
+  "openRouterModel": "deepseek/deepseek-v4-pro",
+  "openRouterAPIKey": null,
   "reviewProfilePath": null,
+  "instructionSet": {
+    "defaultModel": null,
+    "globalInstructions": null,
+    "agents": {},
+    "engineModels": {
+      "codex": {
+        "defaultModel": "gpt-5.6-terra",
+        "agents": {},
+        "defaultReasoningEffort": "medium",
+        "agentReasoningEfforts": {}
+      }
+    }
+  },
   "maxDiffBytes": 200000,
   "reviewCachePath": "~/Library/Caches/com.ai-reviewer",
   "statePath": null,
   "reviewCurrentHeadOnStartup": false,
   "startWatcherOnLaunch": true,
+  "watchAllWorktrees": false,
   "hideDockIcon": true,
   "sweepDepth": 50,
   "retryFailedAfterSeconds": 3600,

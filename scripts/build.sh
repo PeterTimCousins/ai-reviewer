@@ -10,22 +10,30 @@ build_root="$repo_root/build"
 app_root="$build_root/$app_name"
 binary_name="ai-reviewer-watcher"
 codesign_identity="${AI_REVIEWER_CODESIGN_IDENTITY:--}"
+build_configuration="${AI_REVIEWER_BUILD_CONFIGURATION:-release}"
+
+case "$build_configuration" in
+  debug|release) ;;
+  *)
+    echo "AI_REVIEWER_BUILD_CONFIGURATION must be 'debug' or 'release'." >&2
+    exit 2
+    ;;
+esac
+
+"$repo_root/scripts/preflight.sh" --build
 
 mkdir -p "$build_root"
 
-swift build
+swift build -c "$build_configuration"
+binary_path=$(swift build -c "$build_configuration" --show-bin-path)
 
 if [[ -e "$app_root" ]]; then
-  if ! command -v trash >/dev/null 2>&1; then
-    echo "Refusing to replace $app_root because trash is unavailable." >&2
-    exit 1
-  fi
-  trash "$app_root"
+  rm -rf -- "$app_root"
 fi
 
 mkdir -p "$app_root/Contents/MacOS"
 mkdir -p "$app_root/Contents/Resources"
-cp "$repo_root/.build/debug/ai-reviewer-watcher" "$app_root/Contents/MacOS/$binary_name"
+cp "$binary_path/$binary_name" "$app_root/Contents/MacOS/$binary_name"
 mkdir -p "$app_root/Contents/Resources/profiles"
 cp "$repo_root/profiles/default-review.json" "$app_root/Contents/Resources/profiles/default-review.json"
 cp "$repo_root/profiles/default-review-cursor.json" "$app_root/Contents/Resources/profiles/default-review-cursor.json"
@@ -61,5 +69,6 @@ cat > "$app_root/Contents/Info.plist" <<PLIST
 PLIST
 
 /usr/bin/codesign --force --sign "$codesign_identity" "$app_root" >/dev/null
+/usr/bin/codesign --verify --deep --strict "$app_root"
 
-echo "Built $app_root"
+echo "Built $app_root ($build_configuration)"
