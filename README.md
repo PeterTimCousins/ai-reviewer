@@ -9,7 +9,8 @@ The intended model is:
 2. The app is the only process granted access to that repository, including
    removable volumes.
 3. For each commit, the app materializes a local review bundle containing only
-   commit metadata, diffs, and capped changed-file snapshots.
+   commit metadata, diffs, capped changed-file snapshots, and bounded context
+   from the same Git commit.
 4. Codex or Cursor Agent runs only against that local bundle with a stripped environment,
    read-only sandboxing, non-interactive approvals, and the configured review
    profile instructions.
@@ -126,8 +127,8 @@ CONFIG="$HOME/Library/Application Support/com.ai-reviewer/config.json"
 "$BIN" reviews --config "$CONFIG" queue-pending
 "$BIN" reviews --config "$CONFIG" reconcile
 "$BIN" engine --config "$CONFIG" set codex
-"$BIN" models --config "$CONFIG" set gpt-5.6-terra --effort medium
-"$BIN" models --config "$CONFIG" set gpt-5.6-sol --effort high --agent workflow
+"$BIN" models --config "$CONFIG" set gpt-6.1-sol --effort medium
+"$BIN" models --config "$CONFIG" set gpt-6.1-sol --effort high --agent workflow
 "$BIN" config --config "$CONFIG" set maxParallelReviews 4
 "$BIN" config --config "$CONFIG" restore-backup
 "$BIN" instruction-set --config "$CONFIG" export /tmp/reviewer-instructions.json
@@ -164,6 +165,33 @@ native Codex subagents, while AI Reviewer already owns that orchestration layer.
 These overrides are stored in the main app config so you no
 longer need separate `default-review-cursor.json` or cursor-specific profile
 files to switch engines.
+
+The local example uses GPT-6.1 Sol at medium effort for substantive review.
+GPT-6 Luna is the economical option for focused compliance and quality passes;
+GPT-6 Astra is available for deliberately selected difficult reviews. Existing
+model selections remain explicit overrides and are not automatically migrated.
+Without a Codex model cache, the picker includes the GPT-6 family and supports
+`low`, `medium`, `high`, `xhigh`, and `max`; with a cache, Codex's exact model
+availability and effort defaults take precedence.
+
+As of 30 September 2026, OpenAI's standard API prices per million tokens for
+prompts up to 272K input tokens are:
+
+| Model | Input | Cached input | Output |
+| --- | ---: | ---: | ---: |
+| GPT-6.1 Sol | $2.00 | $0.10 | $10.00 |
+| GPT-6 Sol | $2.00 | $0.20 | $10.00 |
+| GPT-6 Luna | $0.10 | $0.01 | $0.50 |
+| GPT-6 Astra | $10.00 | $1.00 | $50.00 |
+| GPT-5.6 Sol | $4.00 | $0.40 | $20.00 |
+| GPT-5.6 Terra | $2.00 | $0.20 | $12.00 |
+| GPT-5.6 Luna | $0.20 | $0.02 | $1.20 |
+
+These are [API token prices](https://developers.openai.com/api/docs/pricing),
+not Codex subscription usage rates or a measured review-quality comparison.
+Preserve each specialist's effort when migrating and compare representative
+reviews before changing its quality tier. See the
+[GPT-6 migration guidance](https://developers.openai.com/api/docs/guides/latest-model#migration-quickstart).
 
 Codex review subprocesses explicitly disable native multi-agent delegation because
 AI Reviewer already owns the specialist orchestration. Each specialist therefore
@@ -234,6 +262,23 @@ The bundle contains:
 - `diff.patch`
 - `changed-files.json`
 - capped snapshots under `snapshots/`
+- `context.txt` with frozen canonical sections and one-hop relative TS/JS imports
+- `context-files.json` recording included, excerpted, missing and capped context
+
+Profiles can declare `contextRules` with `paths`, optional `whenPathPrefixes`
+and optional exact Markdown `headings` (including their `#` prefix). Matching
+rules for one document merge their sections; a whole-file rule takes precedence.
+Sections retain original starting line numbers. Context is limited to 192 KiB
+overall, 64 KiB per file and 24 imported dependencies. Omissions are explicit;
+reviewers must not treat absent evidence as proof of a defect. Context is read
+from Git blobs, never from dirty working files or symlink targets.
+
+The maintained DSInfra profile is `profiles/dsinfra-review.json`. It includes
+current backend invariants and conditional UI interaction coverage. Agents can
+use `runIfPathPrefixes` for directory routing without broad vocabulary matches;
+legacy substring/diff triggers continue to work. Installed instruction overrides
+take precedence over profile prompts, so update both when migrating an existing
+installation.
 
 `run-codex` writes:
 
@@ -324,6 +369,11 @@ Codex subprocesses run from local bundles with:
 - `--ephemeral`
 - `--ignore-user-config`
 - `--ignore-rules`
+
+The outer macOS sandbox permits read-only access to CFPreferences shared-memory
+segments so Codex can load managed configuration. It does not permit shared-memory
+writes or unrelated shared-memory reads. `scripts/check.sh` verifies this boundary
+and that the live repository remains unreadable from the review sandbox.
 
 The app passes `--cd <bundle>` and `--skip-git-repo-check`, so Codex does not
 need a Git checkout or direct access to the watched repository.

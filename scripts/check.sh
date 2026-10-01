@@ -14,6 +14,7 @@ python3 -m json.tool config/example.json >/dev/null
 python3 -m json.tool config/local.example.json >/dev/null
 python3 -m json.tool profiles/default-review.json >/dev/null
 python3 -m json.tool profiles/default-review-cursor.json >/dev/null
+python3 -m json.tool profiles/dsinfra-review.json >/dev/null
 
 AI_REVIEWER_BUILD_CONFIGURATION=release scripts/build.sh
 app="build/AI Reviewer.app"
@@ -23,5 +24,8 @@ binary="$app/Contents/MacOS/ai-reviewer-watcher"
 /usr/bin/plutil -lint "$app/Contents/Info.plist"
 /usr/bin/codesign --verify --deep --strict "$app"
 "$binary" --help >/dev/null
+python3 scripts/check-models.py "$binary"
+python3 scripts/check-context.py "$binary"
+python3 scripts/check-sandbox.py
 
 echo "All checks passed."

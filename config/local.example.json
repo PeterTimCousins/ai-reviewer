@@ -18,7 +18,7 @@
     "agents": {},
     "engineModels": {
       "codex": {
-        "defaultModel": "gpt-5.6-terra",
+        "defaultModel": "gpt-6.1-sol",
         "agents": {},
         "defaultReasoningEffort": "medium",
         "agentReasoningEfforts": {}

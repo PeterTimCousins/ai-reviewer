@@ -1,0 +1,321 @@
+{
+  "schemaVersion": 1,
+  "name": "DSInfra Review",
+  "description": "DSInfra commit review: backend invariants, provider/workflow boundaries and current UI preview contracts.",
+  "maxDiffBytes": 409600,
+  "ignorePaths": [
+    "reviews/**",
+    "dist/**",
+    "coverage/**"
+  ],
+  "globalInstructions": "You are reviewing one commit in the new DSInfra product repository, not the previous dropship-app and not a feature-parity rewrite. Review only behavior introduced or worsened by this commit. Use the supplied same-commit AGENTS.md and canonical context; consult the context inventory for missing or excerpted evidence; distinguish implemented release scope from explicitly planned later work, and do not report a future feature merely because it is not implemented yet. Priority order is integrity/security/recovery/tenancy, then simplicity, then repeatability/maintainability. Core invariants: modules expose public.ts and keep internal repositories/types private; platform code does not depend on product modules; routes validate boundaries and call public use cases rather than repositories; process.env is read only through validated configuration; actor, organisation and correlation context is explicit and immutable; application queries include tenant/participant predicates and PostgreSQL RLS repeats them using transaction-local app.organisation_id; Better Auth is the sole membership authority and uses its separate DB role; explicit SQL migrations own core schema and table proposals need ownership/access/retention contracts; business facts and required pg-boss jobs commit atomically through the Kysely transaction adapter; jobs carry stable IDs/versions, no PII, and are idempotent, retry-bounded and reconcilable; provider payloads and SDK types stop in capability-specific adapters; unsupported provider capability fails closed; money uses integer minor units and explicit currency; logs and wide events are allow-listed and exclude query strings, bodies, arbitrary errors, secrets, tokens, presigned URLs, addresses, payment data and raw provider payloads. The previous application path in AGENTS.md is an explicitly approved read-only research source and is not itself a workspace-boundary violation. Produce only concrete, actionable findings caused by the commit, with file/line evidence and realistic impact. Avoid style-only preferences and avoid recommending speculative abstractions or infrastructure. The React UI is current work. UI_INTEGRATION_LEDGER distinguishes wired browser behaviour, mocked effects and undecided operations; a mock seam is not itself a live business writer, and an undecided control is not proof that an admitted backend feature is missing. Report real mock behaviour defects and false wiring claims, but do not demand future authenticated/API wiring from a declared preview. Prior reviewer premise dispositions apply only while their stated conditions remain true. Missing context or missing browser evidence is a limit on the review, not a finding. Do not claim clipping, sizing or responsive defects without supplied evidence that demonstrates them.",
+  "defaultModel": null,
+  "agents": [
+    {
+      "id": "compliance",
+      "title": "Compliance",
+      "category": "compliance",
+      "model": "gpt-6-luna",
+      "instructions": "Check the diff against AGENTS.md and the canonical document ownership map. Report real violations such as process.env reads outside config, unjustified any or TypeScript suppression, console logging, unvalidated HTTP/job/provider input, cross-module internal imports, routes calling repositories, product modules receiving raw pools, non-minor-unit money, raw sensitive telemetry, duplicate membership authority, speculative datastores/queues/providers, or implementation that contradicts its release/feature/retention contract. For a new table, verify named owner, writer, access/RLS, sensitivity, retention/deletion and feature consumer. Do not demand later-release capability from an earlier admitted slice.",
+      "alwaysRun": true
+    },
+    {
+      "id": "bug",
+      "title": "Bug Scanner",
+      "category": "correctness",
+      "model": "gpt-6.1-sol",
+      "instructions": "Find concrete runtime or data-integrity bugs: missing await, unhandled promise, null/undefined path, wrong property, inverted condition, incorrect status mapping, broken idempotency, duplicate effect, stale-version overwrite, transaction boundary error, cleanup/shutdown leak, date/money/unit conversion error, malformed migration, or empty-input edge case. Follow the actual Express, Better Auth, Kysely, PostgreSQL and pg-boss behavior visible in the diff. Do not report errors TypeScript already makes impossible unless an unsafe cast or boundary bypass restores the runtime path. PostgreSQL owns durable timestamps: preserve database microseconds and distinguish provider, host and database clocks; monotonic versions order authority. Do not forbid legitimate host-clock signature freshness checks. UI interaction and draft/cache defects belong to the UI specialist; focus this review on runtime and data-integrity paths.",
+      "alwaysRun": true
+    },
+    {
+      "id": "impact",
+      "title": "Impact Analysis",
+      "category": "impact",
+      "model": "gpt-6.1-sol",
+      "instructions": "Trace changed public contracts to their consumers: exports, generated OpenAPI, routes, workers, migrations, configuration, tests and canonical docs. Check schema/query and migration/runtime-role compatibility, API/error response changes, queue-name/payload changes, release-register claims, ADR/source-of-truth conflicts, and whether data is written without a named consumer or lifecycle. A documentation-only decision must be internally consistent but need not implement its future release immediately.",
+      "alwaysRun": true
+    },
+    {
+      "id": "quality",
+      "title": "Code Quality",
+      "category": "quality",
+      "model": "gpt-6-luna",
+      "instructions": "Check for maintainability risks that violate the simplicity goal: multiple patterns for one concern, unnecessary abstraction, generic repositories/services/providers without a second proven case, duplicate schemas or authorities, large mixed-responsibility functions, hidden ownership, excessive JSON/status fields, magic values, dead compatibility code, unbounded metadata, or comments that narrate ordinary code. Prefer direct module composition and framework/vendor capabilities. For current React work, TanStack Query may cache generated API server state but must not duplicate workflows or business authority. Apply the repository simplicity ladder: reuse the owning API or native framework capability before adding a custom abstraction. Native semantic controls are the baseline; do not demand a new component library or state store without a demonstrated need.",
+      "alwaysRun": true
+    },
+    {
+      "id": "security",
+      "title": "Security",
+      "category": "security",
+      "model": "gpt-6.1-sol",
+      "instructions": "Check for SQL injection, missing organisation/participant predicates, absent or permissive RLS, user-controlled tenant context, auth/session/active-organisation gaps, Better Auth role leakage, unsafe Express auth mount/body ordering, privilege or GRANT mistakes, secret exposure, raw query/body/error/provider data in telemetry, SSRF, unsafe object keys or presigned URLs, path/shell injection, webhook signature/routing flaws, payment client-secret/card leakage, and jobs containing PII or running without explicit tenant context. RLS is defence in depth and does not excuse missing application scope. Platform-wide access needs a separate deliberate audited role. Application update grants are column-scoped where the canonical contract requires it. For real web boundaries check unsafe HTML/URL handling, credential forwarding, SSR isolation and actor/organisation cache isolation. A declared unauthenticated mock preview is not proof of a live tenant leak; inspect the supplied boundary and scope-remount contract.",
+      "alwaysRun": true
+    },
+    {
+      "id": "architecture",
+      "title": "Architecture Drift",
+      "category": "architecture",
+      "model": "gpt-6.1-sol",
+      "instructions": "Check modular-monolith boundaries and authority: cross-module imports must use public.ts; platform cannot depend on product modules; tables have one owner/writer; routes/processes contain no business policy; Better Auth alone owns membership; payment, fulfilment, order and audit facts remain separate; one named coordinator owns cross-module workflows; synchronous calls preserve same-transaction invariants and pg-boss handles post-commit work. Reject generic provider interfaces, event-bus conversations, Redis/extra stores, ambient tenant state, second DB libraries and speculative foundations. Shopify and eBay are implemented capability boundaries; preserve their concrete admitted contracts rather than inventing hypothetical provider abstractions. React Router web code receives no database, queue or provider credentials and does not import business-module internals. TanStack Query caches server state; local UI drafts and preview seam composition are not durable business coordinators. Judge ownership violations from the actual admitted effect and its implementation, not a mock interface name.",
+      "alwaysRun": true
+    },
+    {
+      "id": "integrator",
+      "title": "Provider Boundary",
+      "category": "integrator",
+      "model": "gpt-6.1-sol",
+      "instructions": "Review channel/provider boundaries only. Require boundary schemas, exact connection plus provider IDs, capability-specific ports, explicit currency/unit/tax/null/clear semantics, stable mutation identity, known retryable/rejected/unknown/terminal outcomes, reconciliation/readback, sanitized fixtures and truthful readiness. Provider payloads, SDK types, enums, categories and Shopify/eBay policy must not leak into core. Desired, observed and last-applied versions remain distinct; stale jobs no-op; exact variant links, never SKU/title matching, route orders. Do not recommend one enormous shared channel abstraction. Unknown effects require causal operation receipts, not coincidental readback matches. Review changed adapter/use-case/API contracts, not merely provider vocabulary or mock-only UI controls.",
+      "alwaysRun": false,
+      "runIfPathPrefixes": [
+        "src/modules/channels/",
+        "src/providers/",
+        "src/platform/providers/",
+        "src/modules/listings/"
+      ]
+    },
+    {
+      "id": "workflow",
+      "title": "Workflow Resilience",
+      "category": "workflow",
+      "model": "gpt-6.1-sol",
+      "instructions": "Check API-to-job and external-effect resilience: required job enqueued in the same Kysely transaction as the business fact, queue created before use, validated versioned payload with organisation/correlation IDs and no PII, explicit tenant transaction in worker, duplicate/superseded no-op, bounded retry/backoff/expiry/retention, cancellation and terminal handling, and reconciliation before repeating unknown external outcomes. Provider calls must not occur inside long DB transactions; scheduling uses pg-boss rather than sleeps/timers. For multi-supplier work, each branch has independent state/payment/fulfilment visibility and partial success never rolls back another committed branch. Require an operator-visible safe action state rather than raw failure data. Only causal receipts echoing the operation identity/idempotency reference may resolve an unknown external effect. Matching quantity or state, not-found/refusal alone, creator metadata or cloneable writable metadata cannot establish causality. Review actual backend effects; browser-only selection and preview mutation names do not establish a pg-boss workflow.",
+      "alwaysRun": false,
+      "runIfPathPrefixes": [
+        "src/platform/jobs/",
+        "src/processes/worker/",
+        "src/modules/orders/",
+        "src/modules/payments/",
+        "src/modules/fulfilment/",
+        "src/modules/listings/",
+        "src/modules/channels/",
+        "src/modules/supplier-payments/",
+        "src/modules/entitlements-billing/",
+        "src/modules/inventory/",
+        "src/modules/notifications/",
+        "src/modules/agreements/",
+        "src/modules/shipping/",
+        "src/modules/data-lifecycle/"
+      ]
+    },
+    {
+      "id": "ui",
+      "title": "UI Interaction and Data Contracts",
+      "category": "ui",
+      "model": "gpt-6.1-sol",
+      "alwaysRun": false,
+      "runIfPathPrefixes": [
+        "app/"
+      ],
+      "instructions": "Review changed React routes, components and data seams for concrete interaction and contract regressions: keyboard/focus and nested click behaviour; selection identity; draft reset/preservation when rows, source, target or saved versions change; stale async responses; loading, error, disabled and refusal states; mutation refresh/invalidation; query-key and QueryClient isolation across source/scope changes; unknown/null versus zero; money/unit conversions; and truthful mock results. Trace supplied hooks, callers and intent declarations. Use the UI integration ledger and ADR 0116 to distinguish wired browser state, mocked effects and undecided owner decisions. In the preview, scope changes remount the QueryClient subtree; do not demand an unavailable session identity or new auth system without a changed live boundary. Report concrete preview bugs, misleading success/wiring claims or admitted API contract regressions, not future feature absence. Tests using jsdom do not prove physical layout, clipping or responsive geometry. Do not report style preferences or invent screenshot evidence. Leave backend ownership, security and provider effects to their specialists unless the UI introduces a demonstrable violation."
+    }
+  ],
+  "contextRules": [
+    {
+      "paths": [
+        "AGENTS.md",
+        "README.md"
+      ]
+    },
+    {
+      "paths": [
+        "docs/architecture/ENGINE_FOUNDATION.md"
+      ],
+      "headings": [
+        "## Priorities",
+        "## Repository shape",
+        "## Web boundary",
+        "## API contract",
+        "## Transactions and jobs"
+      ]
+    },
+    {
+      "paths": [
+        "docs/adr/0116-ui-v1-preview-conventions.md"
+      ],
+      "whenPathPrefixes": [
+        "app/"
+      ]
+    },
+    {
+      "paths": [
+        "docs/governance/UI_INTEGRATION_LEDGER.md"
+      ],
+      "whenPathPrefixes": [
+        "app/"
+      ],
+      "headings": [
+        "## Screens not yet converted",
+        "## Application shell"
+      ]
+    },
+    {
+      "paths": [
+        "docs/governance/UI_INTEGRATION_LEDGER.md"
+      ],
+      "whenPathPrefixes": [
+        "app/components/links/",
+        "app/routes/links",
+        "app/data/links/",
+        "app/routes/products-links"
+      ],
+      "headings": [
+        "### Links",
+        "## Links"
+      ]
+    },
+    {
+      "paths": [
+        "docs/governance/UI_INTEGRATION_LEDGER.md"
+      ],
+      "whenPathPrefixes": [
+        "app/components/products/",
+        "app/routes/products",
+        "app/data/products/",
+        "app/routes/product-detail"
+      ],
+      "headings": [
+        "### Products",
+        "## Products"
+      ]
+    },
+    {
+      "paths": [
+        "docs/governance/UI_INTEGRATION_LEDGER.md"
+      ],
+      "whenPathPrefixes": [
+        "app/components/orders/",
+        "app/routes/orders",
+        "app/data/orders/"
+      ],
+      "headings": [
+        "### Orders workspace",
+        "## Orders workspace"
+      ]
+    },
+    {
+      "paths": [
+        "docs/governance/UI_INTEGRATION_LEDGER.md"
+      ],
+      "whenPathPrefixes": [
+        "app/components/payments/",
+        "app/routes/payments",
+        "app/data/payments/"
+      ],
+      "headings": [
+        "### Payments",
+        "## Payments"
+      ]
+    },
+    {
+      "paths": [
+        "docs/governance/UI_INTEGRATION_LEDGER.md"
+      ],
+      "whenPathPrefixes": [
+        "app/components/pricing/",
+        "app/routes/pricing",
+        "app/data/pricing/"
+      ],
+      "headings": [
+        "### Pricing",
+        "## Pricing"
+      ]
+    },
+    {
+      "paths": [
+        "docs/governance/UI_INTEGRATION_LEDGER.md"
+      ],
+      "whenPathPrefixes": [
+        "app/components/connections/",
+        "app/routes/connections",
+        "app/data/connections/",
+        "app/routes/connection."
+      ],
+      "headings": [
+        "### Channel connections",
+        "## Channel connections"
+      ]
+    },
+    {
+      "paths": [
+        "docs/governance/UI_INTEGRATION_LEDGER.md"
+      ],
+      "whenPathPrefixes": [
+        "app/components/marketplace/",
+        "app/routes/marketplace",
+        "app/data/marketplace/"
+      ],
+      "headings": [
+        "### Marketplace",
+        "## Marketplace"
+      ]
+    },
+    {
+      "paths": [
+        "docs/governance/UI_INTEGRATION_LEDGER.md"
+      ],
+      "whenPathPrefixes": [
+        "app/components/settings/",
+        "app/routes/settings",
+        "app/data/settings/"
+      ],
+      "headings": [
+        "### Settings",
+        "## Settings"
+      ]
+    },
+    {
+      "paths": [
+        "docs/governance/UI_INTEGRATION_LEDGER.md"
+      ],
+      "whenPathPrefixes": [
+        "app/components/dashboard/",
+        "app/routes/dashboard",
+        "app/data/dashboard/"
+      ],
+      "headings": [
+        "### Dashboard",
+        "## Dashboard"
+      ]
+    },
+    {
+      "paths": [
+        "docs/governance/UI_INTEGRATION_LEDGER.md"
+      ],
+      "whenPathPrefixes": [
+        "app/components/action-centre/",
+        "app/routes/action-centre",
+        "app/data/action-centre/",
+        "app/routes/notifications"
+      ],
+      "headings": [
+        "### Action Centre",
+        "## Action Centre"
+      ]
+    },
+    {
+      "paths": [
+        "docs/governance/UI_INTEGRATION_LEDGER.md"
+      ],
+      "whenPathPrefixes": [
+        "app/components/workspace/",
+        "app/routes/workspace",
+        "app/data/workspace/"
+      ],
+      "headings": [
+        "### Workspace",
+        "## Workspace"
+      ]
+    },
+    {
+      "paths": [
+        "docs/governance/UI_INTEGRATION_LEDGER.md"
+      ],
+      "whenPathPrefixes": [
+        "app/data/provider.tsx",
+        "app/data/source.ts",
+        "app/data/organisation.ts",
+        "app/root.tsx"
+      ]
+    }
+  ]
+}
